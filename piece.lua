@@ -5,12 +5,12 @@ Piece.__index = Piece
 
 -- Piece types with their properties
 local PIECE_TYPES = {
-    pawn = { name = "Pawn", moveRange = 1, attackRange = 1, hp = 1, speed = 2 },
-    knight = { name = "Knight", moveRange = 2, attackRange = 2, hp = 3, speed = 3 },
-    bishop = { name = "Bishop", moveRange = 5, attackRange = 5, hp = 3, speed = 2 },
-    rook = { name = "Rook", moveRange = 5, attackRange = 5, hp = 5, speed = 1 },
-    queen = { name = "Queen", moveRange = 5, attackRange = 5, hp = 5, speed = 2 },
-    king = { name = "King", moveRange = 1, attackRange = 1, hp = 10, speed = 2 },
+    pawn = { name = "Pawn", moveRange = 1, attackRange = 1, hp = 10, damage = 5, speed = 2, maxAmmo = 3, maxSupply = 5 },
+    knight = { name = "Knight", moveRange = 2, attackRange = 2, hp = 3, damage = 3, speed = 3, maxAmmo = 3, maxSupply = 5 },
+    bishop = { name = "Bishop", moveRange = 5, attackRange = 5, hp = 3, damage = 3, speed = 2, maxAmmo = 3, maxSupply = 5 },
+    rook = { name = "Rook", moveRange = 5, attackRange = 5, hp = 5, damage = 5, speed = 1, maxAmmo = 3, maxSupply = 5 },
+    queen = { name = "Queen", moveRange = 5, attackRange = 5, hp = 5, damage = 5, speed = 2, maxAmmo = 3, maxSupply = 5 },
+    king = { name = "King", moveRange = 1, attackRange = 1, hp = 10, damage = 5, speed = 2, maxAmmo = 3, maxSupply = 5 },
 }
 
 function Piece.new(pieceType, team, gameMap, col, row)
@@ -30,6 +30,14 @@ function Piece.new(pieceType, team, gameMap, col, row)
     self.selected = false
     self.canMove = true
     self.hasMoved = false  -- Track if piece has moved this turn
+    
+    -- Ammo and supply system
+    self.maxAmmo = self.stats.maxAmmo or 3
+    self.ammo = self.maxAmmo  -- Current ammo remaining
+    self.maxSupply = self.stats.maxSupply or 5
+    self.supply = self.maxSupply  -- Current supply remaining (turns until attrition)
+    self.attritionDamage = 2  -- Damage per turn when out of supply
+    
     self.hexTile = nil
     if col and row then
         self.hexTile = gameMap:getTile(col, row)
@@ -44,6 +52,45 @@ end
 
 function Piece:getAttackRange()
     return self.stats.attackRange
+end
+
+function Piece:getDamage()
+    return self.stats.damage or 1
+end
+
+function Piece:useAmmo()
+    if self.ammo > 0 then
+        self.ammo = self.ammo - 1
+        return true
+    end
+    return false  -- Out of ammo
+end
+
+function Piece:hasAmmo()
+    return self.ammo > 0
+end
+
+function Piece:consumeSupply()
+    if self.supply > 0 then
+        self.supply = self.supply - 1
+    end
+end
+
+function Piece:hasSupply()
+    return self.supply > 0
+end
+
+function Piece:applyAttrition()
+    if not self:hasSupply() then
+        self:takeDamage(self.attritionDamage)
+    end
+end
+
+function Piece:resupply(ammoAmount, supplyAmount)
+    ammoAmount = ammoAmount or self.maxAmmo
+    supplyAmount = supplyAmount or self.maxSupply
+    self.ammo = math.min(self.maxAmmo, self.ammo + ammoAmount)
+    self.supply = math.min(self.maxSupply, self.supply + supplyAmount)
 end
 
 function Piece:takeDamage(amount)
