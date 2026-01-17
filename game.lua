@@ -7,6 +7,7 @@ Game.__index = Game
 local Camera = require("camera")
 local Piece = require("piece")
 local Base = require("base")
+local Resource = require("resource")
 
 function Game.new()
     local self = setmetatable({}, Game)
@@ -44,6 +45,13 @@ function Game.new()
     -- Bases (structures)
     self.bases = {}
     self:initializeBases()
+    
+    -- Resources
+    self.resources = {}
+    self:generateResources()
+    
+    -- Resource currency (for building units/bases)
+    self.teamResources = {[1] = 0, [2] = 0}  -- Resources owned by each team
     
     -- Input handling
     self.selectedPiece = nil
@@ -99,6 +107,41 @@ function Game:addBase(baseType, team, col, row)
     table.insert(self.bases, base)
 end
 
+function Game:generateResources()
+    -- Generate a few resource tiles scattered across the map
+    local numResources = 5  -- Number of resources to place
+    
+    for i = 1, numResources do
+        local attempts = 0
+        local placed = false
+        
+        while not placed and attempts < 100 do
+            attempts = attempts + 1
+            local col = math.random(5, self.mapWidth - 5)  -- Avoid edges
+            local row = math.random(5, self.mapHeight - 5)
+            
+            local tile = self.map:getTile(col, row)
+            if tile and tile.isLand then
+                -- Check if tile is already occupied
+                if not self:getPieceAt(col, row) and not self:getBaseAt(col, row) and not self:getResourceAt(col, row) then
+                    local resource = Resource.new("generic", self.map, col, row)
+                    table.insert(self.resources, resource)
+                    placed = true
+                end
+            end
+        end
+    end
+end
+
+function Game:getResourceAt(col, row)
+    for _, resource in ipairs(self.resources) do
+        if resource.col == col and resource.row == row then
+            return resource
+        end
+    end
+    return nil
+end
+
 function Game:addPiece(pieceType, team, col, row)
     local piece = Piece.new(pieceType, team, self.map, col, row)
     table.insert(self.pieces, piece)
@@ -130,6 +173,12 @@ function Game:draw()
             -- Draw influence radius (optional visual indicator)
             self:drawBaseRadius(base, pixelX, pixelY)
         end
+    end
+    
+    -- Draw resources
+    for _, resource in ipairs(self.resources) do
+        local pixelX, pixelY = self.map:gridToPixels(resource.col, resource.row)
+        resource:draw(pixelX, pixelY, self.hexSideLength)
     end
     
     -- Draw pieces (only draw placed pieces)
@@ -186,7 +235,7 @@ function Game:drawValidPlacementTiles()
     for col = 1, self.map.cols do
         for row = 1, self.map.rows do
             local tile = self.map:getTile(col, row)
-            if tile and tile.isLand and not self:getPieceAt(col, row) and not self:getBaseAt(col, row) then
+            if tile and tile.isLand and not self:getPieceAt(col, row) and not self:getBaseAt(col, row) and not self:getResourceAt(col, row) then
                 local points = tile.points
                 love.graphics.polygon("fill", points)
             end
@@ -247,6 +296,7 @@ function Game:drawUI()
         -- Normal gameplay UI
         local teamColor = self.currentTurn == 1 and "Red" or "Blue"
         love.graphics.print("Team: " .. teamColor .. " | Turn: " .. self.turnCount, 10, 10)
+        love.graphics.print("Resources: " .. (self.teamResources[self.currentTurn] or 0), 10, 30)
         
         -- Draw selected piece info
         if self.selectedPiece then
@@ -254,7 +304,7 @@ function Game:drawUI()
                 self.selectedPiece.stats.name, 
                 self.selectedPiece.hp, 
                 self.selectedPiece.maxHp)
-            love.graphics.print(info, 10, 30)
+            love.graphics.print(info, 10, 50)
             
             -- Show ammo and supply
             local ammoInfo = string.format("Ammo: %d/%d | Supply: %d/%d", 
@@ -262,12 +312,12 @@ function Game:drawUI()
                 self.selectedPiece.maxAmmo,
                 self.selectedPiece.supply,
                 self.selectedPiece.maxSupply)
-            love.graphics.print(ammoInfo, 10, 50)
+            love.graphics.print(ammoInfo, 10, 70)
         end
         
         -- Draw controls
         love.graphics.setFont(love.graphics.newFont(10))
-        local controlsY = self.selectedPiece and 70 or 30
+        local controlsY = self.selectedPiece and 90 or 50
         love.graphics.print("Click to select piece | Right-click to move | E: End Turn | R: Reset", 10, controlsY)
     end
 end
@@ -518,6 +568,19 @@ function Game:resupplyPieceFromBases(piece)
     end
 end
 
+function Game:generateResourceIncome(team)
+    -- Count how many resource tiles this team owns
+    local ownedResources = 0
+    for _, resource in ipairs(self.resources) do
+        if resource.owner == team then
+            ownedResources = ownedResources + 1
+        end
+    end
+    
+    -- Add 1 resource per owned resource tile
+    self.teamResources[team] = self.teamResources[team] + ownedResources
+end
+
 function Game:movePiece(col, row)
     if not self.selectedPiece then return end
     
@@ -543,6 +606,13 @@ function Game:movePiece(col, row)
     
     if isValidMove then
         self.selectedPiece:setPosition(col, row)
+        
+        -- Check if piece moved onto a resource and capture it
+        local resource = self:getResourceAt(col, row)
+        if resource then
+            resource:capture(self.selectedPiece.team)
+        end
+        
         self:calculateValidMoves()
     elseif isValidAttack and targetPiece then
         -- Check if piece has ammo
@@ -565,6 +635,12 @@ function Game:movePiece(col, row)
             end
             -- Only move to the enemy tile if we killed them
             self.selectedPiece:setPosition(col, row)
+            
+            -- Check if piece moved onto a resource and capture it
+            local resource = self:getResourceAt(col, row)
+            if resource then
+                resource:capture(self.selectedPiece.team)
+            end
         end
         -- If enemy survived, attacker stays in place (no movement)
         -- Mark piece as moved since it attacked
@@ -624,6 +700,9 @@ function Game:endTurn()
             end
         end
     end
+    
+    -- Generate resources from captured resource tiles
+    self:generateResourceIncome(teamThatEnded)
     
     self.selectedPiece = nil
     self.validMoves = {}
@@ -739,6 +818,8 @@ end
 function Game:resetGame()
     self.pieces = {}
     self.bases = {}
+    self.resources = {}
+    self.teamResources = {[1] = 0, [2] = 0}
     self.currentTurn = 1
     self.turnCount = 0
     self.state = "placing"
@@ -749,6 +830,7 @@ function Game:resetGame()
     self.selectedPiece = nil
     self:initializePieces()
     self:initializeBases()
+    self:generateResources()
 end
 
 return Game
