@@ -126,7 +126,7 @@ function HexMap:getNeighbors(startHex, range)
     local visited = {} -- Table to track visited tiles
     local queue = {} -- Queue for BFS
     local currentRange = 0 -- Current depth of BFS
-
+    --print(startHex.col, startHex.row)
     -- Initialize the queue with the starting tile
     table.insert(queue, {hex = startHex, range = 0})
     visited[startHex.col .. "," .. startHex.row] = true
@@ -173,16 +173,19 @@ function HexMap:getNeighbors(startHex, range)
             local neighborCol = currentHex.col + dx
             local neighborRow = currentHex.row + dy
 
-
-            local neighborKey = neighborCol .. "," .. neighborRow
-            
-            -- If the neighbor hasn't been visited, add it to the queue
-            if not visited[neighborKey] then
-                visited[neighborKey] = true
-                table.insert(queue, {
-                    hex = self.grid[neighborCol][neighborRow],
-                    range = currentRange + 1
-                })
+            -- Check bounds before accessing grid
+            if neighborCol >= 1 and neighborCol <= self.cols and 
+               neighborRow >= 1 and neighborRow <= self.rows then
+                local neighborKey = neighborCol .. "," .. neighborRow
+                
+                -- If the neighbor hasn't been visited, add it to the queue
+                if not visited[neighborKey] then
+                    visited[neighborKey] = true
+                    table.insert(queue, {
+                        hex = self.grid[neighborCol][neighborRow],
+                        range = currentRange + 1
+                    })
+                end
             end
         end
         ::continue::
@@ -234,6 +237,7 @@ function HexMap:draw(offsetX, offsetY)
             self:drawTile(tile, offsetX, offsetY)
         end
     end
+    self:drawGridCoordinates()
 end
 
 -- Draw a single hex tile
@@ -269,6 +273,18 @@ function HexMap:drawTile(tile, offsetX, offsetY)
     -- Draw outline
     love.graphics.setColor(0.3, 0.3, 0.3)
     love.graphics.polygon("line", scaledPoints)
+end
+
+function HexMap:drawGridCoordinates()
+    love.graphics.setColor(0.5, 0.5, 0.5)
+    love.graphics.setFont(love.graphics.newFont(8))
+    
+    for col = 1, math.max(0, self.cols) do
+        for row = 1, math.max(0, self.cols)  do
+            local pixelX, pixelY = self:gridToPixels(col, row)
+            love.graphics.print(col .. "," .. row, pixelX - 10, pixelY - 5)
+        end
+    end
 end
 
 -- Get map info for debugging

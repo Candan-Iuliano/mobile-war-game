@@ -58,19 +58,63 @@ function Base:getColor()
 end
 
 function Base:draw(pixelX, pixelY, hexSideLength)
+    local size = hexSideLength * 0.6
     local r, g, b = self:getColor()
     
-    -- Draw base as a square
-    local size = hexSideLength * 0.6
-    love.graphics.setColor(r, g, b)
-    love.graphics.rectangle("fill", pixelX - size/2, pixelY - size/2, size, size)
+    -- TODO: Replace with image assets later
+    -- if self.image then
+    --     love.graphics.draw(self.image, pixelX, pixelY, ...)
+    --     return
+    -- end
     
-    -- Draw outline
-    love.graphics.setColor(0, 0, 0)
-    love.graphics.rectangle("line", pixelX - size/2, pixelY - size/2, size, size)
-    
-    -- Draw influence radius indicator (optional, can be toggled)
-    -- This would be drawn in the game's draw function
+    -- Draw different generic shapes for each base type
+    if self.type == "hq" then
+        -- HQ: Pentagon
+        love.graphics.setColor(r, g, b)
+        local points = {}
+        for i = 0, 4 do
+            local angle = (i * 2 * math.pi / 5) - math.pi / 2
+            local radius = size * 0.5
+            table.insert(points, pixelX + radius * math.cos(angle))
+            table.insert(points, pixelY + radius * math.sin(angle))
+        end
+        love.graphics.polygon("fill", points)
+        love.graphics.setColor(0, 0, 0)
+        love.graphics.polygon("line", points)
+        
+    elseif self.type == "supplyDepot" then
+        -- Ammo Depot: Hexagon
+        love.graphics.setColor(r, g, b)
+        local points = {}
+        for i = 0, 5 do
+            local angle = (i * 2 * math.pi / 6) - math.pi / 2
+            local radius = size * 0.5
+            table.insert(points, pixelX + radius * math.cos(angle))
+            table.insert(points, pixelY + radius * math.sin(angle))
+        end
+        love.graphics.polygon("fill", points)
+        love.graphics.setColor(0, 0, 0)
+        love.graphics.polygon("line", points)
+        
+    elseif self.type == "ammoDepot" then
+        -- Supply Depot: Triangle
+        love.graphics.setColor(r, g, b)
+        local points = {
+            pixelX, pixelY - size * 0.5,
+            pixelX - size * 0.4, pixelY + size * 0.4,
+            pixelX + size * 0.4, pixelY + size * 0.4
+        }
+        love.graphics.polygon("fill", points)
+        love.graphics.setColor(0, 0, 0)
+        love.graphics.polygon("line", points)
+        
+    else
+        -- Default: Square
+        love.graphics.setColor(r, g, b)
+        love.graphics.rectangle("fill", pixelX - size/2, pixelY - size/2, size, size)
+        love.graphics.setColor(0, 0, 0)
+        love.graphics.rectangle("line", pixelX - size/2, pixelY - size/2, size, size)
+    end
 end
 
 return Base

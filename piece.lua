@@ -5,7 +5,7 @@ Piece.__index = Piece
 
 -- Piece types with their properties
 local PIECE_TYPES = {
-    pawn = { name = "Pawn", moveRange = 1, attackRange = 1, hp = 10, damage = 5, speed = 2, maxAmmo = 3, maxSupply = 5 },
+    pawn = { name = "Pawn", moveRange = 3, attackRange = 1, hp = 10, damage = 5, speed = 2, maxAmmo = 3, maxSupply = 5 },
     knight = { name = "Knight", moveRange = 2, attackRange = 2, hp = 3, damage = 3, speed = 3, maxAmmo = 3, maxSupply = 5 },
     bishop = { name = "Bishop", moveRange = 5, attackRange = 5, hp = 3, damage = 3, speed = 2, maxAmmo = 3, maxSupply = 5 },
     rook = { name = "Rook", moveRange = 5, attackRange = 5, hp = 5, damage = 5, speed = 1, maxAmmo = 3, maxSupply = 5 },

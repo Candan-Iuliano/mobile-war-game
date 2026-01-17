@@ -119,7 +119,7 @@ function Game:draw()
     self.map:draw(0, 0)
     
     -- Draw grid coordinates for debugging
-    self:drawGridCoordinates()
+    --self:drawGridCoordinates()
     
     -- Draw bases (only draw placed bases)
     for _, base in ipairs(self.bases) do
@@ -156,17 +156,7 @@ function Game:draw()
     self:drawUI()
 end
 
-function Game:drawGridCoordinates()
-    love.graphics.setColor(0.5, 0.5, 0.5)
-    love.graphics.setFont(love.graphics.newFont(8))
-    
-    for col = 1, math.min(self.map.cols, 15) do
-        for row = 1, math.min(self.map.rows, 15) do
-            local pixelX, pixelY = self.map:gridToPixels(col, row)
-            love.graphics.print(col .. "," .. row, pixelX - 10, pixelY - 5)
-        end
-    end
-end
+
 
 function Game:drawValidMoves()
     -- Draw valid movement tiles
@@ -205,12 +195,33 @@ function Game:drawValidPlacementTiles()
 end
 
 function Game:drawBaseRadius(base, pixelX, pixelY)
-    -- Draw a subtle circle showing the base's influence radius
-    local radius = base:getRadius() * self.hexSideLength
-    love.graphics.setColor(1, 1, 0, 0.1)  -- Yellow, very transparent
-    love.graphics.circle("fill", pixelX, pixelY, radius)
-    love.graphics.setColor(1, 1, 0, 0.3)  -- Yellow, more visible outline
-    love.graphics.circle("line", pixelX, pixelY, radius)
+    -- Draw hexagons within the base's influence radius, respecting terrain
+    local radius = base:getRadius()
+    
+    -- Use getHexesWithinRange which respects terrain passability
+    -- Pass base's team so enemy pieces don't block the visualization
+    local visited = {}
+    self:getHexesWithinRange(base.col, base.row, radius, visited, base.team)
+    
+    -- Draw each hex in range (only passable terrain)
+    love.graphics.setColor(1, 0, 0, 0.15)  -- Red, transparent fill
+    for _, hex in ipairs(visited) do
+        local tile = self.map:getTile(hex.col, hex.row)
+        if tile then
+            local points = tile.points
+            love.graphics.polygon("fill", points)
+        end
+    end
+    
+    -- Draw outline for hexes in range
+    love.graphics.setColor(1, 0, 0, 0.4)  -- Red, more visible outline
+    for _, hex in ipairs(visited) do
+        local tile = self.map:getTile(hex.col, hex.row)
+        if tile then
+            local points = tile.points
+            love.graphics.polygon("line", points)
+        end
+    end
 end
 
 function Game:drawUI()
@@ -354,9 +365,9 @@ function Game:calculateValidMoves()
     local moveRange = self.selectedPiece:getMovementRange()
     local attackRange = self.selectedPiece:getMovementRange()  -- Attack range equals move range
     
-    -- Get all neighbors within move range
+    -- Get all neighbors within move range (enemy pieces block movement)
     local visited = {}
-    self:getHexesWithinRange(self.selectedPiece.col, self.selectedPiece.row, moveRange, visited)
+    self:getHexesWithinRange(self.selectedPiece.col, self.selectedPiece.row, moveRange, visited, self.selectedPiece.team)
     
     for _, hex in ipairs(visited) do
         if hex.col ~= self.selectedPiece.col or hex.row ~= self.selectedPiece.row then
@@ -371,7 +382,7 @@ function Game:calculateValidMoves()
     -- Only show attacks if piece has ammo
     if self.selectedPiece:hasAmmo() then
         local attackHexes = {}
-        self:getHexesWithinRange(self.selectedPiece.col, self.selectedPiece.row, attackRange, attackHexes)
+        self:getHexesWithinRange(self.selectedPiece.col, self.selectedPiece.row, attackRange, attackHexes, self.selectedPiece.team)
         
         for _, hex in ipairs(attackHexes) do
             if hex.col ~= self.selectedPiece.col or hex.row ~= self.selectedPiece.row then
@@ -384,8 +395,9 @@ function Game:calculateValidMoves()
     end
 end
 
-function Game:getHexesWithinRange(col, row, range, visited)
+function Game:getHexesWithinRange(col, row, range, visited, team)
     visited = visited or {}
+    team = team or self.currentTurn  -- Default to current turn's team
     
     if range <= 0 then return end
     
@@ -393,21 +405,62 @@ function Game:getHexesWithinRange(col, row, range, visited)
     local startHex = self.map:getTile(col, row)
     if not startHex then return end
     
-    -- Get immediate neighbors (range 1)
-    local neighbors = self.map:getNeighbors(startHex, 1)
+    -- Use BFS to explore hexes, but only through passable terrain
+    local queue = {{hex = startHex, distance = 0}}
+    local visitedSet = {}
+    visitedSet[col .. "," .. row] = true
     
-    for _, neighbor in ipairs(neighbors) do
-        local key = neighbor.col .. "," .. neighbor.row
-        if not visited[key] then
-            visited[key] = neighbor
-            table.insert(visited, neighbor)
-            self:getHexesWithinRange(neighbor.col, neighbor.row, range - 1, visited)
+    while #queue > 0 do
+        local current = table.remove(queue, 1)
+        local currentHex = current.hex
+        local currentDistance = current.distance
+        
+        -- Add to visited if it's not the starting hex and within range
+        if currentDistance > 0 and currentDistance <= range then
+            local key = currentHex.col .. "," .. currentHex.row
+            if not visited[key] then
+                visited[key] = currentHex
+                table.insert(visited, currentHex)
+            end
         end
+        
+        -- Stop if we've reached the maximum range
+        if currentDistance >= range then
+            goto continue
+        end
+        
+        -- Get immediate neighbors (range 1)
+        local neighbors = self.map:getNeighbors(currentHex, 1)
+        
+        for _, neighbor in ipairs(neighbors) do
+            local neighborKey = neighbor.col .. "," .. neighbor.row
+            
+            -- Only explore if not visited and terrain is passable (land)
+            if not visitedSet[neighborKey] then
+                local neighborTile = self.map:getTile(neighbor.col, neighbor.row)
+                if neighborTile and neighborTile.isLand then
+                    -- Check if tile is occupied by enemy piece (blocks movement)
+                    local pieceOnTile = self:getPieceAt(neighbor.col, neighbor.row)
+                    local isEnemyOccupied = pieceOnTile and pieceOnTile.team ~= team
+                    
+                    if not isEnemyOccupied then
+                        -- Terrain is passable and not blocked by enemy, add to queue
+                        visitedSet[neighborKey] = true
+                        table.insert(queue, {
+                            hex = neighborTile,
+                            distance = currentDistance + 1
+                        })
+                    end
+                    -- If terrain is not passable (water) or blocked by enemy, don't explore past it
+                end
+            end
+        end
+        ::continue::
     end
 end
 
 function Game:isWithinRange(startCol, startRow, targetCol, targetRow, range)
-    -- Use BFS to check if target is within range
+    -- Use BFS to check if target is within range, respecting impassable terrain
     local visited = {}
     local queue = {{col = startCol, row = startRow, distance = 0}}
     visited[startCol .. "," .. startRow] = true
@@ -432,8 +485,13 @@ function Game:isWithinRange(startCol, startRow, targetCol, targetRow, range)
             for _, neighbor in ipairs(neighbors) do
                 local key = neighbor.col .. "," .. neighbor.row
                 if not visited[key] then
-                    visited[key] = true
-                    table.insert(queue, {col = neighbor.col, row = neighbor.row, distance = current.distance + 1})
+                    -- Only explore through passable terrain (land)
+                    local neighborTile = self.map:getTile(neighbor.col, neighbor.row)
+                    if neighborTile and neighborTile.isLand then
+                        visited[key] = true
+                        table.insert(queue, {col = neighbor.col, row = neighbor.row, distance = current.distance + 1})
+                    end
+                    -- If terrain is not passable (water), don't explore past it
                 end
             end
         end
@@ -673,6 +731,10 @@ function Game:placeBase(col, row)
         end
     end
 end
+
+
+
+
 
 function Game:resetGame()
     self.pieces = {}
