@@ -8,6 +8,7 @@ local Camera = require("camera")
 local Piece = require("piece")
 local Base = require("base")
 local Resource = require("resource")
+local ActionMenu = require("action_menu")
 
 function Game.new()
     local self = setmetatable({}, Game)
@@ -60,6 +61,10 @@ function Game.new()
     self.isDragging = false
     self.dragStartX = 0
     self.dragStartY = 0
+    
+    -- Action menu UI (reusable for bases, pieces, resources, etc.)
+    self.actionMenu = nil  -- ActionMenu instance
+    self.actionMenuContext = nil  -- Context object (base, piece, etc.) that opened the menu
     
     return self
 end
@@ -179,6 +184,11 @@ function Game:draw()
     for _, resource in ipairs(self.resources) do
         local pixelX, pixelY = self.map:gridToPixels(resource.col, resource.row)
         resource:draw(pixelX, pixelY, self.hexSideLength)
+    end
+    
+    -- Draw action menu (if base is selected)
+    if self.actionMenu then
+        self:drawActionMenu()
     end
     
     -- Draw pieces (only draw placed pieces)
@@ -338,10 +348,42 @@ function Game:mousepressed(x, y, button)
     else
         -- Normal gameplay
         if button == 1 then  -- Left click
+            -- Check if clicking on action menu first
+            if self.actionMenu and self:handleActionMenuClick(worldX, worldY) then
+                return  -- Action menu handled the click
+            end
+            
+            -- Check if clicking on a base
+            local base = self:getBaseAt(col, row)
+            if base and base.team == self.currentTurn and base.col > 0 and base.row > 0 then
+                self:selectBase(base)
+                return
+            end
+            
+            -- Check if clicking on a piece (for future piece actions)
+            -- local piece = self:getPieceAt(col, row)
+            -- if piece and piece.team == self.currentTurn and piece.col > 0 and piece.row > 0 then
+            --     self:openActionMenu(piece, "piece")
+            --     return
+            -- end
+            
+            -- Otherwise, try to select a piece
+            -- But first, close any open action menu
+            if self.actionMenu then
+                self.actionMenu = nil
+                self.actionMenuContext = nil
+                self.actionMenuContextType = nil
+            end
             self:selectPiece(col, row)
         elseif button == 2 then  -- Right click
             if self.selectedPiece then
                 self:movePiece(col, row)
+            end
+            -- Right click closes action menu
+            if self.actionMenu then
+                self.actionMenu = nil
+                self.actionMenuContext = nil
+                self.actionMenuContextType = nil
             end
         end
     end
@@ -399,6 +441,206 @@ function Game:getBaseAt(col, row)
         end
     end
     return nil
+end
+
+function Game:selectBase(base)
+    -- Deselect piece if one is selected
+    if self.selectedPiece then
+        self.selectedPiece.selected = false
+        self.selectedPiece = nil
+        self.validMoves = {}
+        self.validAttacks = {}
+    end
+    
+    -- If clicking the same base and menu is already open, close menu
+    if self.actionMenu and self.actionMenuContext == base then
+        self.actionMenu = nil
+        self.actionMenuContext = nil
+        self.actionMenuContextType = nil
+        return
+    end
+    
+    -- Open menu for this base
+    self:openActionMenu(base, "base")
+end
+
+-- Generic function to open action menu for any object
+-- context: the object (base, piece, resource, etc.)
+-- contextType: "base", "piece", "resource", etc.
+function Game:openActionMenu(context, contextType)
+    -- Generate action options based on context type and object
+    local options = self:getActionOptions(context, contextType)
+    
+    if #options == 0 then
+        -- No options available, don't show menu
+        return
+    end
+    
+    -- Get pixel position of the context object
+    local pixelX, pixelY
+    if contextType == "base" then
+        pixelX, pixelY = self.map:gridToPixels(context.col, context.row)
+    elseif contextType == "piece" then
+        pixelX, pixelY = self.map:gridToPixels(context.col, context.row)
+    elseif contextType == "resource" then
+        pixelX, pixelY = self.map:gridToPixels(context.col, context.row)
+    else
+        return  -- Unknown context type
+    end
+    
+    -- Create ActionMenu instance
+    self.actionMenu = ActionMenu.new(pixelX, pixelY, options, self.hexSideLength)
+    self.actionMenuContext = context
+    self.actionMenuContextType = contextType
+end
+
+-- Get action options for a given context object
+-- This is where you define what actions are available for each object type
+function Game:getActionOptions(context, contextType)
+    local options = {}
+    
+    if contextType == "base" then
+        if context.type == "hq" then
+            -- HQ can build infantry (pawns)
+            table.insert(options, {
+                id = "build_infantry",
+                name = "Build Infantry",
+                cost = 2,  -- Cost in resources
+                icon = "pawn"  -- For future use
+            })
+            table.insert(options, {
+                id = "build_infantry",
+                name = "Build Infantry",
+                cost = 2,  -- Cost in resources
+                icon = "pawn"  -- For future use
+            })
+            -- table.insert(options, {
+            --     id = "build_infantry",
+            --     name = "Build Infantry",
+            --     cost = 2,  -- Cost in resources
+            --     icon = "pawn"  -- For future use
+            -- })
+            -- table.insert(options, {
+            --     id = "build_infantry",
+            --     name = "Build Infantry",
+            --     cost = 2,  -- Cost in resources
+            --     icon = "pawn"  -- For future use
+            -- })
+
+            -- table.insert(options, {
+            --     id = "build_infantry",
+            --     name = "Build Infantry",
+            --     cost = 2,  -- Cost in resources
+            --     icon = "pawn"  -- For future use
+            -- })
+        end
+        -- Add more base types here as needed
+    elseif contextType == "piece" then
+        -- Add piece actions here (e.g., special abilities, upgrades, etc.)
+    elseif contextType == "resource" then
+        -- Add resource actions here (e.g., harvest, upgrade, etc.)
+    end
+    
+    return options
+end
+
+function Game:drawActionMenu()
+    if not self.actionMenu then return end
+    
+    -- Create callback to check if option is affordable
+    local canAffordCallback = function(option)
+        if not option.cost then return true end
+        
+        local team
+        if self.actionMenuContextType == "base" then
+            team = self.actionMenuContext.team
+        elseif self.actionMenuContextType == "piece" then
+            team = self.actionMenuContext.team
+        else
+            team = self.currentTurn
+        end
+        
+        return self.teamResources[team] >= option.cost
+    end
+    
+    self.actionMenu:draw(canAffordCallback)
+end
+
+function Game:handleActionMenuClick(worldX, worldY)
+    if not self.actionMenu then return false end
+    
+    local option, index = self.actionMenu:handleClick(worldX, worldY)
+    if option then
+        self:executeAction(option)
+        return true
+    end
+    
+    return false
+end
+
+function Game:executeAction(option)
+    if not self.actionMenu or not self.actionMenuContext then return end
+    
+    local context = self.actionMenuContext
+    local contextType = self.actionMenuContextType
+    
+    -- Get team from context
+    local team = context.team or self.currentTurn
+    
+    -- Check if player can afford this action
+    if option.cost and self.teamResources[team] < option.cost then
+        return  -- Can't afford
+    end
+    
+    -- Execute action based on option ID
+    if option.id == "build_infantry" and contextType == "base" then
+        -- Build a pawn near the base
+        self:buildUnitNearBase(context, "pawn", team, option.cost)
+    end
+    -- Add more action handlers here as needed
+    
+    -- Close menu after action
+    self.actionMenu = nil
+    self.actionMenuContext = nil
+    self.actionMenuContextType = nil
+end
+
+function Game:buildUnitNearBase(base, unitType, team, cost)
+    -- Deduct cost
+    self.teamResources[team] = self.teamResources[team] - cost
+    
+    -- Find an adjacent empty land tile to place the unit
+    local baseHex = self.map:getTile(base.col, base.row)
+    if not baseHex then return end
+    
+    local neighbors = self.map:getNeighbors(baseHex, 1)
+    for _, neighbor in ipairs(neighbors) do
+        local tile = self.map:getTile(neighbor.col, neighbor.row)
+        if tile and tile.isLand then
+            -- Check if tile is empty
+            if not self:getPieceAt(neighbor.col, neighbor.row) and 
+               not self:getBaseAt(neighbor.col, neighbor.row) and
+               not self:getResourceAt(neighbor.col, neighbor.row) then
+                -- Place unit here
+                self:addPiece(unitType, team, neighbor.col, neighbor.row)
+                return
+            end
+        end
+    end
+    
+    -- If no adjacent tile found, try within 2 tiles
+    local extendedNeighbors = self.map:getNeighbors(baseHex, 2)
+    for _, neighbor in ipairs(extendedNeighbors) do
+        local tile = self.map:getTile(neighbor.col, neighbor.row)
+        if tile and tile.isLand then
+            if not self:getPieceAt(neighbor.col, neighbor.row) and 
+               not self:getBaseAt(neighbor.col, neighbor.row) and
+               not self:getResourceAt(neighbor.col, neighbor.row) then
+                self:addPiece(unitType, team, neighbor.col, neighbor.row)
+                return
+            end
+        end
+    end
 end
 
 function Game:calculateValidMoves()
@@ -828,6 +1070,9 @@ function Game:resetGame()
     self.placementTeam = 1
     self.placementPhase = "pieces"
     self.selectedPiece = nil
+    self.actionMenu = nil
+    self.actionMenuContext = nil
+    self.actionMenuContextType = nil
     self:initializePieces()
     self:initializeBases()
     self:generateResources()
