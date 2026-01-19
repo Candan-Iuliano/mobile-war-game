@@ -114,8 +114,15 @@ function FogOfWar:revealArea(team, centerCol, centerRow, radius, visited)
         local targetHex = self.map:getTile(tile.col, tile.row)
         if targetHex then
             -- Check if this tile has line of sight from center
-            if self.map:hasFieldOfView(centerHex, targetHex, tile.distance) then
+            local blockingHex = {}  -- Will contain the blocking hex if line is blocked
+            local hasLOS = self.map:hasFieldOfView(centerHex, targetHex, tile.distance, blockingHex)
+            
+            if hasLOS then
+                -- Clear line of sight - reveal the target tile
                 self:setTileVisible(team, tile.col, tile.row, true)
+            elseif blockingHex[1] then
+                -- Line is blocked - reveal the blocking tile but not the target
+                self:setTileVisible(team, blockingHex[1].col, blockingHex[1].row, true)
             end
         end
     end
