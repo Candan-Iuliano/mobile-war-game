@@ -89,15 +89,15 @@ function Game.new()
 end
 
 function Game:generateMapTerrain()
-    -- Simple terrain generation: random islands
+    -- Simple terrain generation: random land with mountains
     for col = 1, self.map.cols do
         for row = 1, self.map.rows do
             local tile = self.map.grid[col][row]
-            -- 70% chance of land
+            -- 70% chance of land, 30% chance of mountains
             if math.random() < 0.7 then
                 tile.isLand = true
             else
-                tile.isLand = false
+                tile.isLand = false  -- Mountain (impassable)
             end
         end
     end
@@ -239,6 +239,15 @@ function Game:draw()
     -- Draw valid placement tiles during placement phase
     if self.state == "placing" then
         self:drawValidPlacementTiles()
+    end
+    
+    -- Debug: Draw line of sight visualization for selected piece
+    if self.selectedPiece and self.selectedPiece.col > 0 and self.selectedPiece.row > 0 then
+        local sourceHex = self.map:getTile(self.selectedPiece.col, self.selectedPiece.row)
+        if sourceHex then
+            local visionRange = self.selectedPiece:getMovementRange() or 3
+            self.map:drawLineOfSightDebug(sourceHex, visionRange, 0, 0)
+        end
     end
     
     -- Draw fog of war for current player's team (after all game elements)

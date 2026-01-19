@@ -20,7 +20,7 @@ function HexTile.new(col, row, pixelX, pixelY, hexSideLength)
     self.pixelY = pixelY
     
     -- Terrain properties
-    self.isLand = false          -- false = water, true = land
+    self.isLand = true           -- true = land, false = mountain (impassable)
     
     -- Calculate hex points for rendering
     self.points = {}
@@ -226,10 +226,10 @@ function HexMap:pixelsToGrid(mouseX, mouseY)
     return col, row
 end
 
--- Check if a point/hex blocks line of sight (water blocks, land doesn't)
+-- Check if a point/hex blocks line of sight (mountains block, land doesn't)
 function HexMap:isPointBlocked(hex)
     if not hex then return false end
-    -- Water blocks line of sight, land doesn't
+    -- Mountains block line of sight, land doesn't
     return not hex.isLand
 end
 
@@ -256,72 +256,99 @@ function HexMap:hasSimpleLineOfSight(fromHex, toHex, blockingHexOut)
     local dx = toX - fromX
     local dy = toY - fromY
     local distance = math.sqrt(dx * dx + dy * dy)
-    local dirX, dirY = 0, 0
-    if distance > 0 then
-        dirX = dx / distance
-        dirY = dy / distance
+    
+    if distance == 0 then
+        return true  -- Same tile
     end
     
-    -- Sample points along the line (more lenient - fewer samples)
-    local steps = math.max(10, math.floor(distance / 20))  -- Fewer samples for more lenient line of sight
+    -- Check all blocking tiles in the map against the line segment
+    local blockingRadius = self.hexTile.hexWidth / 3  -- Distance threshold for blocking
     
-    for i = 1, steps - 1 do
-        local t = i / steps
-        local x = fromX + dx * t
-        local y = fromY + dy * t
-        
-        -- Convert pixel coordinates back to grid coordinates
-        local col, row = self:pixelsToGrid(x, y)
-        
-        -- Check if this tile is blocked (more lenient - only block if line goes through center)
-        if col >= 1 and col <= self.cols and row >= 1 and row <= self.rows then
+    for col = 1, self.cols do
+        for row = 1, self.rows do
             local hex = self.grid[col][row]
-            if self:isPointBlocked(hex) then
-                -- Check if the line goes through the center of the hex (more lenient)
+            
+            -- Skip non-blocking tiles and the source/target
+            if self:isPointBlocked(hex) and hex ~= fromHex and hex ~= toHex then
                 local hexX, hexY = self:gridToPixels(col, row)
-                local distanceToCenter = math.sqrt((x - hexX)^2 + (y - hexY)^2)
-                local hexRadius = self.hexTile.hexWidth / 2  -- Approximate hex radius
                 
-                -- Only block if line goes through the center area of the hex
-                if distanceToCenter < hexRadius * 0.85 then  -- More lenient - only block if close to center
-                    -- Return the blocking hex so it can be marked as visible
+                -- Calculate closest point on line segment to this hex
+                local t = ((hexX - fromX) * dx + (hexY - fromY) * dy) / (distance * distance)
+                t = math.max(0, math.min(1, t))  -- Clamp to line segment
+                
+                local closestX = fromX + t * dx
+                local closestY = fromY + t * dy
+                
+                -- Calculate distance from hex center to line
+                local distToLine = math.sqrt((hexX - closestX)^2 + (hexY - closestY)^2)
+                
+                -- Block if line passes within blocking radius of hex center
+                if distToLine < blockingRadius then
                     if blockingHexOut then
                         blockingHexOut[1] = hex
                     end
-                    return false  -- Line is blocked
-                else
-                    -- Edge leniency gate: only allow peeking if the forward neighbor along the ray is water
-                    local bestDot = -math.huge
-                    local bestNeighbor = nil
-                    local neighbors = self:getNeighbors(hex, 1)
-                    for _, n in ipairs(neighbors) do
-                        local nx, ny = self:gridToPixels(n.col, n.row)
-                        local vx = nx - hexX
-                        local vy = ny - hexY
-                        local vlen = math.sqrt(vx * vx + vy * vy)
-                        if vlen > 0 then
-                            local dot = (vx / vlen) * dirX + (vy / vlen) * dirY
-                            if dot > bestDot then
-                                bestDot = dot
-                                bestNeighbor = n
-                            end
-                        end
-                    end
-                    -- If we're heading into land (or no forward neighbor), block to avoid double-peek through land
-                    if not bestNeighbor or bestDot <= 0 or bestNeighbor.isLand then
-                        -- Return the blocking hex so it can be marked as visible
-                        if blockingHexOut then
-                            blockingHexOut[1] = hex
-                        end
-                        return false
-                    end
-                    -- else forward neighbor is water -> allow peeking; continue sampling
+                    return false
                 end
             end
         end
     end
     
     return true  -- Clear line of sight
+end
+
+-- Draw debug visualization of line of sight
+-- Shows lines from centerHex to all tiles in range, colored by visibility
+function HexMap:drawLineOfSightDebug(centerHex, radius, offsetX, offsetY)
+    offsetX = offsetX or 0
+    offsetY = offsetY or 0
+    
+    if not centerHex then return end
+    
+    local centerX, centerY = self:gridToPixels(centerHex.col, centerHex.row)
+    centerX = centerX + offsetX
+    centerY = centerY + offsetY
+    
+    -- Get all tiles in range
+    local neighbors = self:getNeighbors(centerHex, radius)
+    
+    for _, targetHex in ipairs(neighbors) do
+        local targetX, targetY = self:gridToPixels(targetHex.col, targetHex.row)
+        targetX = targetX + offsetX
+        targetY = targetY + offsetY
+        
+        -- Check line of sight
+        local blockingHex = {}
+        local hasLOS = self:hasFieldOfView(centerHex, targetHex, targetHex.distance, blockingHex)
+        
+        if hasLOS then
+            -- Clear line of sight - green line
+            love.graphics.setColor(0, 1, 0, 0.6)
+            love.graphics.line(centerX, centerY, targetX, targetY)
+            -- Draw small green circle at target
+            love.graphics.circle("fill", targetX, targetY, 4)
+        else
+            -- Blocked line of sight - red line
+            love.graphics.setColor(1, 0, 0, 0.6)
+            love.graphics.line(centerX, centerY, targetX, targetY)
+            -- Draw small red circle at target
+            love.graphics.circle("fill", targetX, targetY, 4)
+            
+            -- If there's a blocking hex, draw a line to it in yellow
+            if blockingHex[1] then
+                local blockX, blockY = self:gridToPixels(blockingHex[1].col, blockingHex[1].row)
+                blockX = blockX + offsetX
+                blockY = blockY + offsetY
+                love.graphics.setColor(1, 1, 0, 0.7)
+                love.graphics.line(centerX, centerY, blockX, blockY)
+                -- Draw orange circle at blocking hex
+                love.graphics.circle("fill", blockX, blockY, 6)
+            end
+        end
+    end
+    
+    -- Draw center point
+    love.graphics.setColor(1, 1, 1, 1)
+    love.graphics.circle("fill", centerX, centerY, 5)
 end
 
 -- Draw the map
@@ -355,7 +382,7 @@ function HexMap:drawTile(tile, offsetX, offsetY)
             love.graphics.setColor(0.8, 0.7, 0.5)  -- Tan for bare land
         end
     else
-        love.graphics.setColor(0.2, 0.5, 0.8)  -- Blue for water
+        love.graphics.setColor(0.5, 0.5, 0.5)  -- Gray for mountains
     end
     
     -- Draw hexagon

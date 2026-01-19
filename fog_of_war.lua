@@ -61,6 +61,52 @@ function FogOfWar:setTileExplored(team, col, row, explored)
     self.explored[team][col][row] = explored
 end
 
+function FogOfWar:revealAreaFull(team, centerCol, centerRow, radius)
+    -- Reveal ALL tiles within radius from center (no line of sight checks)
+    local centerHex = self.map:getTile(centerCol, centerRow)
+    if not centerHex then return end
+    
+    -- Use BFS to find all tiles within range
+    local queue = {{col = centerCol, row = centerRow, distance = 0}}
+    local visitedSet = {}
+    visitedSet[centerCol .. "," .. centerRow] = true
+    
+    while #queue > 0 do
+        local current = table.remove(queue, 1)
+        
+        -- Reveal this tile if within radius
+        if current.distance <= radius then
+            self:setTileVisible(team, current.col, current.row, true)
+        end
+        
+        -- Stop if we've reached maximum range
+        if current.distance >= radius then
+            goto continue
+        end
+        
+        -- Get neighbors
+        local currentHex = self.map:getTile(current.col, current.row)
+        if currentHex then
+            local neighbors = self.map:getNeighbors(currentHex, 1)
+            for _, neighbor in ipairs(neighbors) do
+                local key = neighbor.col .. "," .. neighbor.row
+                if not visitedSet[key] then
+                    local neighborTile = self.map:getTile(neighbor.col, neighbor.row)
+                    if neighborTile then
+                        visitedSet[key] = true
+                        table.insert(queue, {
+                            col = neighbor.col,
+                            row = neighbor.row,
+                            distance = current.distance + 1
+                        })
+                    end
+                end
+            end
+        end
+        ::continue::
+    end
+end
+
 function FogOfWar:revealArea(team, centerCol, centerRow, radius, visited)
     -- Reveal all tiles within radius from center using line of sight
     visited = visited or {}
@@ -134,11 +180,11 @@ function FogOfWar:updateVisibility(team, pieces, bases, startingAreas)
         self.visible[team] = {}
     end
     
-    -- Reveal starting area for this team
+    -- Reveal starting area for this team (full visibility, no line of sight checks)
     if startingAreas and startingAreas[team] then
         local corner = startingAreas[team]
         if corner then
-            self:revealArea(team, corner.col, corner.row, 5, {})
+            self:revealAreaFull(team, corner.col, corner.row, 5)
         end
     end
     
@@ -147,16 +193,16 @@ function FogOfWar:updateVisibility(team, pieces, bases, startingAreas)
         if piece.team == team and piece.col > 0 and piece.row > 0 then
             -- Pieces reveal tiles within their vision range (same as movement range)
             local visionRange = 3  -- Default vision range
-            if piece.getMovementRange then
-                visionRange = piece:getMovementRange() or 3
-            end
+            -- if piece.getMovementRange then
+            --     visionRange = piece:getMovementRange() or 3
+            -- end
             self:revealArea(team, piece.col, piece.row, visionRange, {})
         end
     end
     
     -- Reveal tiles around all bases for this team
     for _, base in ipairs(bases) do
-        if base.team == team and base.col > 0 and base.row > 0 then
+        if base.team == team and base.col > 0 and base.row > 0 then            
             -- Bases reveal tiles within their influence radius
             local visionRange = 2  -- Default vision range
             if base.getRadius then
