@@ -37,11 +37,11 @@ function Game.new()
     self.map:initializeGrid()
     self:generateMapTerrain()
     
-    -- Starting areas for teams (opposite corners with 5 tile radius)
-    self.startingAreaRadius = 5
-    self.teamStartingCorners = {
-        [1] = {col = 1, row = 1},   -- Team 1: top-left corner
-        [2] = {col = self.mapWidth, row = self.mapHeight}  -- Team 2: bottom-right corner
+    -- Starting areas for teams (top and bottom rows, 5 rows deep)
+    self.startingAreaDepth = 5
+    self.teamStartingAreas = {
+        [1] = {rowStart = 1, rowEnd = 5},   -- Team 1: top 5 rows
+        [2] = {rowStart = self.mapHeight - 4, rowEnd = self.mapHeight}  -- Team 2: bottom 5 rows
     }
     
     -- Camera
@@ -65,11 +65,15 @@ function Game.new()
     -- Fog of War system
     self.fogOfWar = FogOfWar.new(self.map, 2)
     
-    -- Initialize starting areas as explored for each team
+    -- Initialize starting areas as explored and visible for each team
     for team = 1, 2 do
-        local corner = self.teamStartingCorners[team]
-        if corner then
-            self.fogOfWar:revealArea(team, corner.col, corner.row, self.startingAreaRadius, {})
+        local area = self.teamStartingAreas[team]
+        if area then
+            for row = area.rowStart, area.rowEnd do
+                for col = 1, self.mapWidth do
+                    self.fogOfWar:setTileVisible(team, col, row, true)
+                end
+            end
         end
     end
     
@@ -303,24 +307,18 @@ function Game:drawValidPlacementTiles()
 end
 
 function Game:drawStartingAreas()
-    -- Draw starting area indicators for both teams
-    for team, corner in pairs(self.teamStartingCorners) do
-        -- Get all hexes within starting area radius
-        local visited = {}
-        self:getHexesWithinRange(corner.col, corner.row, self.startingAreaRadius, visited, team)
-        
+    -- Draw starting area indicators for both teams (top and bottom strips)
+    for team, area in pairs(self.teamStartingAreas) do
         -- Determine color based on team and whether it's the current placement team
         local isCurrentTeam = (team == self.placementTeam)
         local alpha = isCurrentTeam and 0.3 or 0.15
         local r, g, b = team == 1 and 1 or 0, 0, team == 1 and 0 or 1  -- Red for team 1, Blue for team 2
         
         -- Draw fill for starting area
-        -- visited is both a dictionary and array, iterate over array part
         love.graphics.setColor(r, g, b, alpha)
-        for i = 1, #visited do
-            local hex = visited[i]
-            if hex and hex.col and hex.row then
-                local tile = self.map:getTile(hex.col, hex.row)
+        for col = 1, self.mapWidth do
+            for row = area.rowStart, area.rowEnd do
+                local tile = self.map:getTile(col, row)
                 if tile and tile.isLand and tile.points then
                     love.graphics.polygon("fill", tile.points)
                 end
@@ -330,10 +328,9 @@ function Game:drawStartingAreas()
         -- Draw outline for current team's starting area
         if isCurrentTeam then
             love.graphics.setColor(r, g, b, 0.6)
-            for i = 1, #visited do
-                local hex = visited[i]
-                if hex and hex.col and hex.row then
-                    local tile = self.map:getTile(hex.col, hex.row)
+            for col = 1, self.mapWidth do
+                for row = area.rowStart, area.rowEnd do
+                    local tile = self.map:getTile(col, row)
                     if tile and tile.isLand and tile.points then
                         love.graphics.polygon("line", tile.points)
                     end
@@ -1053,12 +1050,12 @@ function Game:endTurn()
 end
 
 function Game:isInStartingArea(col, row, team)
-    -- Check if position is within the team's starting area (5 tile radius from corner)
-    local corner = self.teamStartingCorners[team]
-    if not corner then return false end
+    -- Check if position is within the team's starting area (top or bottom 5 rows)
+    local area = self.teamStartingAreas[team]
+    if not area then return false end
     
-    -- Use isWithinRange to check hex distance (respects terrain)
-    return self:isWithinRange(corner.col, corner.row, col, row, self.startingAreaRadius)
+    -- Check if row is within starting area depth
+    return row >= area.rowStart and row <= area.rowEnd
 end
 
 function Game:placePiece(col, row)
