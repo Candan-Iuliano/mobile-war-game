@@ -9,6 +9,7 @@ local Piece = require("piece")
 local Base = require("base")
 local Resource = require("resource")
 local ActionMenu = require("action_menu")
+local FogOfWar = require("fog_of_war")
 
 function Game.new()
     local self = setmetatable({}, Game)
@@ -36,6 +37,13 @@ function Game.new()
     self.map:initializeGrid()
     self:generateMapTerrain()
     
+    -- Starting areas for teams (opposite corners with 5 tile radius)
+    self.startingAreaRadius = 5
+    self.teamStartingCorners = {
+        [1] = {col = 1, row = 1},   -- Team 1: top-left corner
+        [2] = {col = self.mapWidth, row = self.mapHeight}  -- Team 2: bottom-right corner
+    }
+    
     -- Camera
     self.camera = Camera.new(self.mapWidth * 20, self.mapHeight * 20, 1)
     
@@ -53,6 +61,17 @@ function Game.new()
     
     -- Resource currency (for building units/bases)
     self.teamResources = {[1] = 0, [2] = 0}  -- Resources owned by each team
+    
+    -- Fog of War system
+    self.fogOfWar = FogOfWar.new(self.map, 2)
+    
+    -- Initialize starting areas as explored for each team
+    for team = 1, 2 do
+        local corner = self.teamStartingCorners[team]
+        if corner then
+            self.fogOfWar:revealArea(team, corner.col, corner.row, self.startingAreaRadius, {})
+        end
+    end
     
     -- Input handling
     self.selectedPiece = nil
@@ -156,6 +175,14 @@ function Game:update(dt)
     -- Update game logic here
     if self.state == "playing" then
         -- Update pieces, animations, etc.
+        
+        -- Update fog of war visibility for all teams
+        for team = 1, 2 do
+            self.fogOfWar:updateVisibility(team, self.pieces, self.bases, self.teamStartingCorners)
+        end
+    elseif self.state == "placing" then
+        -- Update fog of war for the team that's placing
+        self.fogOfWar:updateVisibility(self.placementTeam, self.pieces, self.bases, self.teamStartingCorners)
     end
 end
 
@@ -165,6 +192,11 @@ function Game:draw()
     
     -- Draw map
     self.map:draw(0, 0)
+    
+    -- Draw starting areas during placement phase
+    if self.state == "placing" then
+        self:drawStartingAreas()
+    end
     
     -- Draw grid coordinates for debugging
     --self:drawGridCoordinates()
@@ -209,6 +241,14 @@ function Game:draw()
         self:drawValidPlacementTiles()
     end
     
+    -- Draw fog of war for current player's team (after all game elements)
+    if self.state == "playing" then
+        self.fogOfWar:draw(self.currentTurn, self.camera, 0, 0)
+    elseif self.state == "placing" then
+        -- During placement, show fog for the team that's placing
+        self.fogOfWar:draw(self.placementTeam, self.camera, 0, 0)
+    end
+    
     love.graphics.pop()
     
     -- Draw UI (always on screen)
@@ -248,6 +288,47 @@ function Game:drawValidPlacementTiles()
             if tile and tile.isLand and not self:getPieceAt(col, row) and not self:getBaseAt(col, row) and not self:getResourceAt(col, row) then
                 local points = tile.points
                 love.graphics.polygon("fill", points)
+            end
+        end
+    end
+end
+
+function Game:drawStartingAreas()
+    -- Draw starting area indicators for both teams
+    for team, corner in pairs(self.teamStartingCorners) do
+        -- Get all hexes within starting area radius
+        local visited = {}
+        self:getHexesWithinRange(corner.col, corner.row, self.startingAreaRadius, visited, team)
+        
+        -- Determine color based on team and whether it's the current placement team
+        local isCurrentTeam = (team == self.placementTeam)
+        local alpha = isCurrentTeam and 0.3 or 0.15
+        local r, g, b = team == 1 and 1 or 0, 0, team == 1 and 0 or 1  -- Red for team 1, Blue for team 2
+        
+        -- Draw fill for starting area
+        -- visited is both a dictionary and array, iterate over array part
+        love.graphics.setColor(r, g, b, alpha)
+        for i = 1, #visited do
+            local hex = visited[i]
+            if hex and hex.col and hex.row then
+                local tile = self.map:getTile(hex.col, hex.row)
+                if tile and tile.isLand and tile.points then
+                    love.graphics.polygon("fill", tile.points)
+                end
+            end
+        end
+        
+        -- Draw outline for current team's starting area
+        if isCurrentTeam then
+            love.graphics.setColor(r, g, b, 0.6)
+            for i = 1, #visited do
+                local hex = visited[i]
+                if hex and hex.col and hex.row then
+                    local tile = self.map:getTile(hex.col, hex.row)
+                    if tile and tile.isLand and tile.points then
+                        love.graphics.polygon("line", tile.points)
+                    end
+                end
             end
         end
     end
@@ -962,11 +1043,25 @@ function Game:endTurn()
     end
 end
 
+function Game:isInStartingArea(col, row, team)
+    -- Check if position is within the team's starting area (5 tile radius from corner)
+    local corner = self.teamStartingCorners[team]
+    if not corner then return false end
+    
+    -- Use isWithinRange to check hex distance (respects terrain)
+    return self:isWithinRange(corner.col, corner.row, col, row, self.startingAreaRadius)
+end
+
 function Game:placePiece(col, row)
     -- Check if tile is valid (must be land and not occupied)
     local tile = self.map:getTile(col, row)
     if not tile or not tile.isLand then
         return  -- Can't place on water or invalid tile
+    end
+    
+    -- Check if position is within the team's starting area
+    if not self:isInStartingArea(col, row, self.placementTeam) then
+        return  -- Can't place outside starting area
     end
     
     -- Check if tile is already occupied
@@ -1009,6 +1104,11 @@ function Game:placeBase(col, row)
     local tile = self.map:getTile(col, row)
     if not tile or not tile.isLand then
         return  -- Can't place on water or invalid tile
+    end
+    
+    -- Check if position is within the team's starting area
+    if not self:isInStartingArea(col, row, self.placementTeam) then
+        return  -- Can't place outside starting area
     end
     
     -- Check if tile is already occupied by piece or base

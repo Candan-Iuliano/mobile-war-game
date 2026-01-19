@@ -226,6 +226,104 @@ function HexMap:pixelsToGrid(mouseX, mouseY)
     return col, row
 end
 
+-- Check if a point/hex blocks line of sight (water blocks, land doesn't)
+function HexMap:isPointBlocked(hex)
+    if not hex then return false end
+    -- Water blocks line of sight, land doesn't
+    return not hex.isLand
+end
+
+-- Check if target hex is visible from player hex (with line of sight)
+-- Returns: true if visible, false if blocked, and optionally returns the blocking hex
+function HexMap:hasFieldOfView(playerHex, targetHex, distance, blockingHexOut)
+    -- Adjacent tiles are always visible
+    if distance == 1 then
+        return true
+    end
+    
+    -- Simple line of sight: check if there's a blocking tile between player and target
+    return self:hasSimpleLineOfSight(playerHex, targetHex, blockingHexOut)
+end
+
+-- Simple line of sight check
+-- Returns: true if clear, false if blocked, and optionally returns the blocking hex
+function HexMap:hasSimpleLineOfSight(fromHex, toHex, blockingHexOut)
+    -- Get pixel coordinates for both hexes
+    local fromX, fromY = self:gridToPixels(fromHex.col, fromHex.row)
+    local toX, toY = self:gridToPixels(toHex.col, toHex.row)
+    
+    -- Calculate line parameters
+    local dx = toX - fromX
+    local dy = toY - fromY
+    local distance = math.sqrt(dx * dx + dy * dy)
+    local dirX, dirY = 0, 0
+    if distance > 0 then
+        dirX = dx / distance
+        dirY = dy / distance
+    end
+    
+    -- Sample points along the line (more lenient - fewer samples)
+    local steps = math.max(10, math.floor(distance / 20))  -- Fewer samples for more lenient line of sight
+    
+    for i = 1, steps - 1 do
+        local t = i / steps
+        local x = fromX + dx * t
+        local y = fromY + dy * t
+        
+        -- Convert pixel coordinates back to grid coordinates
+        local col, row = self:pixelsToGrid(x, y)
+        
+        -- Check if this tile is blocked (more lenient - only block if line goes through center)
+        if col >= 1 and col <= self.cols and row >= 1 and row <= self.rows then
+            local hex = self.grid[col][row]
+            if self:isPointBlocked(hex) then
+                -- Check if the line goes through the center of the hex (more lenient)
+                local hexX, hexY = self:gridToPixels(col, row)
+                local distanceToCenter = math.sqrt((x - hexX)^2 + (y - hexY)^2)
+                local hexRadius = self.hexTile.hexWidth / 2  -- Approximate hex radius
+                
+                -- Only block if line goes through the center area of the hex
+                -- if distanceToCenter < hexRadius * 0.85 then  -- More lenient - only block if close to center
+                --     -- Return the blocking hex so it can be marked as visible
+                --     if blockingHexOut then
+                --         blockingHexOut[1] = hex
+                --     end
+                --     return false  -- Line is blocked
+                -- else
+                --     -- Edge leniency gate: only allow peeking if the forward neighbor along the ray is water
+                --     local bestDot = -math.huge
+                --     local bestNeighbor = nil
+                --     local neighbors = self:getNeighbors(hex, 1)
+                --     for _, n in ipairs(neighbors) do
+                --         local nx, ny = self:gridToPixels(n.col, n.row)
+                --         local vx = nx - hexX
+                --         local vy = ny - hexY
+                --         local vlen = math.sqrt(vx * vx + vy * vy)
+                --         if vlen > 0 then
+                --             local dot = (vx / vlen) * dirX + (vy / vlen) * dirY
+                --             if dot > bestDot then
+                --                 bestDot = dot
+                --                 bestNeighbor = n
+                --             end
+                --         end
+                --     end
+                    -- If we're heading into land (or no forward neighbor), block to avoid double-peek through land
+                    if not bestNeighbor or bestDot <= 0 or bestNeighbor.isLand then
+                        -- Return the blocking hex so it can be marked as visible
+                        if blockingHexOut then
+                            blockingHexOut[1] = hex
+                        end
+                        return false
+                    end
+                    -- else forward neighbor is water -> allow peeking; continue sampling
+                end
+            end
+        end
+    end
+    
+    return true  -- Clear line of sight
+end
+
 -- Draw the map
 function HexMap:draw(offsetX, offsetY)
     offsetX = offsetX or 0
