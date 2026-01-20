@@ -93,18 +93,8 @@ function Game.new()
 end
 
 function Game:generateMapTerrain()
-    -- Simple terrain generation: random land with mountains
-    for col = 1, self.map.cols do
-        for row = 1, self.map.rows do
-            local tile = self.map.grid[col][row]
-            -- 70% chance of land, 30% chance of mountains
-            if math.random() < 0.7 then
-                tile.isLand = true
-            else
-                tile.isLand = false  -- Mountain (impassable)
-            end
-        end
-    end
+    -- Use balanced terrain generator for competitive play
+    self.map:generateTerrain("balanced")
 end
 
 function Game:initializePieces()

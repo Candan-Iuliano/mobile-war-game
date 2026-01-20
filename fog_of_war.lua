@@ -166,10 +166,9 @@ function FogOfWar:revealArea(team, centerCol, centerRow, radius, visited)
             if hasLOS then
                 -- Clear line of sight - reveal the target tile
                 self:setTileVisible(team, tile.col, tile.row, true)
-            elseif blockingHex[1] then
-                -- Line is blocked - reveal the blocking tile but not the target
-                self:setTileVisible(team, blockingHex[1].col, blockingHex[1].row, true)
             end
+            -- Note: blocking hexes are not automatically revealed
+            -- They must be within range to be visible on their own
         end
     end
 end

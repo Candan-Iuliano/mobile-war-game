@@ -104,18 +104,20 @@ end
 
 -- Get a built-in generator by name
 function HexMap:getBuiltInGenerator(methodName)
-    local generators = {
-        scattered = require("mapGenerators.scatteredIslands"),
-        archipelago = require("mapGenerators.archipelago"),
-        continental = require("mapGenerators.continental"),
-        ocean = require("mapGenerators.ocean"),
-    }
+    -- Try to load the requested generator
+    local success, generator = pcall(require, "mapGenerators." .. methodName)
     
-    if not generators[methodName] then
-        error("Unknown terrain generation method: " .. methodName)
+    if success and generator then
+        return generator
     end
     
-    return generators[methodName]
+    -- Fallback: if generator not found, use balanced
+    if methodName ~= "balanced" then
+        print("Warning: Generator '" .. methodName .. "' not found, using 'balanced' instead")
+        return require("mapGenerators.balanced")
+    end
+    
+    error("Could not load balanced terrain generator")
 end
 
 
@@ -245,52 +247,46 @@ function HexMap:hasFieldOfView(playerHex, targetHex, distance, blockingHexOut)
     return self:hasSimpleLineOfSight(playerHex, targetHex, blockingHexOut)
 end
 
--- Simple line of sight check
+-- Hex raycasting line of sight check
+-- Traces a line from source to target, checking each hex along the path
 -- Returns: true if clear, false if blocked, and optionally returns the blocking hex
 function HexMap:hasSimpleLineOfSight(fromHex, toHex, blockingHexOut)
-    -- Get pixel coordinates for both hexes
+    -- Start from the source hex and trace towards the target
+    -- Use parametric line: P(t) = fromPos + t*(toPos - fromPos), where t goes from 0 to 1
+    
     local fromX, fromY = self:gridToPixels(fromHex.col, fromHex.row)
     local toX, toY = self:gridToPixels(toHex.col, toHex.row)
     
-    -- Calculate line parameters
-    local dx = toX - fromX
-    local dy = toY - fromY
-    local distance = math.sqrt(dx * dx + dy * dy)
+    -- Number of steps to check along the line
+    local numSteps = 50
     
-    if distance == 0 then
-        return true  -- Same tile
-    end
-    
-    -- Check all blocking tiles in the map against the line segment
-    local blockingRadius = self.hexTile.hexWidth / 3  -- Distance threshold for blocking
-    
-    for col = 1, self.cols do
-        for row = 1, self.rows do
-            local hex = self.grid[col][row]
-            
-            -- Skip non-blocking tiles and the source/target
-            if self:isPointBlocked(hex) and hex ~= fromHex and hex ~= toHex then
-                local hexX, hexY = self:gridToPixels(col, row)
-                
-                -- Calculate closest point on line segment to this hex
-                local t = ((hexX - fromX) * dx + (hexY - fromY) * dy) / (distance * distance)
-                t = math.max(0, math.min(1, t))  -- Clamp to line segment
-                
-                local closestX = fromX + t * dx
-                local closestY = fromY + t * dy
-                
-                -- Calculate distance from hex center to line
-                local distToLine = math.sqrt((hexX - closestX)^2 + (hexY - closestY)^2)
-                
-                -- Block if line passes within blocking radius of hex center
-                if distToLine < blockingRadius then
-                    if blockingHexOut then
-                        blockingHexOut[1] = hex
-                    end
-                    return false
-                end
-            end
+    for step = 1, numSteps - 1 do
+        local t = step / numSteps
+        
+        -- Interpolate position along the line
+        local x = fromX + t * (toX - fromX)
+        local y = fromY + t * (toY - fromY)
+        
+        -- Convert pixel position back to hex coordinates
+        local col, row = self:pixelsToGrid(x, y)
+        
+        -- Bounds check
+        if col < 1 or col > self.cols or row < 1 or row > self.rows then
+            goto continue
         end
+        
+        local hex = self:getTile(col, row)
+        
+        -- Check if this hex blocks vision
+        -- Only block if it's not the source or target and it's a mountain
+        if hex and self:isPointBlocked(hex) and hex ~= fromHex and hex ~= toHex then
+            if blockingHexOut then
+                blockingHexOut[1] = hex
+            end
+            return false
+        end
+        
+        ::continue::
     end
     
     return true  -- Clear line of sight
