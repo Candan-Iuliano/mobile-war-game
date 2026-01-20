@@ -85,7 +85,7 @@ function ActionMenu:generateHexagonPoints(centerX, centerY, size)
 end
 
 function ActionMenu:draw(canAffordCallback)
-    -- canAffordCallback(option) should return true/false for each option
+    -- canAffordCallback(option) should return true/false for each option, or "deconstruct" for deconstruct action
     
     for i, pos in ipairs(self.hexPositions) do
         local option = self.options[i]
@@ -93,13 +93,15 @@ function ActionMenu:draw(canAffordCallback)
             -- Draw hexagon
             local points = self:generateHexagonPoints(pos.x, pos.y, pos.size)
             
-            -- Color based on affordability
+            -- Color based on affordability or special type
             local canAfford = true
             if canAffordCallback then
                 canAfford = canAffordCallback(option)
             end
             
-            if canAfford then
+            if canAfford == "deconstruct" then
+                love.graphics.setColor(0.8, 0.2, 0.2, 0.9)  -- Red for deconstruct
+            elseif canAfford then
                 love.graphics.setColor(0.2, 0.8, 0.2, 0.9)  -- Green if affordable
             else
                 love.graphics.setColor(0.5, 0.5, 0.5, 0.9)  -- Gray if can't afford
@@ -110,8 +112,18 @@ function ActionMenu:draw(canAffordCallback)
             love.graphics.setColor(0, 0, 0, 1)
             love.graphics.polygon("line", points)
             
-            -- Draw cost text (if option has a cost)
-            if option.cost then
+            -- Draw X symbol for deconstruct option
+            if option.icon == "X" then
+                love.graphics.setColor(1, 1, 1, 1)
+                love.graphics.setLineWidth(3)
+                local xSize = pos.size * 0.5
+                love.graphics.line(pos.x - xSize, pos.y - xSize, pos.x + xSize, pos.y + xSize)
+                love.graphics.line(pos.x + xSize, pos.y - xSize, pos.x - xSize, pos.y + xSize)
+                love.graphics.setLineWidth(1)
+            end
+            
+            -- Draw cost text (if option has a cost and it's not deconstruct)
+            if option.cost and option.cost > 0 then
                 love.graphics.setColor(1, 1, 1, 1)
                 love.graphics.setFont(love.graphics.newFont(10))
                 local costText = tostring(option.cost)

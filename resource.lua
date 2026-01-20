@@ -12,6 +12,7 @@ function Resource.new(resourceType, gameMap, col, row)
     self.row = row
     self.hexTile = nil
     self.owner = nil  -- Which team owns this resource (nil = neutral)
+    self.hasMine = false  -- Whether this resource has a mine built on it
     
     if col and row then
         self.hexTile = gameMap:getTile(col, row)

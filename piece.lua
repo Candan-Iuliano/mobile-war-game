@@ -11,6 +11,11 @@ local PIECE_TYPES = {
     rook = { name = "Rook", moveRange = 5, attackRange = 5, hp = 5, damage = 5, speed = 1, maxAmmo = 3, maxSupply = 5 },
     queen = { name = "Queen", moveRange = 5, attackRange = 5, hp = 5, damage = 5, speed = 2, maxAmmo = 3, maxSupply = 5 },
     king = { name = "King", moveRange = 1, attackRange = 1, hp = 10, damage = 5, speed = 2, maxAmmo = 3, maxSupply = 5 },
+    
+    -- New specialized units
+    sniper = { name = "Sniper", moveRange = 2, attackRange = 7, hp = 4, damage = 8, speed = 1, maxAmmo = 2, maxSupply = 5 },
+    tank = { name = "Tank", moveRange = 4, attackRange = 3, hp = 15, damage = 7, speed = 3, maxAmmo = 4, maxSupply = 5 },
+    engineer = { name = "Engineer", moveRange = 3, attackRange = 0, hp = 8, damage = 0, speed = 2, maxAmmo = 0, maxSupply = 5, canBuild = true },
 }
 
 function Piece.new(pieceType, team, gameMap, col, row)
@@ -30,6 +35,12 @@ function Piece.new(pieceType, team, gameMap, col, row)
     self.selected = false
     self.canMove = true
     self.hasMoved = false  -- Track if piece has moved this turn
+    
+    -- Building system (for engineers)
+    self.isBuilding = false  -- Is this piece currently building something?
+    self.buildingType = nil  -- What type of structure is being built
+    self.buildingTurnsRemaining = 0  -- How many more turns until building completes
+    self.buildingTeam = nil  -- Team that owns the structure being built
     
     -- Ammo and supply system
     self.maxAmmo = self.stats.maxAmmo or 3
@@ -149,6 +160,16 @@ function Piece:draw(pixelX, pixelY, hexSideLength)
     love.graphics.rectangle("fill", pixelX - 15, pixelY - 30, 30, 4)
     love.graphics.setColor(0, 1, 0)
     love.graphics.rectangle("fill", pixelX - 15, pixelY - 30, 30 * healthPercent, 4)
+    
+    -- Draw "E" for engineer pieces
+    if self.type == "engineer" then
+        love.graphics.setColor(1, 1, 1)
+        love.graphics.setFont(love.graphics.newFont(16))
+        local text = "E"
+        local textWidth = love.graphics.getFont():getWidth(text)
+        local textHeight = love.graphics.getFont():getHeight()
+        love.graphics.print(text, pixelX - textWidth / 2, pixelY - textHeight / 2)
+    end
 end
 
 return Piece

@@ -20,8 +20,8 @@ function Game.new()
     self.turnCount = 0
     
     -- Placement phase
-    self.piecesPerTeam = 3  -- Number of pawns per team
-    self.piecesToPlace = self.piecesPerTeam * 2  -- Total pieces (3 for each team)
+    self.piecesPerTeam = 4  -- Number of pieces per team (3 pawns + 1 engineer)
+    self.piecesToPlace = self.piecesPerTeam * 2  -- Total pieces (4 for each team)
     self.piecesPlaced = 0
     self.basesPerTeam = 3  -- HQ, Ammo Depot, Supply Depot
     self.basesToPlace = self.basesPerTeam * 2  -- Total bases (3 for each team)
@@ -99,13 +99,18 @@ end
 
 function Game:initializePieces()
     -- Create 3 pawns for team 1 to be placed (not positioned yet)
-    for i = 1, self.piecesPerTeam do
+    for i = 1, 3 do
         self:addPiece("pawn", 1, nil, nil)  -- col and row will be set during placement
     end
+    -- Create 1 engineer for team 1
+    self:addPiece("engineer", 1, nil, nil)
+    
     -- Create 3 pawns for team 2 to be placed (not positioned yet)
-    for i = 1, self.piecesPerTeam do
+    for i = 1, 3 do
         self:addPiece("pawn", 2, nil, nil)  -- col and row will be set during placement
     end
+    -- Create 1 engineer for team 2
+    self:addPiece("engineer", 2, nil, nil)
 end
 
 function Game:initializeBases()
@@ -385,27 +390,86 @@ function Game:drawUI()
         love.graphics.print("Team: " .. teamColor .. " | Turn: " .. self.turnCount, 10, 10)
         love.graphics.print("Resources: " .. (self.teamResources[self.currentTurn] or 0), 10, 30)
         
+        -- Count bases for current team
+        local hqCount = 0
+        local ammoDepotCount = 0
+        local supplyDepotCount = 0
+        for _, base in ipairs(self.bases) do
+            if base.team == self.currentTurn and base.col > 0 and base.row > 0 then
+                if base.type == "hq" then
+                    hqCount = hqCount + 1
+                elseif base.type == "ammoDepot" then
+                    ammoDepotCount = ammoDepotCount + 1
+                elseif base.type == "supplyDepot" then
+                    supplyDepotCount = supplyDepotCount + 1
+                end
+            end
+        end
+        local basesInfo = string.format("Bases: HQ: %d | Ammo: %d | Supply: %d", hqCount, ammoDepotCount, supplyDepotCount)
+        love.graphics.setFont(love.graphics.newFont(12))
+        love.graphics.print(basesInfo, 10, 50)
+        
+        -- Show building engineers for current team
+        local yOffset = 70
+        love.graphics.setFont(love.graphics.newFont(11))
+        for _, piece in ipairs(self.pieces) do
+            if piece.team == self.currentTurn and piece.isBuilding and piece.buildingTurnsRemaining then
+                local buildingName = piece.buildingType == "resource_mine" and "Resource Mine" or
+                                   piece.buildingType == "ammoDepot" and "Ammo Depot" or
+                                   piece.buildingType == "supplyDepot" and "Supply Depot" or
+                                   "Structure"
+                local buildText = string.format("Engineer building: %s (%d turns)", buildingName, piece.buildingTurnsRemaining)
+                love.graphics.print(buildText, 10, yOffset)
+                yOffset = yOffset + 15
+            end
+        end
+        
+        love.graphics.setFont(love.graphics.newFont(14))
+        
         -- Draw selected piece info
         if self.selectedPiece then
             local info = string.format("Selected: %s (HP: %d/%d)", 
                 self.selectedPiece.stats.name, 
                 self.selectedPiece.hp, 
                 self.selectedPiece.maxHp)
-            love.graphics.print(info, 10, 50)
+            love.graphics.print(info, 10, yOffset)
+            yOffset = yOffset + 20
             
-            -- Show ammo and supply
-            local ammoInfo = string.format("Ammo: %d/%d | Supply: %d/%d", 
-                self.selectedPiece.ammo,
-                self.selectedPiece.maxAmmo,
-                self.selectedPiece.supply,
-                self.selectedPiece.maxSupply)
-            love.graphics.print(ammoInfo, 10, 70)
+            -- Show building status if building
+            if self.selectedPiece.isBuilding then
+                local buildingName = self.selectedPiece.buildingType == "resource_mine" and "Resource Mine" or
+                                   self.selectedPiece.buildingType == "ammoDepot" and "Ammo Depot" or
+                                   self.selectedPiece.buildingType == "supplyDepot" and "Supply Depot" or
+                                   "Structure"
+                local buildInfo = string.format("Building: %s (%d turns left)",
+                    buildingName,
+                    self.selectedPiece.buildingTurnsRemaining or 0)
+                love.graphics.print(buildInfo, 10, yOffset)
+                yOffset = yOffset + 20
+                love.graphics.setFont(love.graphics.newFont(10))
+                local controlsY = yOffset
+                love.graphics.print("Click to select piece | Right-click to move | E: End Turn | R: Reset", 10, controlsY)
+            else
+                -- Show ammo and supply
+                local ammoInfo = string.format("Ammo: %d/%d | Supply: %d/%d", 
+                    self.selectedPiece.ammo,
+                    self.selectedPiece.maxAmmo,
+                    self.selectedPiece.supply,
+                    self.selectedPiece.maxSupply)
+                love.graphics.print(ammoInfo, 10, yOffset)
+                yOffset = yOffset + 20
+                
+                -- Draw controls
+                love.graphics.setFont(love.graphics.newFont(10))
+                local controlsY = yOffset
+                love.graphics.print("Click to select piece | Right-click to move | E: End Turn | R: Reset", 10, controlsY)
+            end
+        else
+            -- Draw controls
+            love.graphics.setFont(love.graphics.newFont(10))
+            local controlsY = yOffset
+            love.graphics.print("Click to select piece | Right-click to move | E: End Turn | R: Reset", 10, controlsY)
         end
-        
-        -- Draw controls
-        love.graphics.setFont(love.graphics.newFont(10))
-        local controlsY = self.selectedPiece and 90 or 50
-        love.graphics.print("Click to select piece | Right-click to move | E: End Turn | R: Reset", 10, controlsY)
     end
 end
 
@@ -430,22 +494,47 @@ function Game:mousepressed(x, y, button)
                 return  -- Action menu handled the click
             end
             
-            -- Check if clicking on a base
+            -- Check if clicking on a piece first (pieces have priority over bases)
+            local piece = self:getPieceAt(col, row)
             local base = self:getBaseAt(col, row)
+            
+            -- If there's a piece, handle piece selection logic
+            if piece and piece.team == self.currentTurn and piece.col > 0 and piece.row > 0 then
+                -- If clicking on already selected piece with menu open, close menu and deselect
+                if piece == self.selectedPiece and self.actionMenu then
+                    self.actionMenu = nil
+                    self.actionMenuContext = nil
+                    self.actionMenuContextType = nil
+                    self.selectedPiece.selected = false
+                    self.selectedPiece = nil
+                    self.validMoves = {}
+                    self.validAttacks = {}
+                    return
+                end
+                
+                -- If clicking on already selected engineer (no menu), open build menu
+                if piece == self.selectedPiece and piece.stats.canBuild then
+                    self:openActionMenu(piece, "piece")
+                    return
+                end
+                
+                -- Otherwise, select this piece
+                if self.actionMenu then
+                    self.actionMenu = nil
+                    self.actionMenuContext = nil
+                    self.actionMenuContextType = nil
+                end
+                self:selectPiece(col, row)
+                return
+            end
+            
+            -- If no piece but there's a base, handle base selection
             if base and base.team == self.currentTurn and base.col > 0 and base.row > 0 then
                 self:selectBase(base)
                 return
             end
             
-            -- Check if clicking on a piece (for future piece actions)
-            -- local piece = self:getPieceAt(col, row)
-            -- if piece and piece.team == self.currentTurn and piece.col > 0 and piece.row > 0 then
-            --     self:openActionMenu(piece, "piece")
-            --     return
-            -- end
-            
-            -- Otherwise, try to select a piece
-            -- But first, close any open action menu
+            -- Otherwise, try to select a piece (in case piece team check failed)
             if self.actionMenu then
                 self.actionMenu = nil
                 self.actionMenuContext = nil
@@ -585,35 +674,77 @@ function Game:getActionOptions(context, contextType)
                 cost = 2,  -- Cost in resources
                 icon = "pawn"  -- For future use
             })
+            -- Sniper
             table.insert(options, {
-                id = "build_infantry",
-                name = "Build Infantry",
-                cost = 2,  -- Cost in resources
-                icon = "pawn"  -- For future use
+                id = "build_sniper",
+                name = "Build Sniper",
+                cost = 4,
+                icon = "sniper"
             })
-            -- table.insert(options, {
-            --     id = "build_infantry",
-            --     name = "Build Infantry",
-            --     cost = 2,  -- Cost in resources
-            --     icon = "pawn"  -- For future use
-            -- })
-            -- table.insert(options, {
-            --     id = "build_infantry",
-            --     name = "Build Infantry",
-            --     cost = 2,  -- Cost in resources
-            --     icon = "pawn"  -- For future use
-            -- })
-
-            -- table.insert(options, {
-            --     id = "build_infantry",
-            --     name = "Build Infantry",
-            --     cost = 2,  -- Cost in resources
-            --     icon = "pawn"  -- For future use
-            -- })
+            -- Tank
+            table.insert(options, {
+                id = "build_tank",
+                name = "Build Tank",
+                cost = 6,
+                icon = "tank"
+            })
+            -- Engineer
+            table.insert(options, {
+                id = "build_engineer",
+                name = "Build Engineer",
+                cost = 3,
+                icon = "engineer"
+            })
         end
+        -- Add deconstruct option to all bases
+        table.insert(options, {
+            id = "deconstruct",
+            name = "Deconstruct",
+            cost = 0,  -- Free
+            icon = "X",
+            isDeconstruct = true  -- Flag for red coloring
+        })
         -- Add more base types here as needed
     elseif contextType == "piece" then
-        -- Add piece actions here (e.g., special abilities, upgrades, etc.)
+        -- Engineer can build structures
+        if context.stats.canBuild and not context.isBuilding then
+            -- Check if engineer is on a resource tile or if tile already has a base
+            local onResourceTile = self:getResourceAt(context.col, context.row) ~= nil
+            local hasBase = self:getBaseAt(context.col, context.row) ~= nil
+            
+            table.insert(options, {
+                id = "build_hq",
+                name = "Build HQ",
+                cost = 10,
+                buildTurns = 4,  -- Takes 4 turns to build
+                icon = "hq",
+                disabled = onResourceTile or hasBase  -- Can't build bases on resource tiles or occupied tiles
+            })
+            table.insert(options, {
+                id = "build_ammo_depot",
+                name = "Build Ammo Depot",
+                cost = 5,
+                buildTurns = 2,  -- Takes 2 turns to build
+                icon = "ammo_depot",
+                disabled = onResourceTile or hasBase  -- Can't build bases on resource tiles or occupied tiles
+            })
+            table.insert(options, {
+                id = "build_supply_depot",
+                name = "Build Supply Depot",
+                cost = 5,
+                buildTurns = 2,  -- Takes 2 turns to build
+                icon = "supply_depot",
+                disabled = onResourceTile or hasBase  -- Can't build bases on resource tiles or occupied tiles
+            })
+            table.insert(options, {
+                id = "build_resource_mine",
+                name = "Build Resource Mine",
+                cost = 8,
+                buildTurns = 3,  -- Takes 3 turns to build
+                icon = "resource_mine",
+                disabled = hasBase  -- Can't build mine if tile has a base
+            })
+        end
     elseif contextType == "resource" then
         -- Add resource actions here (e.g., harvest, upgrade, etc.)
     end
@@ -624,8 +755,14 @@ end
 function Game:drawActionMenu()
     if not self.actionMenu then return end
     
-    -- Create callback to check if option is affordable
+    -- Create callback to check if option is affordable and enabled
     local canAffordCallback = function(option)
+        -- Deconstruct is always shown as red (special case)
+        if option.isDeconstruct then return "deconstruct" end
+        
+        -- Check if option is disabled
+        if option.disabled then return false end
+        
         if not option.cost then return true end
         
         local team
@@ -661,6 +798,11 @@ function Game:executeAction(option)
     local context = self.actionMenuContext
     local contextType = self.actionMenuContextType
     
+    -- Check if option is disabled
+    if option.disabled then
+        return  -- Can't execute disabled actions
+    end
+    
     -- Get team from context
     local team = context.team or self.currentTurn
     
@@ -673,6 +815,35 @@ function Game:executeAction(option)
     if option.id == "build_infantry" and contextType == "base" then
         -- Build a pawn near the base
         self:buildUnitNearBase(context, "pawn", team, option.cost)
+    elseif option.id == "build_sniper" and contextType == "base" then
+        -- Build a sniper near the base
+        self:buildUnitNearBase(context, "sniper", team, option.cost)
+    elseif option.id == "build_tank" and contextType == "base" then
+        -- Build a tank near the base
+        self:buildUnitNearBase(context, "tank", team, option.cost)
+    elseif option.id == "build_engineer" and contextType == "base" then
+        -- Build an engineer near the base
+        self:buildUnitNearBase(context, "engineer", team, option.cost)
+    elseif option.id == "build_hq" and contextType == "piece" then
+        -- Engineer builds an HQ
+        self:buildStructureNearPiece(context, "hq", team, option.cost, option.buildTurns)
+    elseif option.id == "build_ammo_depot" and contextType == "piece" then
+        -- Engineer builds an ammo depot
+        self:buildStructureNearPiece(context, "ammoDepot", team, option.cost, option.buildTurns)
+    elseif option.id == "build_supply_depot" and contextType == "piece" then
+        -- Engineer builds a supply depot
+        self:buildStructureNearPiece(context, "supplyDepot", team, option.cost, option.buildTurns)
+    elseif option.id == "build_resource_mine" and contextType == "piece" then
+        -- Engineer builds a resource mine
+        self:buildResourceMineNearPiece(context, team, option.cost, option.buildTurns)
+    elseif option.id == "deconstruct" and contextType == "base" then
+        -- Deconstruct the base (remove it from the game)
+        for i, base in ipairs(self.bases) do
+            if base == context then
+                table.remove(self.bases, i)
+                break
+            end
+        end
     end
     -- Add more action handlers here as needed
     
@@ -720,14 +891,62 @@ function Game:buildUnitNearBase(base, unitType, team, cost)
     end
 end
 
+function Game:buildStructureNearPiece(piece, structureType, team, cost, buildTurns)
+    -- Deduct cost
+    self.teamResources[team] = self.teamResources[team] - cost
+    
+    -- Check if engineer's current tile is valid (no existing base)
+    local tile = self.map:getTile(piece.col, piece.row)
+    if tile and tile.isLand and not self:getBaseAt(piece.col, piece.row) then
+        -- Start building process
+        piece.isBuilding = true
+        piece.buildingType = structureType
+        piece.buildingTurnsRemaining = buildTurns
+        piece.buildingTeam = team
+        piece.hasMoved = true  -- Can't move while building
+        return
+    end
+    
+    -- If tile already has a base, refund the cost
+    self.teamResources[team] = self.teamResources[team] + cost
+ end
+
+function Game:buildResourceMineNearPiece(piece, team, cost, buildTurns)
+    -- Check if engineer's current tile has an existing resource
+    local existingResource = self:getResourceAt(piece.col, piece.row)
+    if not existingResource then
+        -- Can't build mine here - no resource tile
+        return
+    end
+    
+    -- Check if resource already has a mine (owner is set means it's been captured/mined)
+    if existingResource.hasMine then
+        -- Already has a mine
+        return
+    end
+    
+    -- Deduct cost
+    self.teamResources[team] = self.teamResources[team] - cost
+    
+    -- Start building process
+    piece.isBuilding = true
+    piece.buildingType = "resource_mine"
+    piece.buildingTurnsRemaining = buildTurns
+    piece.buildingTeam = team
+    piece.buildingResourceTarget = existingResource  -- Store reference to the resource
+    piece.hasMoved = true  -- Can't move while building
+end
+
 function Game:calculateValidMoves()
     self.validMoves = {}
     self.validAttacks = {}
     
     if not self.selectedPiece then return end
     
-    -- If piece has already moved this turn, don't show any moves
-    if self.selectedPiece.hasMoved then
+    -- If piece has already moved this turn or is currently building, don't show any moves
+    -- Make sure to handle pieces without building properties (old pieces)
+    local isBuilding = self.selectedPiece.isBuilding or false
+    if self.selectedPiece.hasMoved or isBuilding then
         return
     end
     
@@ -888,16 +1107,25 @@ function Game:resupplyPieceFromBases(piece)
 end
 
 function Game:generateResourceIncome(team)
-    -- Count how many resource tiles this team owns
-    local ownedResources = 0
-    for _, resource in ipairs(self.resources) do
-        if resource.owner == team then
-            ownedResources = ownedResources + 1
+    local income = 0
+    
+    -- Count HQs owned by this team (each HQ generates 1 resource)
+    for _, base in ipairs(self.bases) do
+        if base.team == team and base.type == "hq" and base.col > 0 and base.row > 0 then
+            income = income + 1
         end
     end
     
-    -- Add 1 resource per owned resource tile
-    self.teamResources[team] = self.teamResources[team] + ownedResources
+    -- Count resource tiles with mines owned by this team
+    for _, resource in ipairs(self.resources) do
+        if resource.owner == team and resource.hasMine then
+            -- Mined resources produce 2
+            income = income + 2
+        end
+    end
+    
+    -- Add income to team's resources
+    self.teamResources[team] = self.teamResources[team] + income
 end
 
 function Game:movePiece(col, row)
@@ -926,12 +1154,6 @@ function Game:movePiece(col, row)
     if isValidMove then
         self.selectedPiece:setPosition(col, row)
         
-        -- Check if piece moved onto a resource and capture it
-        local resource = self:getResourceAt(col, row)
-        if resource then
-            resource:capture(self.selectedPiece.team)
-        end
-        
         self:calculateValidMoves()
     elseif isValidAttack and targetPiece then
         -- Check if piece has ammo
@@ -954,12 +1176,6 @@ function Game:movePiece(col, row)
             end
             -- Only move to the enemy tile if we killed them
             self.selectedPiece:setPosition(col, row)
-            
-            -- Check if piece moved onto a resource and capture it
-            local resource = self:getResourceAt(col, row)
-            if resource then
-                resource:capture(self.selectedPiece.team)
-            end
         end
         -- If enemy survived, attacker stays in place (no movement)
         -- Mark piece as moved since it attacked
@@ -973,6 +1189,14 @@ function Game:keypressed(key)
         self:endTurn()
     elseif key == "r" then
         self:resetGame()
+    elseif key == "w" then
+        self.camera:pan(0, 20)  -- Move up
+    elseif key == "s" then
+        self.camera:pan(0, -20)  -- Move down
+    elseif key == "a" then
+        self.camera:pan(20, 0)  -- Move left
+    elseif key == "d" then
+        self.camera:pan(-20, 0)  -- Move right
     end
 end
 
@@ -1001,6 +1225,34 @@ function Game:endTurn()
     local teamThatEnded = self.currentTurn
     for _, piece in ipairs(self.pieces) do
         if piece.team == teamThatEnded then
+            -- Process building progress
+            if piece.isBuilding and piece.buildingTurnsRemaining then
+                piece.buildingTurnsRemaining = piece.buildingTurnsRemaining - 1
+                
+                -- Check if building is complete (0 or less turns remaining)
+                if piece.buildingTurnsRemaining <= 0 then
+                    -- Place the completed structure
+                    if piece.buildingType == "resource_mine" then
+                        -- Mark the resource as having a mine and owned by the team
+                        if piece.buildingResourceTarget then
+                            piece.buildingResourceTarget.hasMine = true
+                            piece.buildingResourceTarget:capture(piece.buildingTeam)
+                        end
+                    else
+                        -- It's a base structure (HQ, Ammo Depot, Supply Depot)
+                        self:addBase(piece.buildingType, piece.buildingTeam, piece.col, piece.row)
+                    end
+                    
+                    -- Clear building state completely
+                    piece.isBuilding = false
+                    piece.buildingType = nil
+                    piece.buildingTurnsRemaining = 0
+                    piece.buildingTeam = nil
+                    piece.buildingResourceTarget = nil
+                    piece.hasMoved = false  -- Reset hasMoved so engineer can act on their next turn
+                end
+            end
+            
             piece:consumeSupply()  -- Reduce supply by 1 turn first
             piece:applyAttrition()  -- Take damage if out of supply
             
@@ -1029,9 +1281,14 @@ function Game:endTurn()
     
     -- Switch to next team's turn
     self.currentTurn = self.currentTurn == 1 and 2 or 1
-    self.turnCount = self.turnCount + 1
     
-    -- Reset move status for pieces of the current team at the START of their turn
+    -- Only increment turn counter when it goes back to team 1 (after both teams have played)
+    if self.currentTurn == 1 then
+        self.turnCount = self.turnCount + 1
+    end
+    
+    -- Reset move status for ALL pieces of the current team at the START of their turn
+    -- This includes engineers who just completed building
     for _, piece in ipairs(self.pieces) do
         if piece.team == self.currentTurn then
             piece:resetMove()
