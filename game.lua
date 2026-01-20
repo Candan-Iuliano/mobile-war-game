@@ -98,13 +98,13 @@ function Game:generateMapTerrain()
 end
 
 function Game:initializePieces()
-    -- Create 3 pawns for team 1 to be placed (not positioned yet)
+    -- Create 3 infantry for team 1 to be placed (not positioned yet)
     for i = 1, self.piecesPerTeam do
-        self:addPiece("pawn", 1, nil, nil)  -- col and row will be set during placement
+        self:addPiece("infantry", 1, nil, nil)  -- col and row will be set during placement
     end
-    -- Create 3 pawns for team 2 to be placed (not positioned yet)
+    -- Create 3 infantry for team 2 to be placed (not positioned yet)
     for i = 1, self.piecesPerTeam do
-        self:addPiece("pawn", 2, nil, nil)  -- col and row will be set during placement
+        self:addPiece("infantry", 2, nil, nil)  -- col and row will be set during placement
     end
 end
 
