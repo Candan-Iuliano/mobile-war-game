@@ -20,7 +20,7 @@ function Game.new()
     self.turnCount = 0
     
     -- Placement phase
-    self.piecesPerTeam = 4  -- Number of pieces per team (3 pawns + 1 engineer)
+    self.piecesPerTeam = 4  -- Number of pieces per team (3 infantry + 1 engineer)
     self.piecesToPlace = self.piecesPerTeam * 2  -- Total pieces (4 for each team)
     self.piecesPlaced = 0
     self.basesPerTeam = 3  -- HQ, Ammo Depot, Supply Depot
@@ -78,9 +78,9 @@ function Game.new()
     end
     
     -- Input handling
-    self.selectedPiece = nil
-    self.validMoves = {}
-    self.validAttacks = {}
+    if self.selectedPiece then
+        self.selectedPiece:deselect(self)
+    end
     self.isDragging = false
     self.dragStartX = 0
     self.dragStartY = 0
@@ -98,16 +98,16 @@ function Game:generateMapTerrain()
 end
 
 function Game:initializePieces()
-    -- Create 3 pawns for team 1 to be placed (not positioned yet)
+    -- Create 3 infantry for team 1 to be placed (not positioned yet)
     for i = 1, 3 do
-        self:addPiece("pawn", 1, nil, nil)  -- col and row will be set during placement
+        self:addPiece("infantry", 1, nil, nil)  -- col and row will be set during placement
     end
     -- Create 1 engineer for team 1
     self:addPiece("engineer", 1, nil, nil)
     
-    -- Create 3 pawns for team 2 to be placed (not positioned yet)
+    -- Create 3 infantry for team 2 to be placed (not positioned yet)
     for i = 1, 3 do
-        self:addPiece("pawn", 2, nil, nil)  -- col and row will be set during placement
+        self:addPiece("infantry", 2, nil, nil)  -- col and row will be set during placement
     end
     -- Create 1 engineer for team 2
     self:addPiece("engineer", 2, nil, nil)
@@ -383,7 +383,7 @@ function Game:drawUI()
         love.graphics.print("Team " .. teamName .. " placing", 10, 30)
         love.graphics.print("Pieces remaining: " .. remaining, 10, 50)
         love.graphics.setFont(love.graphics.newFont(10))
-        love.graphics.print("Click on land tiles to place your pawns", 10, 70)
+        love.graphics.print("Click on land tiles to place your infantry", 10, 70)
     else
         -- Normal gameplay UI
         local teamColor = self.currentTurn == 1 and "Red" or "Blue"
@@ -505,10 +505,7 @@ function Game:mousepressed(x, y, button)
                     self.actionMenu = nil
                     self.actionMenuContext = nil
                     self.actionMenuContextType = nil
-                    self.selectedPiece.selected = false
-                    self.selectedPiece = nil
-                    self.validMoves = {}
-                    self.validAttacks = {}
+                    piece:deselect(self)
                     return
                 end
                 
@@ -566,10 +563,7 @@ function Game:selectPiece(col, row)
     
     -- If clicking on the already selected piece, deselect it
     if piece and piece == self.selectedPiece then
-        self.selectedPiece.selected = false
-        self.selectedPiece = nil
-        self.validMoves = {}
-        self.validAttacks = {}
+        piece:deselect(self)
         return
     end
     
@@ -612,10 +606,7 @@ end
 function Game:selectBase(base)
     -- Deselect piece if one is selected
     if self.selectedPiece then
-        self.selectedPiece.selected = false
-        self.selectedPiece = nil
-        self.validMoves = {}
-        self.validAttacks = {}
+        self.selectedPiece:deselect(self)
     end
     
     -- If clicking the same base and menu is already open, close menu
@@ -667,12 +658,12 @@ function Game:getActionOptions(context, contextType)
     
     if contextType == "base" then
         if context.type == "hq" then
-            -- HQ can build infantry (pawns)
+            -- HQ can build infantry
             table.insert(options, {
                 id = "build_infantry",
                 name = "Build Infantry",
                 cost = 2,  -- Cost in resources
-                icon = "pawn"  -- For future use
+                icon = "infantry"  -- For future use
             })
             -- Sniper
             table.insert(options, {
@@ -739,7 +730,7 @@ function Game:getActionOptions(context, contextType)
             table.insert(options, {
                 id = "build_resource_mine",
                 name = "Build Resource Mine",
-                cost = 8,
+                cost = 3,
                 buildTurns = 3,  -- Takes 3 turns to build
                 icon = "resource_mine",
                 disabled = hasBase  -- Can't build mine if tile has a base
@@ -813,8 +804,8 @@ function Game:executeAction(option)
     
     -- Execute action based on option ID
     if option.id == "build_infantry" and contextType == "base" then
-        -- Build a pawn near the base
-        self:buildUnitNearBase(context, "pawn", team, option.cost)
+        -- Build an infantry near the base
+        self:buildUnitNearBase(context, "infantry", team, option.cost)
     elseif option.id == "build_sniper" and contextType == "base" then
         -- Build a sniper near the base
         self:buildUnitNearBase(context, "sniper", team, option.cost)
@@ -904,6 +895,11 @@ function Game:buildStructureNearPiece(piece, structureType, team, cost, buildTur
         piece.buildingTurnsRemaining = buildTurns
         piece.buildingTeam = team
         piece.hasMoved = true  -- Can't move while building
+        -- Deselect piece when building starts
+        if self.selectedPiece == piece then
+            piece:deselect(self)
+        end
+
         return
     end
     
@@ -935,6 +931,10 @@ function Game:buildResourceMineNearPiece(piece, team, cost, buildTurns)
     piece.buildingTeam = team
     piece.buildingResourceTarget = existingResource  -- Store reference to the resource
     piece.hasMoved = true  -- Can't move while building
+    -- Deselect piece when building starts
+    if self.selectedPiece == piece then
+        piece:deselect(self)
+    end
 end
 
 function Game:calculateValidMoves()
@@ -951,7 +951,7 @@ function Game:calculateValidMoves()
     end
     
     local moveRange = self.selectedPiece:getMovementRange()
-    local attackRange = self.selectedPiece:getMovementRange()  -- Attack range equals move range
+    local attackRange = self.selectedPiece:getAttackRange()
     
     -- Get all neighbors within move range (enemy pieces block movement)
     local visited = {}
@@ -1022,24 +1022,35 @@ function Game:getHexesWithinRange(col, row, range, visited, team)
         
         for _, neighbor in ipairs(neighbors) do
             local neighborKey = neighbor.col .. "," .. neighbor.row
-            
+
             -- Only explore if not visited and terrain is passable (land)
             if not visitedSet[neighborKey] then
                 local neighborTile = self.map:getTile(neighbor.col, neighbor.row)
                 if neighborTile and neighborTile.isLand then
-                    -- Check if tile is occupied by enemy piece (blocks movement)
+                    -- Check if tile is occupied by enemy piece (blocks movement past it)
                     local pieceOnTile = self:getPieceAt(neighbor.col, neighbor.row)
                     local isEnemyOccupied = pieceOnTile and pieceOnTile.team ~= team
-                    
-                    if not isEnemyOccupied then
-                        -- Terrain is passable and not blocked by enemy, add to queue
-                        visitedSet[neighborKey] = true
+
+                    -- Mark as seen so we don't process it again
+                    visitedSet[neighborKey] = true
+                    local nextDistance = currentDistance + 1
+
+                    -- If within range, include the tile. If enemy-occupied, include it but don't enqueue for further exploration.
+                    if nextDistance <= range then
+                        local key = neighborTile.col .. "," .. neighborTile.row
+                        if not visited[key] then
+                            visited[key] = neighborTile
+                            table.insert(visited, neighborTile)
+                        end
+                    end
+
+                    if not isEnemyOccupied and nextDistance < range then
+                        -- Terrain is passable and not blocked by enemy, enqueue to explore further
                         table.insert(queue, {
                             hex = neighborTile,
-                            distance = currentDistance + 1
+                            distance = nextDistance
                         })
                     end
-                    -- If terrain is not passable (water) or blocked by enemy, don't explore past it
                 end
             end
         end

@@ -5,15 +5,10 @@ Piece.__index = Piece
 
 -- Piece types with their properties
 local PIECE_TYPES = {
-    pawn = { name = "Pawn", moveRange = 3, attackRange = 1, hp = 10, damage = 5, speed = 2, maxAmmo = 3, maxSupply = 5 },
-    knight = { name = "Knight", moveRange = 2, attackRange = 2, hp = 3, damage = 3, speed = 3, maxAmmo = 3, maxSupply = 5 },
-    bishop = { name = "Bishop", moveRange = 5, attackRange = 5, hp = 3, damage = 3, speed = 2, maxAmmo = 3, maxSupply = 5 },
-    rook = { name = "Rook", moveRange = 5, attackRange = 5, hp = 5, damage = 5, speed = 1, maxAmmo = 3, maxSupply = 5 },
-    queen = { name = "Queen", moveRange = 5, attackRange = 5, hp = 5, damage = 5, speed = 2, maxAmmo = 3, maxSupply = 5 },
-    king = { name = "King", moveRange = 1, attackRange = 1, hp = 10, damage = 5, speed = 2, maxAmmo = 3, maxSupply = 5 },
+    infantry = { name = "Infantry", moveRange = 2, attackRange = 1, viewRange = 2, hp = 10, damage = 5, speed = 2, maxAmmo = 3, maxSupply = 5 },
     
     -- New specialized units
-    sniper = { name = "Sniper", moveRange = 2, attackRange = 7, hp = 4, damage = 8, speed = 1, maxAmmo = 2, maxSupply = 5 },
+    sniper = { name = "Sniper", moveRange = 2, attackRange = 4, viewRange = 4, hp = 4, damage = 8, speed = 1, maxAmmo = 2, maxSupply = 5 },
     tank = { name = "Tank", moveRange = 4, attackRange = 3, hp = 15, damage = 7, speed = 3, maxAmmo = 4, maxSupply = 5 },
     engineer = { name = "Engineer", moveRange = 3, attackRange = 0, hp = 8, damage = 0, speed = 2, maxAmmo = 0, maxSupply = 5, canBuild = true },
 }
@@ -59,6 +54,10 @@ end
 
 function Piece:getMovementRange()
     return self.stats.moveRange
+end
+
+function Piece:getViewRange()
+    return self.stats.viewRange or self.stats.moveRange or 3
 end
 
 function Piece:getAttackRange()
@@ -129,6 +128,20 @@ function Piece:resetMove()
     self.hasMoved = false
 end
 
+function Piece:deselect(game)
+    self.selected = false
+    if game and game.selectedPiece == self then
+        game.selectedPiece = nil
+    end
+    if game then
+        game.validMoves = {}
+        game.validAttacks = {}
+        game.actionMenu = nil
+        game.actionMenuContext = nil
+        game.actionMenuContextType = nil
+    end
+end
+
 function Piece:getColor()
     if self.team == 1 then
         return 1, 0, 0  -- Red for team 1
@@ -166,6 +179,25 @@ function Piece:draw(pixelX, pixelY, hexSideLength)
         love.graphics.setColor(1, 1, 1)
         love.graphics.setFont(love.graphics.newFont(16))
         local text = "E"
+        local textWidth = love.graphics.getFont():getWidth(text)
+        local textHeight = love.graphics.getFont():getHeight()
+        love.graphics.print(text, pixelX - textWidth / 2, pixelY - textHeight / 2)
+    end
+    -- Draw "S" for sniper pieces
+    if self.type == "sniper" then
+        love.graphics.setColor(1, 1, 1)
+        love.graphics.setFont(love.graphics.newFont(16))
+        local text = "S"
+        local textWidth = love.graphics.getFont():getWidth(text)
+        local textHeight = love.graphics.getFont():getHeight()
+        love.graphics.print(text, pixelX - textWidth / 2, pixelY - textHeight / 2)
+    end
+
+    -- Draw "I" for infantry pieces
+    if self.type == "infantry" then
+        love.graphics.setColor(1, 1, 1)
+        love.graphics.setFont(love.graphics.newFont(16))
+        local text = "I"
         local textWidth = love.graphics.getFont():getWidth(text)
         local textHeight = love.graphics.getFont():getHeight()
         love.graphics.print(text, pixelX - textWidth / 2, pixelY - textHeight / 2)

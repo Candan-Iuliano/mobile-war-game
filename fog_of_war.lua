@@ -190,11 +190,11 @@ function FogOfWar:updateVisibility(team, pieces, bases, startingAreas)
     -- Reveal tiles around all pieces for this team
     for _, piece in ipairs(pieces) do
         if piece.team == team and piece.col > 0 and piece.row > 0 then
-            -- Pieces reveal tiles within their vision range (same as movement range)
+            -- Pieces reveal tiles within their vision range
             local visionRange = 3  -- Default vision range
-            -- if piece.getMovementRange then
-            --     visionRange = piece:getMovementRange() or 3
-            -- end
+            if piece.getViewRange then
+                visionRange = piece:getViewRange() or visionRange
+            end
             self:revealArea(team, piece.col, piece.row, visionRange, {})
         end
     end
