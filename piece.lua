@@ -4,32 +4,36 @@ local Piece = {}
 Piece.__index = Piece
 
 -- Piece types with their properties
-local PIECE_TYPES = {
-    infantry = { name = "Infantry", moveRange = 2, attackRange = 1, viewRange = 2, hp = 10, damage = 5, speed = 2, maxAmmo = 3, maxSupply = 5 },
-    
-    -- New specialized units
-    sniper = { name = "Sniper", moveRange = 2, attackRange = 4, viewRange = 4, hp = 4, damage = 8, speed = 1, maxAmmo = 2, maxSupply = 5 },
-    tank = { name = "Tank", moveRange = 4, attackRange = 3, hp = 15, damage = 7, speed = 3, maxAmmo = 4, maxSupply = 5 },
-    engineer = { name = "Engineer", moveRange = 3, attackRange = 0, hp = 8, damage = 0, speed = 2, maxAmmo = 0, maxSupply = 5, canBuild = true },
-}
+-- Piece types are implemented as separate modules (e.g. infantry.lua, sniper.lua)
+-- Each type module should return a table: { stats = {...}, methods = {...} }
+-- `Piece.new` will load the module for the requested type and compose
+-- a prototype chain so type-specific methods are checked before base methods.
 
 function Piece.new(pieceType, team, gameMap, col, row)
-    local self = setmetatable({}, Piece)
-    
-    if not PIECE_TYPES[pieceType] then
-        error("Unknown piece type: " .. pieceType)
+    -- Load type module (must be available via require("infantry"), etc.)
+    local ok, typeMod = pcall(require, pieceType)
+    if not ok or not typeMod then
+        error("Unknown piece type or missing module: " .. tostring(pieceType))
     end
+
+    -- Create prototype chain: type methods -> Piece
+    local typeProto = typeMod.methods or {}
+    setmetatable(typeProto, { __index = Piece })
+
+    -- Create instance and point its metatable to type prototype
+    local self = setmetatable({}, { __index = typeProto })
+
     self.gameMap = gameMap
     self.type = pieceType
-    self.stats = PIECE_TYPES[pieceType]
-    self.team = team or 1  -- Team 1 or 2
-    self.col = col or 0  -- 0 means not placed yet
+    self.stats = typeMod.stats or {}
+    self.team = team or 1
+    self.col = col or 0
     self.row = row or 0
-    self.hp = self.stats.hp
-    self.maxHp = self.stats.hp
+    self.hp = self.stats.hp or 1
+    self.maxHp = self.stats.hp or 1
     self.selected = false
     self.canMove = true
-    self.hasMoved = false  -- Track if piece has moved this turn
+    self.hasMoved = false
     
     -- Building system (for engineers)
     self.isBuilding = false  -- Is this piece currently building something?
@@ -40,7 +44,8 @@ function Piece.new(pieceType, team, gameMap, col, row)
     -- Ammo and supply system
     self.maxAmmo = self.stats.maxAmmo or 3
     self.ammo = self.maxAmmo  -- Current ammo remaining
-    self.maxSupply = self.stats.maxSupply or 5
+    -- self.maxSupply = self.stats.maxSupply or 5
+     self.maxSupply = 50
     self.supply = self.maxSupply  -- Current supply remaining (turns until attrition)
     self.attritionDamage = 2  -- Damage per turn when out of supply
     
@@ -141,6 +146,8 @@ function Piece:deselect(game)
         game.actionMenuContextType = nil
     end
 end
+
+-- Note: `startBuilding` is implemented by builder/engineer subclasses.
 
 function Piece:getColor()
     if self.team == 1 then

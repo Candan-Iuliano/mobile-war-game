@@ -5,7 +5,7 @@ Base.__index = Base
 
 -- Base types with their properties
 local BASE_TYPES = {
-    hq = { name = "HQ", radius = 3, suppliesAmmo = true, suppliesSupply = true },
+    hq = { name = "HQ", radius = 3, suppliesAmmo = true, suppliesSupply = true, unitCapacity = 10 },
     ammoDepot = { name = "Ammo Depot", radius = 2, suppliesAmmo = true, suppliesSupply = false },
     supplyDepot = { name = "Supply Depot", radius = 2, suppliesAmmo = false, suppliesSupply = true },
 }

@@ -50,6 +50,8 @@ function Game.new()
     -- Pieces (units)
     self.pieces = {}
     self:initializePieces()
+    -- Mines placed on the map
+    self.mines = {}
     
     -- Bases (structures)
     self.bases = {}
@@ -216,10 +218,24 @@ function Game:draw()
         local pixelX, pixelY = self.map:gridToPixels(resource.col, resource.row)
         resource:draw(pixelX, pixelY, self.hexSideLength)
     end
-    
-    -- Draw action menu (if base is selected)
-    if self.actionMenu then
-        self:drawActionMenu()
+
+    -- Draw mines (only draw if revealed to the current player's team)
+    if self.mines then
+        for _, mine in ipairs(self.mines) do
+            if mine.col and mine.row then
+                local shouldDraw = false
+                if mine.revealedTo and mine.revealedTo[self.currentTurn] then
+                    shouldDraw = true
+                end
+                if shouldDraw then
+                    local mx, my = self.map:gridToPixels(mine.col, mine.row)
+                    love.graphics.setColor(0.1, 0.1, 0.1)
+                    love.graphics.circle("fill", mx, my, self.hexSideLength * 0.15)
+                    love.graphics.setColor(0, 0, 0)
+                    love.graphics.circle("line", mx, my, self.hexSideLength * 0.15)
+                end
+            end
+        end
     end
     
     -- Draw pieces (only draw placed pieces)
@@ -249,6 +265,11 @@ function Game:draw()
         end
     end
     
+    -- Draw action menu on top of pieces and overlays
+    if self.actionMenu then
+        self:drawActionMenu()
+    end
+
     -- Draw fog of war for current player's team (after all game elements)
     if self.state == "playing" then
         self.fogOfWar:draw(self.currentTurn, self.camera, 0, 0)
@@ -389,6 +410,11 @@ function Game:drawUI()
         local teamColor = self.currentTurn == 1 and "Red" or "Blue"
         love.graphics.print("Team: " .. teamColor .. " | Turn: " .. self.turnCount, 10, 10)
         love.graphics.print("Resources: " .. (self.teamResources[self.currentTurn] or 0), 10, 30)
+        -- Show unit count / capacity for current team
+        local unitCount = self:getUnitCount(self.currentTurn)
+        local unitCapacity = self:getUnitCapacity(self.currentTurn)
+        local capacityText = unitCapacity > 0 and string.format("Units: %d / %d", unitCount, unitCapacity) or string.format("Units: %d", unitCount)
+        love.graphics.print(capacityText, 10, 50)
         
         -- Count bases for current team
         local hqCount = 0
@@ -407,10 +433,10 @@ function Game:drawUI()
         end
         local basesInfo = string.format("Bases: HQ: %d | Ammo: %d | Supply: %d", hqCount, ammoDepotCount, supplyDepotCount)
         love.graphics.setFont(love.graphics.newFont(12))
-        love.graphics.print(basesInfo, 10, 50)
+        love.graphics.print(basesInfo, 10, 70)
         
         -- Show building engineers for current team
-        local yOffset = 70
+        local yOffset = 90
         love.graphics.setFont(love.graphics.newFont(11))
         for _, piece in ipairs(self.pieces) do
             if piece.team == self.currentTurn and piece.isBuilding and piece.buildingTurnsRemaining then
@@ -509,8 +535,8 @@ function Game:mousepressed(x, y, button)
                     return
                 end
                 
-                -- If clicking on already selected engineer (no menu), open build menu
-                if piece == self.selectedPiece and piece.stats.canBuild then
+                -- If clicking on already selected piece, open action menu (default actions like Sweep)
+                if piece == self.selectedPiece then
                     self:openActionMenu(piece, "piece")
                     return
                 end
@@ -603,6 +629,134 @@ function Game:getBaseAt(col, row)
     return nil
 end
 
+-- Mines helpers
+function Game:addMine(mine)
+    self.mines = self.mines or {}
+    table.insert(self.mines, mine)
+end
+
+function Game:getMineAt(col, row)
+    if not self.mines then return nil end
+    for _, mine in ipairs(self.mines) do
+        if mine.col == col and mine.row == row then
+            return mine
+        end
+    end
+    return nil
+end
+
+function Game:removeMine(mine)
+    if not mine then return end
+    -- remove from global list
+    for i, m in ipairs(self.mines or {}) do
+        if m == mine then
+            table.remove(self.mines, i)
+            break
+        end
+    end
+    -- remove from owner's list
+    if mine.owner and mine.owner.placedMines then
+        for i, m in ipairs(mine.owner.placedMines) do
+            if m == mine then
+                table.remove(mine.owner.placedMines, i)
+                break
+            end
+        end
+    end
+end
+
+function Game:triggerMineAt(col, row, mover)
+    local mine = self:getMineAt(col, row)
+    if not mine then return false end
+    if mine.team == mover.team then return false end
+
+    -- Apply damage to mover (half damage if mine was revealed to mover's team)
+    local dmg = mine.damage or 5
+    if mine.revealedTo and mine.revealedTo[mover.team] then
+        dmg = math.max(1, math.floor(dmg / 2))
+    end
+    local wasKilled = mover:takeDamage(dmg)
+
+    -- Remove mine
+    self:removeMine(mine)
+
+    -- If mover died, remove from pieces list
+    if wasKilled then
+        for i, p in ipairs(self.pieces) do
+            if p == mover then
+                table.remove(self.pieces, i)
+                break
+            end
+        end
+    end
+
+    return true
+end
+
+
+-- Reveal mines within a piece's view range for that piece's team
+function Game:sweepForMines(piece)
+    if not piece or not piece.col or not piece.row then return end
+    local range = piece.getViewRange and piece:getViewRange() or 1
+    for _, mine in ipairs(self.mines or {}) do
+        if mine.col and mine.row then
+            -- Don't reveal your own team's mines when sweeping
+            if mine.team == piece.team then
+                goto continue
+            end
+            if self:isWithinRange(piece.col, piece.row, mine.col, mine.row, range) then
+                mine.revealedTo = mine.revealedTo or {}
+                mine.revealedTo[piece.team] = true
+            end
+        end
+        ::continue::
+    end
+end
+
+
+-- Disarm a revealed mine adjacent to the piece; engineers get +1 resource
+function Game:disarmMine(piece, mine)
+    if not piece or not mine then return end
+    if not mine.revealedTo or not mine.revealedTo[piece.team] then
+        return -- can't disarm an unrevealed mine
+    end
+
+    -- Remove the mine from game
+    self:removeMine(mine)
+
+    -- Reward engineer with 1 resource
+    if piece.stats and piece.stats.canBuild then
+        self.teamResources[piece.team] = (self.teamResources[piece.team] or 0) + 1
+    end
+end
+
+function Game:getUnitCount(team)
+    local count = 0
+    for _, piece in ipairs(self.pieces) do
+        if piece.team == team and piece.col and piece.col > 0 and piece.row and piece.row > 0 then
+            count = count + 1
+        end
+    end
+    return count
+end
+
+function Game:getUnitCapacity(team)
+    local capacity = 0
+    for _, base in ipairs(self.bases) do
+        if base.team == team and base.col and base.col > 0 and base.row and base.row > 0 then
+            if base.stats and base.stats.unitCapacity then
+                capacity = capacity + base.stats.unitCapacity
+            else
+                -- default per-HQ capacity if stat missing (only count HQs)
+                if base.type == "hq" then
+                    capacity = capacity + 1
+                end
+            end
+        end
+    end
+    return capacity
+end
+
 function Game:selectBase(base)
     -- Deselect piece if one is selected
     if self.selectedPiece then
@@ -658,33 +812,42 @@ function Game:getActionOptions(context, contextType)
     
     if contextType == "base" then
         if context.type == "hq" then
+            local team = context.team
+            local unitCount = self:getUnitCount(team)
+            local unitCapacity = self:getUnitCapacity(team)
+            local atCapacity = (unitCapacity > 0) and (unitCount >= unitCapacity) or false
+
             -- HQ can build infantry
             table.insert(options, {
                 id = "build_infantry",
                 name = "Build Infantry",
                 cost = 2,  -- Cost in resources
-                icon = "infantry"  -- For future use
+                icon = "infantry",  -- For future use
+                disabled = atCapacity
             })
             -- Sniper
             table.insert(options, {
                 id = "build_sniper",
                 name = "Build Sniper",
                 cost = 4,
-                icon = "sniper"
+                icon = "sniper",
+                disabled = atCapacity
             })
             -- Tank
             table.insert(options, {
                 id = "build_tank",
                 name = "Build Tank",
                 cost = 6,
-                icon = "tank"
+                icon = "tank",
+                disabled = atCapacity
             })
             -- Engineer
             table.insert(options, {
                 id = "build_engineer",
                 name = "Build Engineer",
                 cost = 3,
-                icon = "engineer"
+                icon = "engineer",
+                disabled = atCapacity
             })
         end
         -- Add deconstruct option to all bases
@@ -735,6 +898,48 @@ function Game:getActionOptions(context, contextType)
                 icon = "resource_mine",
                 disabled = hasBase  -- Can't build mine if tile has a base
             })
+            -- Place a land mine (engineer-specific)
+            table.insert(options, {
+                id = "place_mine",
+                name = "Place Mine",
+                cost = 2,
+                icon = "mine",
+                disabled = self:getMineAt(context.col, context.row) ~= nil
+            })
+        end
+        -- Sweep for mines (default unit action; consumes turn)
+        do
+            local disabled = (context.hasMoved or context.isBuilding)
+            table.insert(options, {
+                id = "sweep_mines",
+                name = "Sweep For Mines",
+                cost = 0,
+                icon = "sweep",
+                shortcut = "S",
+                disabled = disabled
+            })
+        end
+
+        -- Disarm option(s) for any revealed mines adjacent to this piece
+        do
+            local startTile = self.map:getTile(context.col, context.row)
+            if startTile then
+                local neighbors = self.map:getNeighbors(startTile, 1)
+                for _, n in ipairs(neighbors) do
+                    local mine = self:getMineAt(n.col, n.row)
+                    -- Only show disarm for mines that are revealed to this team and belong to an enemy
+                    if mine and mine.revealedTo and mine.revealedTo[context.team] and mine.team ~= context.team then
+                        table.insert(options, {
+                            id = "disarm_mine",
+                            name = "Disarm Mine",
+                            icon = "disarm",
+                            shortcut = "D",
+                            targetMine = mine,
+                            disabled = (context.hasMoved or context.isBuilding)
+                        })
+                    end
+                end
+            end
         end
     elseif contextType == "resource" then
         -- Add resource actions here (e.g., harvest, upgrade, etc.)
@@ -827,6 +1032,24 @@ function Game:executeAction(option)
     elseif option.id == "build_resource_mine" and contextType == "piece" then
         -- Engineer builds a resource mine
         self:buildResourceMineNearPiece(context, team, option.cost, option.buildTurns)
+    elseif option.id == "place_mine" and contextType == "piece" then
+        -- Engineer places a land mine
+        if context.placeMine then
+            context:placeMine(self)
+        end
+    elseif option.id == "sweep_mines" and contextType == "piece" then
+        -- Sweep action: reveal mines within piece's view range for this team
+        if context then
+            self:sweepForMines(context)
+            -- consume turn for this piece
+            context.hasMoved = true
+        end
+    elseif option.id == "disarm_mine" and contextType == "piece" then
+        -- Disarm a revealed neighboring mine (option carries the targetMine)
+        if option.targetMine then
+            self:disarmMine(context, option.targetMine)
+            context.hasMoved = true
+        end
     elseif option.id == "deconstruct" and contextType == "base" then
         -- Deconstruct the base (remove it from the game)
         for i, base in ipairs(self.bases) do
@@ -845,6 +1068,14 @@ function Game:executeAction(option)
 end
 
 function Game:buildUnitNearBase(base, unitType, team, cost)
+    -- Check unit capacity for this team
+    local unitCount = self:getUnitCount(team)
+    local unitCapacity = self:getUnitCapacity(team)
+    if unitCapacity > 0 and unitCount >= unitCapacity then
+        -- At capacity; cannot build more units
+        return
+    end
+
     -- Deduct cost
     self.teamResources[team] = self.teamResources[team] - cost
     
@@ -883,57 +1114,46 @@ function Game:buildUnitNearBase(base, unitType, team, cost)
 end
 
 function Game:buildStructureNearPiece(piece, structureType, team, cost, buildTurns)
-    -- Deduct cost
+    -- Delegate to piece if it implements buildStructure
+    if piece and piece.buildStructure then
+        return piece:buildStructure(self, structureType, team, cost, buildTurns)
+    end
+
+    -- Fallback: original behavior
     self.teamResources[team] = self.teamResources[team] - cost
-    
-    -- Check if engineer's current tile is valid (no existing base)
     local tile = self.map:getTile(piece.col, piece.row)
     if tile and tile.isLand and not self:getBaseAt(piece.col, piece.row) then
-        -- Start building process
-        piece.isBuilding = true
-        piece.buildingType = structureType
-        piece.buildingTurnsRemaining = buildTurns
-        piece.buildingTeam = team
-        piece.hasMoved = true  -- Can't move while building
-        -- Deselect piece when building starts
-        if self.selectedPiece == piece then
-            piece:deselect(self)
+        if piece.startBuilding then
+            piece:startBuilding(structureType, team, buildTurns, nil, self)
+            return
         end
-
+        -- No startBuilding on piece: refund cost
+        self.teamResources[team] = self.teamResources[team] + cost
         return
     end
-    
-    -- If tile already has a base, refund the cost
     self.teamResources[team] = self.teamResources[team] + cost
  end
 
 function Game:buildResourceMineNearPiece(piece, team, cost, buildTurns)
-    -- Check if engineer's current tile has an existing resource
+    -- Delegate to piece if it implements buildResourceMine
+    if piece and piece.buildResourceMine then
+        return piece:buildResourceMine(self, team, cost, buildTurns)
+    end
+
+    -- Fallback: original behavior
     local existingResource = self:getResourceAt(piece.col, piece.row)
     if not existingResource then
-        -- Can't build mine here - no resource tile
         return
     end
-    
-    -- Check if resource already has a mine (owner is set means it's been captured/mined)
     if existingResource.hasMine then
-        -- Already has a mine
         return
     end
-    
-    -- Deduct cost
     self.teamResources[team] = self.teamResources[team] - cost
-    
-    -- Start building process
-    piece.isBuilding = true
-    piece.buildingType = "resource_mine"
-    piece.buildingTurnsRemaining = buildTurns
-    piece.buildingTeam = team
-    piece.buildingResourceTarget = existingResource  -- Store reference to the resource
-    piece.hasMoved = true  -- Can't move while building
-    -- Deselect piece when building starts
-    if self.selectedPiece == piece then
-        piece:deselect(self)
+    if piece.startBuilding then
+        piece:startBuilding("resource_mine", team, buildTurns, existingResource, self)
+    else
+        -- No startBuilding on piece: refund
+        self.teamResources[team] = self.teamResources[team] + cost
     end
 end
 
@@ -961,7 +1181,10 @@ function Game:calculateValidMoves()
         if hex.col ~= self.selectedPiece.col or hex.row ~= self.selectedPiece.row then
             local tile = self.map:getTile(hex.col, hex.row)
             if tile and tile.isLand and not self:getPieceAt(hex.col, hex.row) then
-                table.insert(self.validMoves, hex)
+                -- Only allow moving to tiles visible to this piece's team
+                if self.fogOfWar and self.fogOfWar:isTileVisible(self.selectedPiece.team, hex.col, hex.row) then
+                    table.insert(self.validMoves, hex)
+                end
             end
         end
     end
@@ -1164,6 +1387,8 @@ function Game:movePiece(col, row)
     
     if isValidMove then
         self.selectedPiece:setPosition(col, row)
+        -- Check for mines triggered by moving into this tile
+        self:triggerMineAt(col, row, self.selectedPiece)
         
         self:calculateValidMoves()
     elseif isValidAttack and targetPiece then
@@ -1186,7 +1411,13 @@ function Game:movePiece(col, row)
                 end
             end
             -- Only move to the enemy tile if we killed them
-            self.selectedPiece:setPosition(col, row)
+            -- Only allow the attacker to move into the target tile when the attack was adjacent (melee).
+            -- Ranged attacks (distance > 1) should not result in movement into the target tile.
+            if self:isWithinRange(self.selectedPiece.col, self.selectedPiece.row, col, row, 1) then
+                self.selectedPiece:setPosition(col, row)
+                -- Check for mines when attacker moves into the tile after killing
+                self:triggerMineAt(col, row, self.selectedPiece)
+            end
         end
         -- If enemy survived, attacker stays in place (no movement)
         -- Mark piece as moved since it attacked

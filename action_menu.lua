@@ -130,6 +130,16 @@ function ActionMenu:draw(canAffordCallback)
                 local textWidth = love.graphics.getFont():getWidth(costText)
                 love.graphics.print(costText, pos.x - textWidth / 2, pos.y - 5)
             end
+
+            -- Draw shortcut letter (if provided)
+            if option.shortcut then
+                love.graphics.setColor(1, 1, 1, 1)
+                love.graphics.setFont(love.graphics.newFont(14))
+                local letter = tostring(option.shortcut)
+                local lw = love.graphics.getFont():getWidth(letter)
+                -- Position the shortcut just above the center of the hex
+                love.graphics.print(letter, pos.x - lw / 2, pos.y - pos.size * 0.6)
+            end
         end
     end
 end
