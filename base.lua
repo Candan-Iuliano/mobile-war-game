@@ -4,10 +4,18 @@ local Base = {}
 Base.__index = Base
 
 -- Base types with their properties
+-- Load specialized base modules
+local AIRBASE = {}
+local ok_air, air_mod = pcall(require, "airbase")
+if ok_air and air_mod and air_mod.stats then
+    AIRBASE = air_mod.stats
+end
+
 local BASE_TYPES = {
     hq = { name = "HQ", radius = 3, suppliesAmmo = true, suppliesSupply = true, unitCapacity = 10 },
     ammoDepot = { name = "Ammo Depot", radius = 2, suppliesAmmo = true, suppliesSupply = false },
     supplyDepot = { name = "Supply Depot", radius = 2, suppliesAmmo = false, suppliesSupply = true },
+    airbase = AIRBASE,
 }
 
 function Base.new(baseType, team, gameMap, col, row)
@@ -114,6 +122,23 @@ function Base:draw(pixelX, pixelY, hexSideLength)
         love.graphics.rectangle("fill", pixelX - size/2, pixelY - size/2, size, size)
         love.graphics.setColor(0, 0, 0)
         love.graphics.rectangle("line", pixelX - size/2, pixelY - size/2, size, size)
+    end
+    -- Airbase visual
+    if self.type == "airbase" then
+        love.graphics.setColor(1, 1, 1)
+        -- Draw a simple airplane/star icon: central circle + two wings
+        love.graphics.setColor(r, g, b)
+        love.graphics.circle("fill", pixelX, pixelY, size * 0.4)
+        love.graphics.setColor(0, 0, 0)
+        love.graphics.circle("line", pixelX, pixelY, size * 0.4)
+        -- left wing
+        love.graphics.setColor(r, g, b)
+        love.graphics.polygon("fill", pixelX - size * 0.7, pixelY, pixelX - size * 0.15, pixelY - size * 0.15, pixelX - size * 0.15, pixelY + size * 0.15)
+        -- right wing
+        love.graphics.polygon("fill", pixelX + size * 0.7, pixelY, pixelX + size * 0.15, pixelY - size * 0.15, pixelX + size * 0.15, pixelY + size * 0.15)
+        love.graphics.setColor(0,0,0)
+        love.graphics.polygon("line", pixelX - size * 0.7, pixelY, pixelX - size * 0.15, pixelY - size * 0.15, pixelX - size * 0.15, pixelY + size * 0.15)
+        love.graphics.polygon("line", pixelX + size * 0.7, pixelY, pixelX + size * 0.15, pixelY - size * 0.15, pixelX + size * 0.15, pixelY + size * 0.15)
     end
 end
 

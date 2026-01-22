@@ -120,11 +120,14 @@ function Game:initializeBases()
     self:addBase("hq", 1, nil, nil)
     self:addBase("ammoDepot", 1, nil, nil)
     self:addBase("supplyDepot", 1, nil, nil)
+    -- Add one airbase per player (unplaced at start)
+    self:addBase("airbase", 1, nil, nil)
     
     -- Create bases for team 2: HQ, Ammo Depot, Supply Depot
     self:addBase("hq", 2, nil, nil)
     self:addBase("ammoDepot", 2, nil, nil)
     self:addBase("supplyDepot", 2, nil, nil)
+    self:addBase("airbase", 2, nil, nil)
 end
 
 function Game:addBase(baseType, team, col, row)
@@ -212,6 +215,8 @@ function Game:draw()
             self:drawBaseRadius(base, pixelX, pixelY)
         end
     end
+
+    
     
     -- Draw resources
     for _, resource in ipairs(self.resources) do
@@ -236,6 +241,55 @@ function Game:draw()
                 end
             end
         end
+    end
+    
+    -- Draw air superiority markers on tiles ("=", "^", "˅") for tiles with AS
+    local asMap = self:calculateAirSuperiorityMap()
+    for key, vals in pairs(asMap) do
+        local comma = string.find(key, ",")
+        if comma then
+            local col = tonumber(string.sub(key, 1, comma - 1))
+            local row = tonumber(string.sub(key, comma + 1))
+            if col and row then
+                -- Respect fog of war: only show markers if tile is visible to current team
+                if self.fogOfWar and not self.fogOfWar:isTileVisible(self.currentTurn, col, row) then
+                    goto continue_as
+                end
+
+                local t1 = vals[1] or 0
+                local t2 = vals[2] or 0
+                local playerAS = (self.currentTurn == 1) and t1 or t2
+                local enemyAS = (self.currentTurn == 1) and t2 or t1
+
+                local symbol = nil
+                -- tie and both present
+                if playerAS > 0 and playerAS == enemyAS then
+                    symbol = "="
+                elseif playerAS > enemyAS and enemyAS > 0 then
+                    symbol = "^"
+                elseif enemyAS > playerAS and enemyAS > 0 then
+                    symbol = "˅"
+                end
+
+                if symbol then
+                    local tile = self.map:getTile(col, row)
+                    if tile and tile.points then
+                        local px, py = self.map:gridToPixels(col, row)
+                        -- Choose color: team color for favorable/tie, enemy color for losing
+                        if symbol == "˅" then
+                            love.graphics.setColor(1, 0, 0)
+                        else
+                            if self.currentTurn == 1 then love.graphics.setColor(1, 0, 0) else love.graphics.setColor(0, 0, 1) end
+                        end
+                        love.graphics.setFont(love.graphics.newFont(14))
+                        local w = love.graphics.getFont():getWidth(symbol)
+                        local h = love.graphics.getFont():getHeight()
+                        love.graphics.print(symbol, px - w/2, py - h/2)
+                    end
+                end
+            end
+        end
+        ::continue_as::
     end
     
     -- Draw pieces (only draw placed pieces)
@@ -268,6 +322,33 @@ function Game:draw()
     -- Draw action menu on top of pieces and overlays
     if self.actionMenu then
         self:drawActionMenu()
+    end
+
+    -- Draw airstrike targeting UI (crosshair + highlight) if active (rendered above pieces)
+    if self.airstrikeTargeting then
+        local mx, my = love.mouse.getPosition()
+        local worldX, worldY = self.camera:screenToWorld(mx, my)
+        local tcol, trow = self.map:pixelsToGrid(worldX, worldY)
+
+        -- Highlight tile under cursor
+        local tile = self.map:getTile(tcol, trow)
+        if tile then
+            local can = self:canAirstrike(self.airstrikeTargeting.team, tcol, trow)
+            if can then
+                love.graphics.setColor(0, 1, 0, 0.4)
+            else
+                love.graphics.setColor(1, 0, 0, 0.4)
+            end
+            love.graphics.polygon("fill", tile.points)
+        end
+
+        -- Draw crosshair at mouse (in world coords)
+        love.graphics.setColor(1, 1, 1)
+        local size = 16
+        love.graphics.setLineWidth(2)
+        love.graphics.line(worldX - size, worldY, worldX + size, worldY)
+        love.graphics.line(worldX, worldY - size, worldX, worldY + size)
+        love.graphics.setLineWidth(1)
     end
 
     -- Draw fog of war for current player's team (after all game elements)
@@ -365,8 +446,21 @@ function Game:drawBaseRadius(base, pixelX, pixelY)
     local visited = {}
     self:getHexesWithinRange(base.col, base.row, radius, visited, base.team)
     
+    -- Only show radius for bases belonging to the current player's team
+    if base.team ~= self.currentTurn then
+        return
+    end
+
+    -- Choose color based on team
+    local fillR, fillG, fillB, fillA = 1, 0, 0, 0.15
+    local lineR, lineG, lineB, lineA = 1, 0, 0, 0.4
+    if base.team == 2 then
+        fillR, fillG, fillB, fillA = 0, 0, 1, 0.15
+        lineR, lineG, lineB, lineA = 0, 0, 1, 0.4
+    end
+
     -- Draw each hex in range (only passable terrain)
-    love.graphics.setColor(1, 0, 0, 0.15)  -- Red, transparent fill
+    love.graphics.setColor(fillR, fillG, fillB, fillA)
     for _, hex in ipairs(visited) do
         local tile = self.map:getTile(hex.col, hex.row)
         if tile then
@@ -374,9 +468,9 @@ function Game:drawBaseRadius(base, pixelX, pixelY)
             love.graphics.polygon("fill", points)
         end
     end
-    
+
     -- Draw outline for hexes in range
-    love.graphics.setColor(1, 0, 0, 0.4)  -- Red, more visible outline
+    love.graphics.setColor(lineR, lineG, lineB, lineA)
     for _, hex in ipairs(visited) do
         local tile = self.map:getTile(hex.col, hex.row)
         if tile then
@@ -444,7 +538,7 @@ function Game:drawUI()
                                    piece.buildingType == "ammoDepot" and "Ammo Depot" or
                                    piece.buildingType == "supplyDepot" and "Supply Depot" or
                                    "Structure"
-                local buildText = string.format("Engineer building: %s (%d turns)", buildingName, piece.buildingTurnsRemaining)
+                local buildText = string.format("Engineer building: %s (%d turns)", buildlingName, piece.buildingTurnsRemaining)
                 love.graphics.print(buildText, 10, yOffset)
                 yOffset = yOffset + 15
             end
@@ -514,6 +608,42 @@ function Game:mousepressed(x, y, button)
         end
     else
         -- Normal gameplay
+        -- If airstrike targeting is active, intercept clicks
+        if self.airstrikeTargeting then
+            if button == 1 then -- Left click cancels and refunds cost
+                local at = self.airstrikeTargeting
+                self.teamResources[at.team] = (self.teamResources[at.team] or 0) + (at.cost or 0)
+                self.airstrikeTargeting = nil
+                return
+            elseif button == 2 then -- Right click commits the strike
+                local at = self.airstrikeTargeting
+                local base = at.base
+                -- Verify we still have superiority on that tile
+                if not self:canAirstrike(at.team, col, row) then
+                    -- Not allowed, do nothing
+                    self.airstrikeTargeting = nil
+                    return
+                end
+
+                -- Apply strike to any piece at that tile
+                local targetPiece = self:getPieceAt(col, row)
+                local strikeDamage = 6
+                if targetPiece then
+                    local wasKilled = targetPiece:takeDamage(strikeDamage)
+                    if wasKilled then
+                        for i, p in ipairs(self.pieces) do
+                            if p == targetPiece then
+                                table.remove(self.pieces, i)
+                                break
+                            end
+                        end
+                    end
+                end
+                self.airstrikeTargeting = nil
+                return
+            end
+        end
+
         if button == 1 then  -- Left click
             -- Check if clicking on action menu first
             if self.actionMenu and self:handleActionMenuClick(worldX, worldY) then
@@ -858,6 +988,28 @@ function Game:getActionOptions(context, contextType)
             icon = "X",
             isDeconstruct = true  -- Flag for red coloring
         })
+        -- Airbase: offer an airstrike targeting mode when there exists at least one eligible enemy target
+        if context.type == "airbase" and context.col and context.col > 0 then
+            local tiles = self:getTilesWithinRadius(context.col, context.row, context:getRadius())
+            local hasEligible = false
+            for _, tile in ipairs(tiles) do
+                local piece = self:getPieceAt(tile.col, tile.row)
+                if piece and piece.team ~= context.team then
+                    if self:canAirstrike(context.team, tile.col, tile.row) then
+                        hasEligible = true
+                        break
+                    end
+                end
+            end
+            if hasEligible then
+                table.insert(options, {
+                    id = "airstrike_target",
+                    name = "Airstrike (Target)",
+                    icon = "airstrike",
+                    cost = 2,
+                })
+            end
+        end
         -- Add more base types here as needed
     elseif contextType == "piece" then
         -- Engineer can build structures
@@ -897,6 +1049,14 @@ function Game:getActionOptions(context, contextType)
                 buildTurns = 3,  -- Takes 3 turns to build
                 icon = "resource_mine",
                 disabled = hasBase  -- Can't build mine if tile has a base
+            })
+            table.insert(options, {
+                id = "build_airbase",
+                name = "Build Airbase",
+                cost = 8,
+                buildTurns = 4,
+                icon = "airbase",
+                disabled = onResourceTile or hasBase
             })
             -- Place a land mine (engineer-specific)
             table.insert(options, {
@@ -1023,6 +1183,9 @@ function Game:executeAction(option)
     elseif option.id == "build_hq" and contextType == "piece" then
         -- Engineer builds an HQ
         self:buildStructureNearPiece(context, "hq", team, option.cost, option.buildTurns)
+    elseif option.id == "build_airbase" and contextType == "piece" then
+        -- Engineer builds an Airbase
+        self:buildStructureNearPiece(context, "airbase", team, option.cost, option.buildTurns)
     elseif option.id == "build_ammo_depot" and contextType == "piece" then
         -- Engineer builds an ammo depot
         self:buildStructureNearPiece(context, "ammoDepot", team, option.cost, option.buildTurns)
@@ -1058,6 +1221,24 @@ function Game:executeAction(option)
                 break
             end
         end
+    elseif option.id == "airstrike_target" and contextType == "base" then
+        -- Enter airstrike targeting mode: deduct cost now, allow player to choose tile
+        if not context or context.type ~= "airbase" then return end
+        local cost = option.cost or 0
+        if self.teamResources[team] < cost then return end
+
+        -- Deduct cost and enter targeting state (left-click cancel refunds)
+        self.teamResources[team] = self.teamResources[team] - cost
+        self.airstrikeTargeting = {
+            base = context,
+            team = team,
+            cost = cost,
+        }
+        -- Close any action menu while targeting
+        self.actionMenu = nil
+        self.actionMenuContext = nil
+        self.actionMenuContextType = nil
+        return
     end
     -- Add more action handlers here as needed
     
@@ -1279,6 +1460,81 @@ function Game:getHexesWithinRange(col, row, range, visited, team)
         end
         ::continue::
     end
+end
+
+-- Get all tiles within a radius regardless of passability (used for airbase influence)
+function Game:getTilesWithinRadius(col, row, radius)
+    local tiles = {}
+    if radius <= 0 then return tiles end
+    local startHex = self.map:getTile(col, row)
+    if not startHex then return tiles end
+
+    local queue = {{col = col, row = row, distance = 0}}
+    local visitedSet = {}
+    visitedSet[col .. "," .. row] = true
+
+    while #queue > 0 do
+        local current = table.remove(queue, 1)
+        if current.distance > 0 and current.distance <= radius then
+            local hex = self.map:getTile(current.col, current.row)
+            if hex then
+                table.insert(tiles, hex)
+            end
+        end
+
+        if current.distance >= radius then
+            goto continue
+        end
+
+        local currentHex = self.map:getTile(current.col, current.row)
+        if currentHex then
+            local neighbors = self.map:getNeighbors(currentHex, 1)
+            for _, n in ipairs(neighbors) do
+                local key = n.col .. "," .. n.row
+                if not visitedSet[key] then
+                    visitedSet[key] = true
+                    table.insert(queue, { col = n.col, row = n.row, distance = current.distance + 1 })
+                end
+            end
+        end
+        ::continue::
+    end
+
+    return tiles
+end
+
+-- Calculate air superiority map: returns table keyed by "col,row" -> { [1]=points1, [2]=points2 }
+function Game:calculateAirSuperiorityMap()
+    local map = {}
+    for _, base in ipairs(self.bases) do
+        if base.type == "airbase" and base.col and base.col > 0 and base.row and base.row > 0 then
+            local tiles = self:getTilesWithinRadius(base.col, base.row, base:getRadius())
+            for _, tile in ipairs(tiles) do
+                local key = tile.col .. "," .. tile.row
+                if not map[key] then map[key] = { [1] = 0, [2] = 0 } end
+                map[key][base.team] = map[key][base.team] + 1
+            end
+        end
+    end
+    return map
+end
+
+-- Convenience: get air superiority points for a tile (returns t1, t2)
+function Game:getAirSuperiorityAt(col, row)
+    local map = self:calculateAirSuperiorityMap()
+    local key = col .. "," .. row
+    local entry = map[key]
+    if not entry then return 0, 0 end
+    return entry[1] or 0, entry[2] or 0
+end
+
+-- Can `team` perform an airstrike against target tile? Requires teamAS > enemyAS and teamAS > 0
+function Game:canAirstrike(team, targetCol, targetRow)
+    local t1, t2 = self:getAirSuperiorityAt(targetCol, targetRow)
+    local teamAS = t1
+    local enemyAS = t2
+    if team == 2 then teamAS, enemyAS = t2, t1 end
+    return teamAS > 0 and teamAS > enemyAS
 end
 
 function Game:isWithinRange(startCol, startRow, targetCol, targetRow, range)
