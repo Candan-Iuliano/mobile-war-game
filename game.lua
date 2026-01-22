@@ -268,7 +268,7 @@ function Game:draw()
                 elseif playerAS > enemyAS and enemyAS > 0 then
                     symbol = "^"
                 elseif enemyAS > playerAS and enemyAS > 0 then
-                    symbol = "˅"
+                    symbol = "v"
                 end
 
                 if symbol then
@@ -276,7 +276,7 @@ function Game:draw()
                     if tile and tile.points then
                         local px, py = self.map:gridToPixels(col, row)
                         -- Choose color: team color for favorable/tie, enemy color for losing
-                        if symbol == "˅" then
+                        if symbol == "v" then
                             love.graphics.setColor(1, 0, 0)
                         else
                             if self.currentTurn == 1 then love.graphics.setColor(1, 0, 0) else love.graphics.setColor(0, 0, 1) end
@@ -311,13 +311,13 @@ function Game:draw()
     end
     
     -- Debug: Draw line of sight visualization for selected piece
-    if self.selectedPiece and self.selectedPiece.col > 0 and self.selectedPiece.row > 0 then
-        local sourceHex = self.map:getTile(self.selectedPiece.col, self.selectedPiece.row)
-        if sourceHex then
-            local visionRange = self.selectedPiece:getMovementRange() or 3
-            self.map:drawLineOfSightDebug(sourceHex, visionRange, 0, 0)
-        end
-    end
+    -- if self.selectedPiece and self.selectedPiece.col > 0 and self.selectedPiece.row > 0 then
+    --     local sourceHex = self.map:getTile(self.selectedPiece.col, self.selectedPiece.row)
+    --     if sourceHex then
+    --         local visionRange = self.selectedPiece:getMovementRange() or 3
+    --         self.map:drawLineOfSightDebug(sourceHex, visionRange, 0, 0)
+    --     end
+    -- end
     
     -- Draw action menu on top of pieces and overlays
     if self.actionMenu then
@@ -537,8 +537,9 @@ function Game:drawUI()
                 local buildingName = piece.buildingType == "resource_mine" and "Resource Mine" or
                                    piece.buildingType == "ammoDepot" and "Ammo Depot" or
                                    piece.buildingType == "supplyDepot" and "Supply Depot" or
+                                   piece.buildingType == "airbase" and "Airbase" or
                                    "Structure"
-                local buildText = string.format("Engineer building: %s (%d turns)", buildlingName, piece.buildingTurnsRemaining)
+                local buildText = string.format("Engineer building: %s (%d turns)", buildingName, piece.buildingTurnsRemaining)
                 love.graphics.print(buildText, 10, yOffset)
                 yOffset = yOffset + 15
             end
@@ -560,6 +561,7 @@ function Game:drawUI()
                 local buildingName = self.selectedPiece.buildingType == "resource_mine" and "Resource Mine" or
                                    self.selectedPiece.buildingType == "ammoDepot" and "Ammo Depot" or
                                    self.selectedPiece.buildingType == "supplyDepot" and "Supply Depot" or
+                                   self.selectedPiece.buildingType == "airbase" and "Airbase" or
                                    "Structure"
                 local buildInfo = string.format("Building: %s (%d turns left)",
                     buildingName,
@@ -1297,7 +1299,16 @@ end
 function Game:buildStructureNearPiece(piece, structureType, team, cost, buildTurns)
     -- Delegate to piece if it implements buildStructure
     if piece and piece.buildStructure then
-        return piece:buildStructure(self, structureType, team, cost, buildTurns)
+        local ok, res = pcall(function()
+            return piece:buildStructure(self, structureType, team, cost, buildTurns)
+        end)
+        if not ok or not res then
+            -- Ensure cost refunded if build failed unexpectedly
+            self.teamResources[team] = (self.teamResources[team] or 0) + (cost or 0)
+            print("[DEBUG] buildStructure failed for piece (type=", tostring(piece.type), ") result=", tostring(res), " ok=", tostring(ok))
+            return false
+        end
+        return true
     end
 
     -- Fallback: original behavior
