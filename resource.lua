@@ -32,6 +32,17 @@ function Resource:capture(team)
 end
 
 function Resource:getColor()
+    if self.type == "oil" then
+        -- Oil visuals: dark black-ish when neutral, team tint when owned
+        if self.owner == 1 then
+            return 0.3, 0.1, 0.1
+        elseif self.owner == 2 then
+            return 0.1, 0.1, 0.3
+        else
+            return 0.05, 0.05, 0.05
+        end
+    end
+
     if self.owner == 1 then
         return 1, 0, 0  -- Red for team 1
     elseif self.owner == 2 then

@@ -63,6 +63,15 @@ function Game.new()
     
     -- Resource currency (for building units/bases)
     self.teamResources = {[1] = 0, [2] = 0}  -- Resources owned by each team
+    -- Oil resource (separate currency used for late-game units)
+    self.teamOil = {[1] = 0, [2] = 0}
+
+    -- Province/Region control data (initialized after map)
+    self.provinces = {}  -- mapping col,row -> province id
+    self.regions = {}    -- mapping region id -> list of province ids
+    self.numProvinceCols = 2
+    self.numProvinceRows = 2
+    self:initializeProvinces()
     
     -- Fog of War system
     self.fogOfWar = FogOfWar.new(self.map, 2)
@@ -130,6 +139,334 @@ function Game:initializeBases()
     self:addBase("airbase", 2, nil, nil)
 end
 
+function Game:initializeProvinces()
+    -- Partition the map into provinces limited to the middle area (exclude starting areas)
+    -- For this map, create a 2x2 province grid in the central band, and group provinces into 2 regions (columns)
+    local pc = self.numProvinceCols or 2
+    local pr = self.numProvinceRows or 2
+
+    -- Determine middle band rows (exclude starting areas)
+    local startRow = (self.startingAreaDepth or 5) + 1
+    local endRow = self.mapHeight - (self.startingAreaDepth or 5)
+    local bandHeight = math.max(1, endRow - startRow + 1)
+
+    local provinceWidth = math.max(1, math.floor(self.mapWidth / pc))
+    local provinceHeight = math.max(1, math.floor(bandHeight / pr))
+
+    self.provinces = {}
+    self.regions = {}
+
+    local provinceId = 1
+    for px = 1, pc do
+        local colStart = (px - 1) * provinceWidth + 1
+        local colEnd = (px == pc) and self.mapWidth or (px * provinceWidth)
+        for py = 1, pr do
+            local rowStart = startRow + (py - 1) * provinceHeight
+            local rowEnd = (py == pr) and endRow or (startRow + py * provinceHeight - 1)
+
+            -- store province tiles (only in middle band)
+            local tiles = {}
+            for col = colStart, colEnd do
+                for row = rowStart, rowEnd do
+                    tiles[#tiles + 1] = {col = col, row = row}
+                    self.provinces[col .. "," .. row] = provinceId
+                end
+            end
+
+            -- region id = px (group provinces by column)
+            local regionId = px
+            self.regions[regionId] = self.regions[regionId] or {}
+            table.insert(self.regions[regionId], provinceId)
+
+            provinceId = provinceId + 1
+        end
+    end
+end
+
+function Game:drawProvinceBoundaries()
+    if not self.provinces then return end
+
+    -- Build reverse map: provinceId -> list of tiles
+    local provinceTiles = {}
+    for col = 1, self.mapWidth do
+        for row = 1, self.mapHeight do
+            local pid = self.provinces[col .. "," .. row]
+            if pid then
+                provinceTiles[pid] = provinceTiles[pid] or {}
+                table.insert(provinceTiles[pid], {col = col, row = row})
+            end
+        end
+    end
+
+    -- Draw each province as a subtle fill and light outline
+    for pid, tiles in pairs(provinceTiles) do
+        -- choose a color based on province id to alternate hues
+        local hue = (pid % 2 == 0) and 0.85 or 0.9
+        love.graphics.setColor(0.8 * hue, 0.75 * hue, 0.6 * hue, 0.06)
+        for _, t in ipairs(tiles) do
+            local tile = self.map:getTile(t.col, t.row)
+            if tile and tile.points and tile.isLand then
+                love.graphics.polygon("fill", tile.points)
+            end
+        end
+    end
+
+    -- Draw province external borders (black when unowned, team color when owned)
+    for pid, tiles in pairs(provinceTiles) do
+        local owner = self:getProvinceOwner(pid)
+        local colorR, colorG, colorB = 0, 0, 0
+        if owner == 1 then colorR, colorG, colorB = 1, 0, 0
+        elseif owner == 2 then colorR, colorG, colorB = 0, 0, 1
+        end
+        local edges = self:calculateExternalEdges(tiles)
+        love.graphics.setLineWidth(2)
+        love.graphics.setColor(colorR, colorG, colorB, 1)
+        for _, e in ipairs(edges) do
+            love.graphics.line(e[1], e[2], e[3], e[4])
+        end
+        love.graphics.setLineWidth(1)
+    end
+
+    -- Draw region labels and ownership
+    local regionOwners = self:calculateRegionControl()
+    love.graphics.setFont(love.graphics.newFont(12))
+    for regionId, provinceList in pairs(self.regions) do
+        -- compute average pixel position for region label
+        local sumX, sumY, count = 0, 0, 0
+        for _, provinceId in ipairs(provinceList) do
+            -- pick first tile in provinceTiles[provinceId] if exists
+            local tiles = provinceTiles[provinceId]
+            if tiles and #tiles > 0 then
+                for _, t in ipairs(tiles) do
+                    local px, py = self.map:gridToPixels(t.col, t.row)
+                    sumX = sumX + px
+                    sumY = sumY + py
+                    count = count + 1
+                end
+            end
+        end
+        if count > 0 then
+            local cx = sumX / count
+            local cy = sumY / count
+            local owner = regionOwners[regionId]
+            if owner == 1 then
+                love.graphics.setColor(1, 0, 0, 0.9)
+            elseif owner == 2 then
+                love.graphics.setColor(0, 0, 1, 0.9)
+            else
+                love.graphics.setColor(0.9, 0.9, 0.9, 0.9)
+            end
+            love.graphics.printf("Region " .. tostring(regionId), cx - 40, cy - 8, 80, "center")
+
+            -- Draw external region border (thicker) and color by region owner
+            local regionEdges = self:calculateRegionExternalEdges(regionId)
+            local rR, rG, rB = 0, 0, 0
+            if owner == 1 then rR, rG, rB = 1, 0, 0
+            elseif owner == 2 then rR, rG, rB = 0, 0, 1
+            end
+            love.graphics.setLineWidth(4)
+            love.graphics.setColor(rR, rG, rB, 1)
+            for _, e in ipairs(regionEdges) do
+                love.graphics.line(e[1], e[2], e[3], e[4])
+            end
+            love.graphics.setLineWidth(1)
+        end
+    end
+
+    love.graphics.setColor(1,1,1,1)
+end
+
+-- Return neighbor offsets for a given column parity (matches HexMap:getNeighbors ordering)
+function Game:getHexNeighborOffsets(col)
+    local odd = (col % 2 ~= 0)
+    if not odd then
+        return {
+            {1, 0}, {1, 1}, {0, 1}, {-1, 0}, {-1, 1}, {0, -1}
+        }
+    else
+        return {
+            {1, -1}, {1, 0}, {0, 1}, {-1, -1}, {-1, 0}, {0, -1}
+        }
+    end
+end
+
+-- Generic external edge calculator for a set of tiles.
+-- `tiles` is an array of {col=row, row=row} or a table keyed by "col,row" -> true
+-- Returns array of edges: { {x1,y1,x2,y2}, ... }
+function Game:calculateExternalEdges(tiles)
+    local tileSet = {}
+    if not tiles then return {} end
+    if #tiles > 0 then
+        for _, t in ipairs(tiles) do
+            tileSet[t.col .. "," .. t.row] = true
+        end
+    else
+        -- assume table keyed style
+        for k, v in pairs(tiles) do
+            if v then tileSet[k] = true end
+        end
+    end
+
+    local edges = {}
+    for key, _ in pairs(tileSet) do
+        local comma = string.find(key, ",")
+        if not comma then goto continue_tile end
+        local col = tonumber(string.sub(key, 1, comma - 1))
+        local row = tonumber(string.sub(key, comma + 1))
+        local tile = self.map:getTile(col, row)
+        if not tile or not tile.points then goto continue_tile end
+
+        local offsets = self:getHexNeighborOffsets(col)
+        for i = 1, 6 do
+            local off = offsets[i]
+            local ncol = col + off[1]
+            local nrow = row + off[2]
+            local nkey = ncol .. "," .. nrow
+            if not tileSet[nkey] then
+                -- Neighbor missing: pick the edge whose midpoint faces the neighbor center
+                local cx, cy = self.map:gridToPixels(col, row)
+                local ncx, ncy = self.map:gridToPixels(ncol, nrow)
+                local vx, vy = ncx - cx, ncy - cy
+                local vdist = math.sqrt(vx * vx + vy * vy)
+                local vnx, vny = 0, 0
+                if vdist > 0 then vnx, vny = vx / vdist, vy / vdist end
+
+                local bestJ, bestDot = 1, -999
+                -- Find edge midpoint most aligned with neighbor direction
+                for j = 1, 6 do
+                    local p1j = (j - 1) * 2 + 1
+                    local p2j = (j % 6) * 2 + 1
+                    local ax = tile.points[p1j]
+                    local ay = tile.points[p1j + 1]
+                    local bx = tile.points[p2j]
+                    local by = tile.points[p2j + 1]
+                    local mx = (ax + bx) * 0.5
+                    local my = (ay + by) * 0.5
+                    local ex, ey = mx - cx, my - cy
+                    local ed = math.sqrt(ex * ex + ey * ey)
+                    if ed > 0 and vdist > 0 then
+                        local enx, eny = ex / ed, ey / ed
+                        local dot = enx * vnx + eny * vny
+                        if dot > bestDot then
+                            bestDot = dot
+                            bestJ = j
+                        end
+                    elseif vdist == 0 then
+                        bestJ = i
+                        break
+                    end
+                end
+
+                local p1i = (bestJ - 1) * 2 + 1
+                local p2i = (bestJ % 6) * 2 + 1
+                local ax = tile.points[p1i]
+                local ay = tile.points[p1i + 1]
+                local bx = tile.points[p2i]
+                local by = tile.points[p2i + 1]
+
+                -- Midpoint and inward normal
+                local mx = (ax + bx) * 0.5
+                local my = (ay + by) * 0.5
+                local dx = cx - mx
+                local dy = cy - my
+                local distn = math.sqrt(dx * dx + dy * dy)
+                local nx, ny = 0, 0
+                if distn > 0 then nx, ny = dx / distn, dy / distn end
+
+                -- Slightly smaller inset so borders sit closer to hex edges
+                local inset = math.min(6, (self.hexSideLength or 32) * 0.12)
+                local ox = nx * inset
+                local oy = ny * inset
+
+                local x1 = ax + ox
+                local y1 = ay + oy
+                local x2 = bx + ox
+                local y2 = by + oy
+                table.insert(edges, {x1, y1, x2, y2})
+            end
+        end
+        ::continue_tile::
+    end
+
+    return edges
+end
+
+-- Determine owner of a province (returns team number or nil). A team owns a province if it has one or more HQs in that province and no HQs of other teams.
+function Game:getProvinceOwner(provinceId)
+    local owner = nil
+    for _, base in ipairs(self.bases) do
+        if base.type == "hq" and base.col and base.row and base.col > 0 then
+            local pid = self.provinces[base.col .. "," .. base.row]
+            if pid == provinceId then
+                if not owner then owner = base.team
+                elseif owner ~= base.team then return nil end
+            end
+        end
+    end
+    return owner
+end
+
+-- Calculate external edges for a region (regionId)
+function Game:calculateRegionExternalEdges(regionId)
+    local provinceList = self.regions[regionId]
+    if not provinceList then return {} end
+    local tiles = {}
+    for _, pid in ipairs(provinceList) do
+        for k, v in pairs(self.provinces) do
+            if v == pid then
+                local comma = string.find(k, ",")
+                if comma then
+                    local col = tonumber(string.sub(k, 1, comma - 1))
+                    local row = tonumber(string.sub(k, comma + 1))
+                    table.insert(tiles, {col = col, row = row})
+                end
+            end
+        end
+    end
+    return self:calculateExternalEdges(tiles)
+end
+
+-- Determine ownership of regions: returns table regionId -> ownerTeam or nil
+function Game:calculateRegionControl()
+    local owners = {}
+    for regionId, provinceList in pairs(self.regions) do
+        -- region is controlled by a team if that team has an HQ in every province of this region
+        local regionOwner = nil
+        local allProvincesHaveHQ = true
+        local requiredTeam = nil
+        for _, provinceId in ipairs(provinceList) do
+            -- find any HQ in this province
+            local foundHQ = false
+            local foundTeam = nil
+            for _, base in ipairs(self.bases) do
+                if base.type == "hq" and base.col and base.row and base.col > 0 then
+                    local pid = self.provinces[base.col .. "," .. base.row]
+                    if pid == provinceId then
+                        foundHQ = true
+                        foundTeam = base.team
+                        break
+                    end
+                end
+            end
+            if not foundHQ then
+                allProvincesHaveHQ = false
+                break
+            end
+            if not requiredTeam then
+                requiredTeam = foundTeam
+            elseif requiredTeam ~= foundTeam then
+                -- Different teams in different provinces -> no single owner
+                allProvincesHaveHQ = false
+                break
+            end
+        end
+        if allProvincesHaveHQ and requiredTeam then
+            owners[regionId] = requiredTeam
+        end
+    end
+    return owners
+end
+
 function Game:addBase(baseType, team, col, row)
     local base = Base.new(baseType, team, self.map, col, row)
     table.insert(self.bases, base)
@@ -137,26 +474,36 @@ end
 
 function Game:generateResources()
     -- Generate a few resource tiles scattered across the map
-    local numResources = 5  -- Number of resources to place
-    
+    local numResources = 5  -- Number of generic resources to place
+
     for i = 1, numResources do
         local attempts = 0
         local placed = false
-        
         while not placed and attempts < 100 do
             attempts = attempts + 1
             local col = math.random(5, self.mapWidth - 5)  -- Avoid edges
             local row = math.random(5, self.mapHeight - 5)
-            
             local tile = self.map:getTile(col, row)
             if tile and tile.isLand then
-                -- Check if tile is already occupied
                 if not self:getPieceAt(col, row) and not self:getBaseAt(col, row) and not self:getResourceAt(col, row) then
                     local resource = Resource.new("generic", self.map, col, row)
                     table.insert(self.resources, resource)
                     placed = true
                 end
             end
+        end
+    end
+
+    -- Add a couple of rich oil deposits near the map center
+    local centerCol = math.floor(self.mapWidth / 2)
+    local centerRow = math.floor(self.mapHeight / 2)
+    local oilSpots = {{centerCol, centerRow}, {centerCol + 2, centerRow - 1}}
+    for _, spot in ipairs(oilSpots) do
+        local col, row = spot[1], spot[2]
+        local tile = self.map:getTile(col, row)
+        if tile and tile.isLand and not self:getResourceAt(col, row) then
+            local resource = Resource.new("oil", self.map, col, row)
+            table.insert(self.resources, resource)
         end
     end
 end
@@ -196,6 +543,9 @@ function Game:draw()
     
     -- Draw map
     self.map:draw(0, 0)
+
+    -- Draw province fills and region labels
+    self:drawProvinceBoundaries()
     
     -- Draw starting areas during placement phase
     if self.state == "placing" then
@@ -503,7 +853,7 @@ function Game:drawUI()
         -- Normal gameplay UI
         local teamColor = self.currentTurn == 1 and "Red" or "Blue"
         love.graphics.print("Team: " .. teamColor .. " | Turn: " .. self.turnCount, 10, 10)
-        love.graphics.print("Resources: " .. (self.teamResources[self.currentTurn] or 0), 10, 30)
+        love.graphics.print("Resources: " .. (self.teamResources[self.currentTurn] or 0) .. "  Oil: " .. (self.teamOil[self.currentTurn] or 0), 10, 30)
         -- Show unit count / capacity for current team
         local unitCount = self:getUnitCount(self.currentTurn)
         local unitCapacity = self:getUnitCapacity(self.currentTurn)
@@ -1178,7 +1528,15 @@ function Game:executeAction(option)
         self:buildUnitNearBase(context, "sniper", team, option.cost)
     elseif option.id == "build_tank" and contextType == "base" then
         -- Build a tank near the base
-        self:buildUnitNearBase(context, "tank", team, option.cost)
+        -- Tanks require oil in addition to generic resources
+        local oilCost = 1
+        if self.teamOil[team] and self.teamOil[team] >= oilCost then
+            self.teamOil[team] = self.teamOil[team] - oilCost
+            self:buildUnitNearBase(context, "tank", team, option.cost)
+        else
+            -- Not enough oil: do nothing (could show message)
+            return
+        end
     elseif option.id == "build_engineer" and contextType == "base" then
         -- Build an engineer near the base
         self:buildUnitNearBase(context, "engineer", team, option.cost)
@@ -1620,13 +1978,26 @@ function Game:generateResourceIncome(team)
     -- Count resource tiles with mines owned by this team
     for _, resource in ipairs(self.resources) do
         if resource.owner == team and resource.hasMine then
-            -- Mined resources produce 2
-            income = income + 2
+            if resource.type == "oil" then
+                -- Oil produces oil resource (separate currency)
+                self.teamOil[team] = self.teamOil[team] + 1
+            else
+                -- Mined resources produce 2 generic resources
+                income = income + 2
+            end
         end
     end
     
     -- Add income to team's resources
     self.teamResources[team] = self.teamResources[team] + income
+
+    -- Region control bonuses: +1 resource per controlled region
+    local regionOwners = self:calculateRegionControl()
+    for regionId, owner in pairs(regionOwners) do
+        if owner == team then
+            self.teamResources[team] = self.teamResources[team] + 1
+        end
+    end
 end
 
 function Game:movePiece(col, row)
