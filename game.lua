@@ -10,6 +10,7 @@ local Base = require("base")
 local Resource = require("resource")
 local ActionMenu = require("action_menu")
 local FogOfWar = require("fog_of_war")
+local Network = require("network")
 
 function Game.new()
     local self = setmetatable({}, Game)
@@ -23,7 +24,7 @@ function Game.new()
     self.piecesPerTeam = 4  -- Number of pieces per team (3 infantry + 1 engineer)
     self.piecesToPlace = self.piecesPerTeam * 2  -- Total pieces (4 for each team)
     self.piecesPlaced = 0
-    self.basesPerTeam = 3  -- HQ, Ammo Depot, Supply Depot
+    self.basesPerTeam = 4  -- HQ, Ammo Depot, Supply Depot, Airbase
     self.basesToPlace = self.basesPerTeam * 2  -- Total bases (3 for each team)
     self.basesPlaced = 0
     self.placementTeam = 1  -- Which team is currently placing (starts with team 1)
@@ -31,8 +32,8 @@ function Game.new()
     
     -- Map setup
     self.hexSideLength = 32
-    self.mapWidth = 20
-    self.mapHeight = 20
+    self.mapWidth = 32
+    self.mapHeight = 32
     self.map = HexMap.new(self.mapWidth, self.mapHeight, self.hexSideLength)
     self.map:initializeGrid()
     self:generateMapTerrain()
@@ -66,15 +67,14 @@ function Game.new()
     -- Oil resource (separate currency used for late-game units)
     self.teamOil = {[1] = 0, [2] = 0}
 
-    -- Province/Region control data (initialized after map)
-    self.provinces = {}  -- mapping col,row -> province id
-    self.regions = {}    -- mapping region id -> list of province ids
+    -- Province/Region control data (disabled for now)
+    self.provinces = nil
+    self.regions = nil
     self.numProvinceCols = 2
     self.numProvinceRows = 2
-    self:initializeProvinces()
     
     -- Fog of War system
-    self.fogOfWar = FogOfWar.new(self.map, 2)
+    self.fogOfWar = FogOfWar.new(self.map, 2, self)
     
     -- Initialize starting areas as explored and visible for each team
     for team = 1, 2 do
@@ -99,13 +99,26 @@ function Game.new()
     -- Action menu UI (reusable for bases, pieces, resources, etc.)
     self.actionMenu = nil  -- ActionMenu instance
     self.actionMenuContext = nil  -- Context object (base, piece, etc.) that opened the menu
+    -- Hotseat pass control
+    self.passPending = false
+    self.pendingNextTeam = nil
+    -- Hotseat/network/dev flags
+    self.hotseatEnabled = true
+    self.devMode = false
+    -- Per-player ready flags for simultaneous placement
+    self.playerReady = {[1] = false, [2] = false}
     
     return self
 end
 
 function Game:generateMapTerrain()
-    -- Use balanced terrain generator for competitive play
-    self.map:generateTerrain("balanced")
+    -- Use region-stitch generator to create tileable strategic regions
+    local success, _ = pcall(function() self.map:generateTerrain("region_stitch") end)
+    if not success then
+        -- Fallback to balanced if region_stitch unavailable
+        print("Region-stitch terrain generator failed, falling back to balanced generator.")
+        self.map:generateTerrain("balanced")
+    end
 end
 
 function Game:initializePieces()
@@ -139,142 +152,142 @@ function Game:initializeBases()
     self:addBase("airbase", 2, nil, nil)
 end
 
-function Game:initializeProvinces()
-    -- Partition the map into provinces limited to the middle area (exclude starting areas)
-    -- For this map, create a 2x2 province grid in the central band, and group provinces into 2 regions (columns)
-    local pc = self.numProvinceCols or 2
-    local pr = self.numProvinceRows or 2
+-- function Game:initializeProvinces()
+--     -- Partition the map into provinces limited to the middle area (exclude starting areas)
+--     -- For this map, create a 2x2 province grid in the central band, and group provinces into 2 regions (columns)
+--     local pc = self.numProvinceCols or 2
+--     local pr = self.numProvinceRows or 2
 
-    -- Determine middle band rows (exclude starting areas)
-    local startRow = (self.startingAreaDepth or 5) + 1
-    local endRow = self.mapHeight - (self.startingAreaDepth or 5)
-    local bandHeight = math.max(1, endRow - startRow + 1)
+--     -- Determine middle band rows (exclude starting areas)
+--     local startRow = (self.startingAreaDepth or 5) + 1
+--     local endRow = self.mapHeight - (self.startingAreaDepth or 5)
+--     local bandHeight = math.max(1, endRow - startRow + 1)
 
-    local provinceWidth = math.max(1, math.floor(self.mapWidth / pc))
-    local provinceHeight = math.max(1, math.floor(bandHeight / pr))
+--     local provinceWidth = math.max(1, math.floor(self.mapWidth / pc))
+--     local provinceHeight = math.max(1, math.floor(bandHeight / pr))
 
-    self.provinces = {}
-    self.regions = {}
+--     self.provinces = {}
+--     self.regions = {}
 
-    local provinceId = 1
-    for px = 1, pc do
-        local colStart = (px - 1) * provinceWidth + 1
-        local colEnd = (px == pc) and self.mapWidth or (px * provinceWidth)
-        for py = 1, pr do
-            local rowStart = startRow + (py - 1) * provinceHeight
-            local rowEnd = (py == pr) and endRow or (startRow + py * provinceHeight - 1)
+--     local provinceId = 1
+--     for px = 1, pc do
+--         local colStart = (px - 1) * provinceWidth + 1
+--         local colEnd = (px == pc) and self.mapWidth or (px * provinceWidth)
+--         for py = 1, pr do
+--             local rowStart = startRow + (py - 1) * provinceHeight
+--             local rowEnd = (py == pr) and endRow or (startRow + py * provinceHeight - 1)
 
-            -- store province tiles (only in middle band)
-            local tiles = {}
-            for col = colStart, colEnd do
-                for row = rowStart, rowEnd do
-                    tiles[#tiles + 1] = {col = col, row = row}
-                    self.provinces[col .. "," .. row] = provinceId
-                end
-            end
+--             -- store province tiles (only in middle band)
+--             local tiles = {}
+--             for col = colStart, colEnd do
+--                 for row = rowStart, rowEnd do
+--                     tiles[#tiles + 1] = {col = col, row = row}
+--                     self.provinces[col .. "," .. row] = provinceId
+--                 end
+--             end
 
-            -- region id = px (group provinces by column)
-            local regionId = px
-            self.regions[regionId] = self.regions[regionId] or {}
-            table.insert(self.regions[regionId], provinceId)
+--             -- region id = px (group provinces by column)
+--             local regionId = px
+--             self.regions[regionId] = self.regions[regionId] or {}
+--             table.insert(self.regions[regionId], provinceId)
 
-            provinceId = provinceId + 1
-        end
-    end
-end
+--             provinceId = provinceId + 1
+--         end
+--     end
+-- end
 
-function Game:drawProvinceBoundaries()
-    if not self.provinces then return end
+-- function Game:drawProvinceBoundaries()
+--     if not self.provinces then return end
 
-    -- Build reverse map: provinceId -> list of tiles
-    local provinceTiles = {}
-    for col = 1, self.mapWidth do
-        for row = 1, self.mapHeight do
-            local pid = self.provinces[col .. "," .. row]
-            if pid then
-                provinceTiles[pid] = provinceTiles[pid] or {}
-                table.insert(provinceTiles[pid], {col = col, row = row})
-            end
-        end
-    end
+--     -- Build reverse map: provinceId -> list of tiles
+--     local provinceTiles = {}
+--     for col = 1, self.mapWidth do
+--         for row = 1, self.mapHeight do
+--             local pid = self.provinces[col .. "," .. row]
+--             if pid then
+--                 provinceTiles[pid] = provinceTiles[pid] or {}
+--                 table.insert(provinceTiles[pid], {col = col, row = row})
+--             end
+--         end
+--     end
 
-    -- Draw each province as a subtle fill and light outline
-    for pid, tiles in pairs(provinceTiles) do
-        -- choose a color based on province id to alternate hues
-        local hue = (pid % 2 == 0) and 0.85 or 0.9
-        love.graphics.setColor(0.8 * hue, 0.75 * hue, 0.6 * hue, 0.06)
-        for _, t in ipairs(tiles) do
-            local tile = self.map:getTile(t.col, t.row)
-            if tile and tile.points and tile.isLand then
-                love.graphics.polygon("fill", tile.points)
-            end
-        end
-    end
+--     -- Draw each province as a subtle fill and light outline
+--     for pid, tiles in pairs(provinceTiles) do
+--         -- choose a color based on province id to alternate hues
+--         local hue = (pid % 2 == 0) and 0.85 or 0.9
+--         love.graphics.setColor(0.8 * hue, 0.75 * hue, 0.6 * hue, 0.06)
+--         for _, t in ipairs(tiles) do
+--             local tile = self.map:getTile(t.col, t.row)
+--             if tile and tile.points and tile.isLand then
+--                 love.graphics.polygon("fill", tile.points)
+--             end
+--         end
+--     end
 
-    -- Draw province external borders (black when unowned, team color when owned)
-    for pid, tiles in pairs(provinceTiles) do
-        local owner = self:getProvinceOwner(pid)
-        local colorR, colorG, colorB = 0, 0, 0
-        if owner == 1 then colorR, colorG, colorB = 1, 0, 0
-        elseif owner == 2 then colorR, colorG, colorB = 0, 0, 1
-        end
-        local edges = self:calculateExternalEdges(tiles)
-        love.graphics.setLineWidth(2)
-        love.graphics.setColor(colorR, colorG, colorB, 1)
-        for _, e in ipairs(edges) do
-            love.graphics.line(e[1], e[2], e[3], e[4])
-        end
-        love.graphics.setLineWidth(1)
-    end
+--     -- Draw province external borders (black when unowned, team color when owned)
+--     for pid, tiles in pairs(provinceTiles) do
+--         local owner = self:getProvinceOwner(pid)
+--         local colorR, colorG, colorB = 0, 0, 0
+--         if owner == 1 then colorR, colorG, colorB = 1, 0, 0
+--         elseif owner == 2 then colorR, colorG, colorB = 0, 0, 1
+--         end
+--         local edges = self:calculateExternalEdges(tiles)
+--         love.graphics.setLineWidth(2)
+--         love.graphics.setColor(colorR, colorG, colorB, 1)
+--         for _, e in ipairs(edges) do
+--             love.graphics.line(e[1], e[2], e[3], e[4])
+--         end
+--         love.graphics.setLineWidth(1)
+--     end
 
-    -- Draw region labels and ownership
-    local regionOwners = self:calculateRegionControl()
-    love.graphics.setFont(love.graphics.newFont(12))
-    for regionId, provinceList in pairs(self.regions) do
-        -- compute average pixel position for region label
-        local sumX, sumY, count = 0, 0, 0
-        for _, provinceId in ipairs(provinceList) do
-            -- pick first tile in provinceTiles[provinceId] if exists
-            local tiles = provinceTiles[provinceId]
-            if tiles and #tiles > 0 then
-                for _, t in ipairs(tiles) do
-                    local px, py = self.map:gridToPixels(t.col, t.row)
-                    sumX = sumX + px
-                    sumY = sumY + py
-                    count = count + 1
-                end
-            end
-        end
-        if count > 0 then
-            local cx = sumX / count
-            local cy = sumY / count
-            local owner = regionOwners[regionId]
-            if owner == 1 then
-                love.graphics.setColor(1, 0, 0, 0.9)
-            elseif owner == 2 then
-                love.graphics.setColor(0, 0, 1, 0.9)
-            else
-                love.graphics.setColor(0.9, 0.9, 0.9, 0.9)
-            end
-            love.graphics.printf("Region " .. tostring(regionId), cx - 40, cy - 8, 80, "center")
+--     -- Draw region labels and ownership
+--     local regionOwners = self:calculateRegionControl()
+--     love.graphics.setFont(love.graphics.newFont(12))
+--     for regionId, provinceList in pairs(self.regions) do
+--         -- compute average pixel position for region label
+--         local sumX, sumY, count = 0, 0, 0
+--         for _, provinceId in ipairs(provinceList) do
+--             -- pick first tile in provinceTiles[provinceId] if exists
+--             local tiles = provinceTiles[provinceId]
+--             if tiles and #tiles > 0 then
+--                 for _, t in ipairs(tiles) do
+--                     local px, py = self.map:gridToPixels(t.col, t.row)
+--                     sumX = sumX + px
+--                     sumY = sumY + py
+--                     count = count + 1
+--                 end
+--             end
+--         end
+--         if count > 0 then
+--             local cx = sumX / count
+--             local cy = sumY / count
+--             local owner = regionOwners[regionId]
+--             if owner == 1 then
+--                 love.graphics.setColor(1, 0, 0, 0.9)
+--             elseif owner == 2 then
+--                 love.graphics.setColor(0, 0, 1, 0.9)
+--             else
+--                 love.graphics.setColor(0.9, 0.9, 0.9, 0.9)
+--             end
+--             love.graphics.printf("Region " .. tostring(regionId), cx - 40, cy - 8, 80, "center")
 
-            -- Draw external region border (thicker) and color by region owner
-            local regionEdges = self:calculateRegionExternalEdges(regionId)
-            local rR, rG, rB = 0, 0, 0
-            if owner == 1 then rR, rG, rB = 1, 0, 0
-            elseif owner == 2 then rR, rG, rB = 0, 0, 1
-            end
-            love.graphics.setLineWidth(4)
-            love.graphics.setColor(rR, rG, rB, 1)
-            for _, e in ipairs(regionEdges) do
-                love.graphics.line(e[1], e[2], e[3], e[4])
-            end
-            love.graphics.setLineWidth(1)
-        end
-    end
+--             -- Draw external region border (thicker) and color by region owner
+--             local regionEdges = self:calculateRegionExternalEdges(regionId)
+--             local rR, rG, rB = 0, 0, 0
+--             if owner == 1 then rR, rG, rB = 1, 0, 0
+--             elseif owner == 2 then rR, rG, rB = 0, 0, 1
+--             end
+--             love.graphics.setLineWidth(4)
+--             love.graphics.setColor(rR, rG, rB, 1)
+--             for _, e in ipairs(regionEdges) do
+--                 love.graphics.line(e[1], e[2], e[3], e[4])
+--             end
+--             love.graphics.setLineWidth(1)
+--         end
+--     end
 
-    love.graphics.setColor(1,1,1,1)
-end
+--     love.graphics.setColor(1,1,1,1)
+-- end
 
 -- Return neighbor offsets for a given column parity (matches HexMap:getNeighbors ordering)
 function Game:getHexNeighborOffsets(col)
@@ -293,189 +306,245 @@ end
 -- Generic external edge calculator for a set of tiles.
 -- `tiles` is an array of {col=row, row=row} or a table keyed by "col,row" -> true
 -- Returns array of edges: { {x1,y1,x2,y2}, ... }
-function Game:calculateExternalEdges(tiles)
-    local tileSet = {}
-    if not tiles then return {} end
-    if #tiles > 0 then
-        for _, t in ipairs(tiles) do
-            tileSet[t.col .. "," .. t.row] = true
-        end
-    else
-        -- assume table keyed style
-        for k, v in pairs(tiles) do
-            if v then tileSet[k] = true end
-        end
-    end
+-- function Game:calculateExternalEdges(tiles)
+--     local tileSet = {}
+--     if not tiles then return {} end
+--     if #tiles > 0 then
+--         for _, t in ipairs(tiles) do
+--             tileSet[t.col .. "," .. t.row] = true
+--         end
+--     else
+--         -- assume table keyed style
+--         for k, v in pairs(tiles) do
+--             if v then tileSet[k] = true end
+--         end
+--     end
 
-    local edges = {}
-    for key, _ in pairs(tileSet) do
-        local comma = string.find(key, ",")
-        if not comma then goto continue_tile end
-        local col = tonumber(string.sub(key, 1, comma - 1))
-        local row = tonumber(string.sub(key, comma + 1))
-        local tile = self.map:getTile(col, row)
-        if not tile or not tile.points then goto continue_tile end
+--     local edges = {}
+--     for key, _ in pairs(tileSet) do
+--         local comma = string.find(key, ",")
+--         if not comma then goto continue_tile end
+--         local col = tonumber(string.sub(key, 1, comma - 1))
+--         local row = tonumber(string.sub(key, comma + 1))
+--         local tile = self.map:getTile(col, row)
+--         if not tile or not tile.points then goto continue_tile end
 
-        local offsets = self:getHexNeighborOffsets(col)
-        for i = 1, 6 do
-            local off = offsets[i]
-            local ncol = col + off[1]
-            local nrow = row + off[2]
-            local nkey = ncol .. "," .. nrow
-            if not tileSet[nkey] then
-                -- Neighbor missing: pick the edge whose midpoint faces the neighbor center
-                local cx, cy = self.map:gridToPixels(col, row)
-                local ncx, ncy = self.map:gridToPixels(ncol, nrow)
-                local vx, vy = ncx - cx, ncy - cy
-                local vdist = math.sqrt(vx * vx + vy * vy)
-                local vnx, vny = 0, 0
-                if vdist > 0 then vnx, vny = vx / vdist, vy / vdist end
+--         local offsets = self:getHexNeighborOffsets(col)
+--         for i = 1, 6 do
+--             local off = offsets[i]
+--             local ncol = col + off[1]
+--             local nrow = row + off[2]
+--             local nkey = ncol .. "," .. nrow
+--             if not tileSet[nkey] then
+--                 -- Neighbor missing: pick the edge whose midpoint faces the neighbor center
+--                 local cx, cy = self.map:gridToPixels(col, row)
+--                 local ncx, ncy = self.map:gridToPixels(ncol, nrow)
+--                 local vx, vy = ncx - cx, ncy - cy
+--                 local vdist = math.sqrt(vx * vx + vy * vy)
+--                 local vnx, vny = 0, 0
+--                 if vdist > 0 then vnx, vny = vx / vdist, vy / vdist end
 
-                local bestJ, bestDot = 1, -999
-                -- Find edge midpoint most aligned with neighbor direction
-                for j = 1, 6 do
-                    local p1j = (j - 1) * 2 + 1
-                    local p2j = (j % 6) * 2 + 1
-                    local ax = tile.points[p1j]
-                    local ay = tile.points[p1j + 1]
-                    local bx = tile.points[p2j]
-                    local by = tile.points[p2j + 1]
-                    local mx = (ax + bx) * 0.5
-                    local my = (ay + by) * 0.5
-                    local ex, ey = mx - cx, my - cy
-                    local ed = math.sqrt(ex * ex + ey * ey)
-                    if ed > 0 and vdist > 0 then
-                        local enx, eny = ex / ed, ey / ed
-                        local dot = enx * vnx + eny * vny
-                        if dot > bestDot then
-                            bestDot = dot
-                            bestJ = j
-                        end
-                    elseif vdist == 0 then
-                        bestJ = i
-                        break
-                    end
-                end
+--                 local bestJ, bestDot = 1, -999
+--                 -- Find edge midpoint most aligned with neighbor direction
+--                 for j = 1, 6 do
+--                     local p1j = (j - 1) * 2 + 1
+--                     local p2j = (j % 6) * 2 + 1
+--                     local ax = tile.points[p1j]
+--                     local ay = tile.points[p1j + 1]
+--                     local bx = tile.points[p2j]
+--                     local by = tile.points[p2j + 1]
+--                     local mx = (ax + bx) * 0.5
+--                     local my = (ay + by) * 0.5
+--                     local ex, ey = mx - cx, my - cy
+--                     local ed = math.sqrt(ex * ex + ey * ey)
+--                     if ed > 0 and vdist > 0 then
+--                         local enx, eny = ex / ed, ey / ed
+--                         local dot = enx * vnx + eny * vny
+--                         if dot > bestDot then
+--                             bestDot = dot
+--                             bestJ = j
+--                         end
+--                     elseif vdist == 0 then
+--                         bestJ = i
+--                         break
+--                     end
+--                 end
 
-                local p1i = (bestJ - 1) * 2 + 1
-                local p2i = (bestJ % 6) * 2 + 1
-                local ax = tile.points[p1i]
-                local ay = tile.points[p1i + 1]
-                local bx = tile.points[p2i]
-                local by = tile.points[p2i + 1]
+--                 local p1i = (bestJ - 1) * 2 + 1
+--                 local p2i = (bestJ % 6) * 2 + 1
+--                 local ax = tile.points[p1i]
+--                 local ay = tile.points[p1i + 1]
+--                 local bx = tile.points[p2i]
+--                 local by = tile.points[p2i + 1]
 
-                -- Midpoint and inward normal
-                local mx = (ax + bx) * 0.5
-                local my = (ay + by) * 0.5
-                local dx = cx - mx
-                local dy = cy - my
-                local distn = math.sqrt(dx * dx + dy * dy)
-                local nx, ny = 0, 0
-                if distn > 0 then nx, ny = dx / distn, dy / distn end
+--                 -- Midpoint and inward normal
+--                 local mx = (ax + bx) * 0.5
+--                 local my = (ay + by) * 0.5
+--                 local dx = cx - mx
+--                 local dy = cy - my
+--                 local distn = math.sqrt(dx * dx + dy * dy)
+--                 local nx, ny = 0, 0
+--                 if distn > 0 then nx, ny = dx / distn, dy / distn end
 
-                -- Slightly smaller inset so borders sit closer to hex edges
-                local inset = math.min(6, (self.hexSideLength or 32) * 0.12)
-                local ox = nx * inset
-                local oy = ny * inset
+--                 -- Slightly smaller inset so borders sit closer to hex edges
+--                 local inset = math.min(6, (self.hexSideLength or 32) * 0.12)
+--                 local ox = nx * inset
+--                 local oy = ny * inset
 
-                local x1 = ax + ox
-                local y1 = ay + oy
-                local x2 = bx + ox
-                local y2 = by + oy
-                table.insert(edges, {x1, y1, x2, y2})
-            end
-        end
-        ::continue_tile::
-    end
+--                 local x1 = ax + ox
+--                 local y1 = ay + oy
+--                 local x2 = bx + ox
+--                 local y2 = by + oy
+--                 table.insert(edges, {x1, y1, x2, y2})
+--             end
+--         end
+--         ::continue_tile::
+--     end
 
-    return edges
-end
+--     return edges
+-- end
 
--- Determine owner of a province (returns team number or nil). A team owns a province if it has one or more HQs in that province and no HQs of other teams.
-function Game:getProvinceOwner(provinceId)
-    local owner = nil
-    for _, base in ipairs(self.bases) do
-        if base.type == "hq" and base.col and base.row and base.col > 0 then
-            local pid = self.provinces[base.col .. "," .. base.row]
-            if pid == provinceId then
-                if not owner then owner = base.team
-                elseif owner ~= base.team then return nil end
-            end
-        end
-    end
-    return owner
-end
+-- -- Determine owner of a province (returns team number or nil). A team owns a province if it has one or more HQs in that province and no HQs of other teams.
+-- function Game:getProvinceOwner(provinceId)
+--     local owner = nil
+--     for _, base in ipairs(self.bases) do
+--         if base.type == "hq" and base.col and base.row and base.col > 0 then
+--             local pid = self.provinces[base.col .. "," .. base.row]
+--             if pid == provinceId then
+--                 if not owner then owner = base.team
+--                 elseif owner ~= base.team then return nil end
+--             end
+--         end
+--     end
+--     return owner
+-- end
 
--- Calculate external edges for a region (regionId)
-function Game:calculateRegionExternalEdges(regionId)
-    local provinceList = self.regions[regionId]
-    if not provinceList then return {} end
-    local tiles = {}
-    for _, pid in ipairs(provinceList) do
-        for k, v in pairs(self.provinces) do
-            if v == pid then
-                local comma = string.find(k, ",")
-                if comma then
-                    local col = tonumber(string.sub(k, 1, comma - 1))
-                    local row = tonumber(string.sub(k, comma + 1))
-                    table.insert(tiles, {col = col, row = row})
-                end
-            end
-        end
-    end
-    return self:calculateExternalEdges(tiles)
-end
+-- -- Calculate external edges for a region (regionId)
+-- function Game:calculateRegionExternalEdges(regionId)
+--     local provinceList = self.regions[regionId]
+--     if not provinceList then return {} end
+--     local tiles = {}
+--     for _, pid in ipairs(provinceList) do
+--         for k, v in pairs(self.provinces) do
+--             if v == pid then
+--                 local comma = string.find(k, ",")
+--                 if comma then
+--                     local col = tonumber(string.sub(k, 1, comma - 1))
+--                     local row = tonumber(string.sub(k, comma + 1))
+--                     table.insert(tiles, {col = col, row = row})
+--                 end
+--             end
+--         end
+--     end
+--     return self:calculateExternalEdges(tiles)
+-- end
 
--- Determine ownership of regions: returns table regionId -> ownerTeam or nil
-function Game:calculateRegionControl()
-    local owners = {}
-    for regionId, provinceList in pairs(self.regions) do
-        -- region is controlled by a team if that team has an HQ in every province of this region
-        local regionOwner = nil
-        local allProvincesHaveHQ = true
-        local requiredTeam = nil
-        for _, provinceId in ipairs(provinceList) do
-            -- find any HQ in this province
-            local foundHQ = false
-            local foundTeam = nil
-            for _, base in ipairs(self.bases) do
-                if base.type == "hq" and base.col and base.row and base.col > 0 then
-                    local pid = self.provinces[base.col .. "," .. base.row]
-                    if pid == provinceId then
-                        foundHQ = true
-                        foundTeam = base.team
-                        break
-                    end
-                end
-            end
-            if not foundHQ then
-                allProvincesHaveHQ = false
-                break
-            end
-            if not requiredTeam then
-                requiredTeam = foundTeam
-            elseif requiredTeam ~= foundTeam then
-                -- Different teams in different provinces -> no single owner
-                allProvincesHaveHQ = false
-                break
-            end
-        end
-        if allProvincesHaveHQ and requiredTeam then
-            owners[regionId] = requiredTeam
-        end
-    end
-    return owners
-end
+-- -- Determine ownership of regions: returns table regionId -> ownerTeam or nil
+-- function Game:calculateRegionControl()
+--     -- If regions aren't initialized, return empty ownership map
+--     if not self.regions then return {} end
+--     local owners = {}
+--     for regionId, provinceList in pairs(self.regions) do
+--         -- region is controlled by a team if that team has an HQ in every province of this region
+--         local regionOwner = nil
+--         local allProvincesHaveHQ = true
+--         local requiredTeam = nil
+--         for _, provinceId in ipairs(provinceList) do
+--             -- find any HQ in this province
+--             local foundHQ = false
+--             local foundTeam = nil
+--             for _, base in ipairs(self.bases) do
+--                 if base.type == "hq" and base.col and base.row and base.col > 0 then
+--                     local pid = self.provinces[base.col .. "," .. base.row]
+--                     if pid == provinceId then
+--                         foundHQ = true
+--                         foundTeam = base.team
+--                         break
+--                     end
+--                 end
+--             end
+--             if not foundHQ then
+--                 allProvincesHaveHQ = false
+--                 break
+--             end
+--             if not requiredTeam then
+--                 requiredTeam = foundTeam
+--             elseif requiredTeam ~= foundTeam then
+--                 -- Different teams in different provinces -> no single owner
+--                 allProvincesHaveHQ = false
+--                 break
+--             end
+--         end
+--         if allProvincesHaveHQ and requiredTeam then
+--             owners[regionId] = requiredTeam
+--         end
+--     end
+--     return owners
+-- end
 
 function Game:addBase(baseType, team, col, row)
     local base = Base.new(baseType, team, self.map, col, row)
     table.insert(self.bases, base)
+    pcall(function() print(string.format("[game] addBase local -> type=%s team=%s col=%s row=%s", tostring(baseType), tostring(team), tostring(col), tostring(row))) end)
+    -- If this base was placed with coordinates, mark it so host will broadcast at end-turn
+    if base.col and base.row and base.col > 0 and base.row > 0 then
+        base.justPlaced = true
+        -- Update fog visibility immediately so the new base's effects are recognized locally
+        if self.fogOfWar then
+            pcall(function() print("[game] addBase visibility before: t1=" .. tostring(self.fogOfWar:isTileVisible(1, base.col, base.row)) .. " t2=" .. tostring(self.fogOfWar:isTileVisible(2, base.col, base.row))) end)
+            self.fogOfWar:updateVisibility(1, self.pieces, self.bases, self.teamStartingCorners)
+            self.fogOfWar:updateVisibility(2, self.pieces, self.bases, self.teamStartingCorners)
+            pcall(function() print("[game] addBase visibility after: t1=" .. tostring(self.fogOfWar:isTileVisible(1, base.col, base.row)) .. " t2=" .. tostring(self.fogOfWar:isTileVisible(2, base.col, base.row))) end)
+        end
+    end
 end
 
 function Game:generateResources()
-    -- Generate a few resource tiles scattered across the map
-    local numResources = 5  -- Number of generic resources to place
+    -- Helper: avoid starting areas (full-width top/bottom strips)
+    local function inStartingArea(col, row)
+        if not self.teamStartingAreas then return false end
+        for team, area in pairs(self.teamStartingAreas) do
+            if area and area.rowStart and area.rowEnd then
+                if row >= area.rowStart and row <= area.rowEnd then
+                    return true
+                end
+            end
+        end
+        return false
+    end
 
+    -- First, create resources marked by the map generator (tile.resourceType)
+    local centerCol = math.floor(self.mapWidth / 2)
+    local centerRow = math.floor(self.mapHeight / 2)
+    local oilRadius = math.max(1, math.floor(math.min(self.mapWidth, self.mapHeight) * 0.35))
+    for col = 1, self.mapWidth do
+        for row = 1, self.mapHeight do
+            local tile = self.map:getTile(col, row)
+            if tile and tile.resourceType and tile.isLand and not self:getResourceAt(col, row) and not inStartingArea(col, row) then
+                local rtype = tile.resourceType or "generic"
+                -- Only place oil if it's reasonably close to the map center
+                if rtype == "oil" then
+                    local dx = col - centerCol
+                    local dy = row - centerRow
+                    local dist = math.sqrt(dx * dx + dy * dy)
+                    if dist <= oilRadius then
+                        local resource = Resource.new(rtype, self.map, col, row)
+                        table.insert(self.resources, resource)
+                    else
+                        -- convert to generic if too far from center
+                        local resource = Resource.new("generic", self.map, col, row)
+                        table.insert(self.resources, resource)
+                    end
+                else
+                    local resource = Resource.new(rtype, self.map, col, row)
+                    table.insert(self.resources, resource)
+                end
+            end
+        end
+    end
+
+    -- Generate a few additional generic resource tiles scattered across the map
+    local numResources = 3  -- Number of extra generic resources to place
     for i = 1, numResources do
         local attempts = 0
         local placed = false
@@ -485,7 +554,7 @@ function Game:generateResources()
             local row = math.random(5, self.mapHeight - 5)
             local tile = self.map:getTile(col, row)
             if tile and tile.isLand then
-                if not self:getPieceAt(col, row) and not self:getBaseAt(col, row) and not self:getResourceAt(col, row) then
+                if not self:getPieceAt(col, row) and not self:getBaseAt(col, row) and not self:getResourceAt(col, row) and not inStartingArea(col, row) then
                     local resource = Resource.new("generic", self.map, col, row)
                     table.insert(self.resources, resource)
                     placed = true
@@ -494,14 +563,47 @@ function Game:generateResources()
         end
     end
 
-    -- Add a couple of rich oil deposits near the map center
-    local centerCol = math.floor(self.mapWidth / 2)
+    -- Ensure at least one oil deposit per side (top/bottom) near the map center, avoiding starting areas
+    local minOilPerSide = 1
+    local oilRadius = math.max(1, math.floor(math.min(self.mapWidth, self.mapHeight) * 0.25))
     local centerRow = math.floor(self.mapHeight / 2)
-    local oilSpots = {{centerCol, centerRow}, {centerCol + 2, centerRow - 1}}
-    for _, spot in ipairs(oilSpots) do
-        local col, row = spot[1], spot[2]
+
+    local function countOilInHalf(upper)
+        local cnt = 0
+        for _, r in ipairs(self.resources) do
+            if r.type == "oil" then
+                if upper and r.row < centerRow then cnt = cnt + 1 end
+                if not upper and r.row >= centerRow then cnt = cnt + 1 end
+            end
+        end
+        return cnt
+    end
+
+    -- Place oil for upper half
+    local tries = 0
+    while countOilInHalf(true) < minOilPerSide and tries < 400 do
+        tries = tries + 1
+        local angle = math.random() * math.pi * 2
+        local dist = math.random(0, oilRadius)
+        local col = centerCol + math.floor(math.cos(angle) * dist + 0.5)
+        local row = centerRow - math.abs(math.floor(math.sin(angle) * dist + 0.5)) - 1
         local tile = self.map:getTile(col, row)
-        if tile and tile.isLand and not self:getResourceAt(col, row) then
+        if tile and tile.isLand and not inStartingArea(col, row) and not self:getResourceAt(col, row) then
+            local resource = Resource.new("oil", self.map, col, row)
+            table.insert(self.resources, resource)
+        end
+    end
+
+    -- Place oil for lower half
+    tries = 0
+    while countOilInHalf(false) < minOilPerSide and tries < 400 do
+        tries = tries + 1
+        local angle = math.random() * math.pi * 2
+        local dist = math.random(0, oilRadius)
+        local col = centerCol + math.floor(math.cos(angle) * dist + 0.5)
+        local row = centerRow + math.abs(math.floor(math.sin(angle) * dist + 0.5)) + 1
+        local tile = self.map:getTile(col, row)
+        if tile and tile.isLand and not inStartingArea(col, row) and not self:getResourceAt(col, row) then
             local resource = Resource.new("oil", self.map, col, row)
             table.insert(self.resources, resource)
         end
@@ -520,6 +622,11 @@ end
 function Game:addPiece(pieceType, team, col, row)
     local piece = Piece.new(pieceType, team, self.map, col, row)
     table.insert(self.pieces, piece)
+    -- If added with coordinates (mid-game build), mark so host will broadcast at end-turn
+    if piece.col and piece.row and piece.col > 0 and piece.row > 0 then
+        piece.justPlaced = true
+        pcall(function() print(string.format("[game] addPiece local -> type=%s team=%s col=%s row=%s", tostring(pieceType), tostring(team), tostring(col), tostring(row))) end)
+    end
 end
 
 function Game:update(dt)
@@ -527,14 +634,389 @@ function Game:update(dt)
     if self.state == "playing" then
         -- Update pieces, animations, etc.
         
-        -- Update fog of war visibility for all teams
+        -- Calculate air superiority map once per update (cached) to avoid repeated expensive recalcs
+        self.airSuperiorityMap = self:calculateAirSuperiorityMap()
+
+        -- Update fog of war visibility for all teams (visibility logic will query cached air superiority)
         for team = 1, 2 do
             self.fogOfWar:updateVisibility(team, self.pieces, self.bases, self.teamStartingCorners)
         end
+        -- network messages are polled by main.lua and forwarded to Game:handleNetworkMessage
     elseif self.state == "placing" then
-        -- Update fog of war for the team that's placing
-        self.fogOfWar:updateVisibility(self.placementTeam, self.pieces, self.bases, self.teamStartingCorners)
+        -- Update fog of war for the team that's placing (or local team if networked)
+        local viewTeam = self.localTeam or self.placementTeam
+        self.fogOfWar:updateVisibility(viewTeam, self.pieces, self.bases, self.teamStartingCorners)
     end
+end
+
+function Game:handleNetworkMessage(msg)
+    if not msg or not msg.type then return end
+    self._applyingRemote = true
+    if msg.type == "move" then
+        self:applyRemoteMove(msg)
+    elseif msg.type == "moveRequest" then
+        -- Host receives move request and applies it authoritatively
+        if self.isHost then
+            local fromCol = tonumber(msg.fromCol)
+            local fromRow = tonumber(msg.fromRow)
+            local toCol = tonumber(msg.toCol)
+            local toRow = tonumber(msg.toRow)
+            if fromCol and fromRow and toCol and toRow then
+                self:applyRemoteMove({fromCol = fromCol, fromRow = fromRow, toCol = toCol, toRow = toRow})
+                -- Broadcast authoritative commit
+                self:sendCommit({type = "move", fromCol = fromCol, fromRow = fromRow, toCol = toCol, toRow = toRow})
+            end
+        end
+    elseif msg.type == "startBuildingRequest" then
+        -- Client requested a build; host records building state and broadcasts commit
+        if self.isHost then
+            local col = tonumber(msg.col)
+            local row = tonumber(msg.row)
+            local buildingType = msg.buildingType
+            local team = tonumber(msg.team)
+            local buildTurns = tonumber(msg.buildTurns)
+            if col and row and buildingType and team then
+                local piece = self:getPieceAt(col, row)
+                if piece then
+                    piece.isBuilding = true
+                    piece.buildingType = buildingType
+                    piece.buildingTurnsRemaining = buildTurns or piece.buildingTurnsRemaining
+                    piece.buildingTeam = team
+                    pcall(function() print(string.format("[game] host applied startBuilding at %d,%d type=%s team=%s turns=%s", col, row, tostring(buildingType), tostring(team), tostring(buildTurns))) end)
+                end
+                -- Broadcast commit to clients so they can update local UI/state
+                self:sendCommit({type = "startBuilding", col = col, row = row, buildingType = buildingType, team = team, buildTurns = buildTurns})
+            end
+        end
+    elseif msg.type == "attackRequest" then
+        if self.isHost then
+            local amsg = msg
+            amsg.damage = tonumber(amsg.damage) or 0
+            amsg.fromCol = tonumber(amsg.fromCol)
+            amsg.fromRow = tonumber(amsg.fromRow)
+            amsg.toCol = tonumber(amsg.toCol)
+            amsg.toRow = tonumber(amsg.toRow)
+            -- Apply attack on host (reuse attack commit handling below by calling it directly)
+            -- We'll apply same logic as commit
+            local attacker = self:getPieceAt(amsg.fromCol, amsg.fromRow)
+            local target = self:getPieceAt(amsg.toCol, amsg.toRow)
+            if attacker and attacker.useAmmo then attacker:useAmmo() end
+            if target then
+                local wasKilled = target:takeDamage(amsg.damage)
+                if wasKilled then
+                    for i, p in ipairs(self.pieces) do
+                        if p == target then table.remove(self.pieces, i); break end
+                    end
+                    if amsg.moved and attacker then attacker:setPosition(amsg.toCol, amsg.toRow); self:triggerMineAt(amsg.toCol, amsg.toRow, attacker) end
+                end
+            else
+                if amsg.moved and attacker then attacker:setPosition(amsg.toCol, amsg.toRow); self:triggerMineAt(amsg.toCol, amsg.toRow, attacker) end
+            end
+            -- Broadcast commit
+            self:sendCommit({type = "attack", fromCol = amsg.fromCol, fromRow = amsg.fromRow, toCol = amsg.toCol, toRow = amsg.toRow, damage = amsg.damage, moved = amsg.moved})
+        end
+    elseif msg.type == "placePieceRequest" then
+        if self.isHost then
+            local team = tonumber(msg.team)
+            local col = tonumber(msg.col)
+            local row = tonumber(msg.row)
+            local unitType = msg.unitType
+            if team and col and row then
+                -- Try to fill existing unplaced piece
+                local filled = false
+                for _, piece in ipairs(self.pieces) do
+                    if piece.team == team and (not piece.col or piece.col == 0) and (not piece.row or piece.row == 0) then
+                        piece:setPosition(col, row)
+                        self.piecesPlaced = (self.piecesPlaced or 0) + 1
+                        filled = true
+                        break
+                    end
+                end
+                if not filled then
+                    -- create new piece
+                    self:addPiece(unitType or "infantry", team, col, row)
+                end
+                -- Broadcast commit
+                self:sendCommit({type = "placePiece", team = team, col = col, row = row, unitType = unitType})
+            end
+        end
+    elseif msg.type == "placeBaseRequest" then
+        if self.isHost then
+            local team = tonumber(msg.team)
+            local col = tonumber(msg.col)
+            local row = tonumber(msg.row)
+            local baseType = msg.baseType
+            if team and col and row then
+                local placed = false
+                for _, base in ipairs(self.bases) do
+                    if base.team == team and (not base.col or base.col == 0) and (not base.row or base.row == 0) then
+                        base:setPosition(col, row)
+                        self.basesPlaced = (self.basesPlaced or 0) + 1
+                        placed = true
+                        break
+                    end
+                end
+                if not placed then
+                    local newBase = Base.new(baseType or "hq", team, self.map, col, row)
+                    table.insert(self.bases, newBase)
+                    self.basesPlaced = (self.basesPlaced or 0) + 1
+                end
+                -- Broadcast commit
+                self:sendCommit({type = "placeBase", team = team, col = col, row = row, baseType = baseType})
+            end
+        end
+    elseif msg.type == "buildUnitRequest" then
+        if self.isHost then
+            local team = tonumber(msg.team)
+            local col = tonumber(msg.col)
+            local row = tonumber(msg.row)
+            local unitType = msg.unitType
+            if team and col and row and unitType then
+                self:addPiece(unitType, team, col, row)
+                -- Broadcast commit as placePiece
+                self:sendCommit({type = "placePiece", team = team, col = col, row = row, unitType = unitType})
+            end
+        end
+    elseif msg.type == "move" then
+        self:applyRemoteMove(msg)
+    elseif msg.type == "attack" then
+        -- Remote performed an attack: apply ammo use, damage, removals and possible move-on-kill
+        local fromCol = tonumber(msg.fromCol)
+        local fromRow = tonumber(msg.fromRow)
+        local toCol = tonumber(msg.toCol)
+        local toRow = tonumber(msg.toRow)
+        local damage = tonumber(msg.damage) or 0
+        local moved = msg.moved and true or false
+        local attacker = self:getPieceAt(fromCol, fromRow)
+        local target = self:getPieceAt(toCol, toRow)
+        -- Mirror ammo consumption on attacker if present
+        if attacker and attacker.useAmmo then
+            attacker:useAmmo()
+        end
+        if target then
+            local wasKilled = target:takeDamage(damage)
+            if wasKilled then
+                for i, p in ipairs(self.pieces) do
+                    if p == target then
+                        table.remove(self.pieces, i)
+                        break
+                    end
+                end
+                -- If attacker moved into the target tile, move it and trigger mines
+                if moved and attacker then
+                    attacker:setPosition(toCol, toRow)
+                    self:triggerMineAt(toCol, toRow, attacker)
+                end
+            end
+        else
+            -- If target not found, but moved flag set, still try to move attacker
+            if moved and attacker then
+                attacker:setPosition(toCol, toRow)
+                self:triggerMineAt(toCol, toRow, attacker)
+            end
+        end
+    elseif msg.type == "placePiece" then
+        -- Remote placed a piece during placement phase: mirror it
+        local team = tonumber(msg.team)
+        local col = tonumber(msg.col)
+        local row = tonumber(msg.row)
+        local unitType = msg.unitType
+        if team and col and row then
+            -- Find first unplaced piece for that team and set position
+            for _, piece in ipairs(self.pieces) do
+                if piece.team == team and (not piece.col or piece.col == 0) and (not piece.row or piece.row == 0) then
+                    piece:setPosition(col, row)
+                    self.piecesPlaced = (self.piecesPlaced or 0) + 1
+                    break
+                end
+            end
+            -- If no unplaced piece was available, this is a mid-game build: create the piece
+            local found = self:getPieceAt(col, row)
+            if not found and unitType then
+                self:addPiece(unitType, team, col, row)
+            else
+                -- If we found a piece at this tile, and it was building this unit, clear its building state
+                if found and found.isBuilding then
+                    found.isBuilding = false
+                    found.buildingType = nil
+                    found.buildingTurnsRemaining = 0
+                    found.buildingTeam = nil
+                    found.buildingResourceTarget = nil
+                    found.hasMoved = false
+                end
+            end
+        end
+    elseif msg.type == "placeBase" then
+        -- Remote placed a base during placement phase: mirror it
+        local team = tonumber(msg.team)
+        local col = tonumber(msg.col)
+        local row = tonumber(msg.row)
+        local baseType = msg.baseType
+        if team and col and row then
+            local placed = false
+            for _, base in ipairs(self.bases) do
+                if base.team == team and (not base.col or base.col == 0) and (not base.row or base.row == 0) then
+                    pcall(function() print(string.format("[game] recv.placeBase -> team=%s col=%s row=%s baseType=%s (filled existing slot)", tostring(team), tostring(col), tostring(row), tostring(baseType))) end)
+                    if self.fogOfWar then
+                        pcall(function() print("[game] recv.placeBase visibility before: t1=" .. tostring(self.fogOfWar:isTileVisible(1, col, row)) .. " t2=" .. tostring(self.fogOfWar:isTileVisible(2, col, row))) end)
+                    end
+                    base:setPosition(col, row)
+                    self.basesPlaced = (self.basesPlaced or 0) + 1
+                    -- Update fog visibility so the new base is registered for vision
+                    if self.fogOfWar then
+                        self.fogOfWar:updateVisibility(1, self.pieces, self.bases, self.teamStartingCorners)
+                        self.fogOfWar:updateVisibility(2, self.pieces, self.bases, self.teamStartingCorners)
+                        pcall(function() print("[game] recv.placeBase visibility after: t1=" .. tostring(self.fogOfWar:isTileVisible(1, col, row)) .. " t2=" .. tostring(self.fogOfWar:isTileVisible(2, col, row))) end)
+                    end
+                    -- If there is a piece at this tile that was building the base, clear its building state
+                    local builder = self:getPieceAt(col, row)
+                    if builder and builder.isBuilding then
+                        builder.isBuilding = false
+                        builder.buildingType = nil
+                        builder.buildingTurnsRemaining = 0
+                        builder.buildingTeam = nil
+                        builder.buildingResourceTarget = nil
+                        builder.hasMoved = false
+                    end
+                    placed = true
+                    break
+                end
+            end
+            if not placed then
+                -- No placeholder base existed on this client: create a new Base instance to mirror the host
+                pcall(function() print(string.format("[game] recv.placeBase -> creating new base instance team=%s col=%s row=%s baseType=%s", tostring(team), tostring(col), tostring(row), tostring(baseType))) end)
+                local newBase = Base.new(baseType, team, self.map, col, row)
+                table.insert(self.bases, newBase)
+                self.basesPlaced = (self.basesPlaced or 0) + 1
+                if self.fogOfWar then
+                    self.fogOfWar:updateVisibility(1, self.pieces, self.bases, self.teamStartingCorners)
+                    self.fogOfWar:updateVisibility(2, self.pieces, self.bases, self.teamStartingCorners)
+                    pcall(function() print("[game] recv.placeBase visibility after (created): t1=" .. tostring(self.fogOfWar:isTileVisible(1, col, row)) .. " t2=" .. tostring(self.fogOfWar:isTileVisible(2, col, row))) end)
+                end
+                -- If there is a builder at this tile, clear its building state
+                local builder2 = self:getPieceAt(col, row)
+                if builder2 and builder2.isBuilding then
+                    builder2.isBuilding = false
+                    builder2.buildingType = nil
+                    builder2.buildingTurnsRemaining = 0
+                    builder2.buildingTeam = nil
+                    builder2.buildingResourceTarget = nil
+                    builder2.hasMoved = false
+                end
+            end
+        end
+    elseif msg.type == "startBuilding" then
+        -- Host broadcasted startBuilding commit: apply building state on client
+        local col = tonumber(msg.col)
+        local row = tonumber(msg.row)
+        local buildingType = msg.buildingType
+        local team = tonumber(msg.team)
+        local buildTurns = tonumber(msg.buildTurns)
+        if col and row and buildingType and team then
+            local piece = self:getPieceAt(col, row)
+            if piece then
+                piece.isBuilding = true
+                piece.buildingType = buildingType
+                piece.buildingTurnsRemaining = buildTurns or piece.buildingTurnsRemaining
+                piece.buildingTeam = team
+                pcall(function() print(string.format("[game] applied commit startBuilding at %d,%d type=%s team=%s turns=%s", col, row, tostring(buildingType), tostring(team), tostring(buildTurns))) end)
+            else
+                pcall(function() print(string.format("[game] commit startBuilding: no piece at %d,%d", col, row)) end)
+            end
+        end
+    elseif msg.type == "placementPhase" then
+        if msg.phase == "bases" then
+            pcall(function() print("[game] remote requested entering base placement phase") end)
+            self.placementPhase = "bases"
+        elseif msg.phase == "ready" then
+            pcall(function() print("[game] remote requested entering ready phase") end)
+            self.placementPhase = "ready"
+        end
+    elseif msg.type == "endTurn" then
+        -- apply end turn from remote: set current turn to the provided nextTeam
+        if msg.nextTeam then
+            self.currentTurn = msg.nextTeam
+            -- If authoritative resource totals provided, apply them to keep clients in sync
+            if msg.teamResources1 then self.teamResources[1] = tonumber(msg.teamResources1) or self.teamResources[1] end
+            if msg.teamResources2 then self.teamResources[2] = tonumber(msg.teamResources2) or self.teamResources[2] end
+            if msg.teamOil1 then self.teamOil[1] = tonumber(msg.teamOil1) or self.teamOil[1] end
+            if msg.teamOil2 then self.teamOil[2] = tonumber(msg.teamOil2) or self.teamOil[2] end
+            if self.currentTurn == 1 then
+                self.turnCount = self.turnCount + 1
+            end
+            for _, p in ipairs(self.pieces) do
+                if p.team == self.currentTurn then p:resetMove() end
+            end
+        else
+            -- fallback: call endTurn if no nextTeam provided
+            self:endTurn()
+        end
+    elseif msg.type == "ready" then
+        if msg.team and (msg.team == 1 or msg.team == 2) then
+            self.playerReady[msg.team] = not not msg.ready
+            -- If host and both ready, start the game
+            if self.isHost and self.playerReady[1] and self.playerReady[2] then
+                self.state = "playing"
+                self.turnCount = 1
+                self.currentTurn = 1
+                for _, p in ipairs(self.pieces) do p:resetMove() end
+                pcall(function()
+                    if Network and Network.send and Network.isConnected and Network.isConnected() then
+                        Network.send({type = "startPlay"})
+                    end
+                end)
+            end
+        end
+    elseif msg.type == "endTurnRequest" then
+        -- A client asked the host to end their turn. Only the host should process this.
+        if self.isHost then
+            -- Temporarily clear _applyingRemote so endTurn will send the resulting endTurn message
+            local prev = self._applyingRemote
+            self._applyingRemote = false
+            self:endTurn()
+            self._applyingRemote = prev
+        end
+    elseif msg.type == "startPlay" then
+        -- Host told us both players are ready and game should start
+        if self.state == "placing" then
+            self.state = "playing"
+            self.turnCount = 1
+            self.currentTurn = 1
+            for _, p in ipairs(self.pieces) do p:resetMove() end
+        end
+    end
+    self._applyingRemote = false
+end
+
+function Game:applyRemoteMove(msg)
+    if not msg then return end
+    local fromCol = tonumber(msg.fromCol)
+    local fromRow = tonumber(msg.fromRow)
+    local toCol = tonumber(msg.toCol)
+    local toRow = tonumber(msg.toRow)
+    if not fromCol or not fromRow or not toCol or not toRow then return end
+    local piece = self:getPieceAt(fromCol, fromRow)
+    if not piece then return end
+    -- Move without validating team/turn (mirroring remote)
+    piece:setPosition(toCol, toRow)
+    -- Trigger mines if any
+    self:triggerMineAt(toCol, toRow, piece)
+    -- If this piece was selected locally, deselect it now that the move is applied
+    if self.selectedPiece and self.selectedPiece == piece then
+        piece:deselect(self)
+    end
+end
+
+-- Helper to send authoritative commit messages (host uses this after applying a request)
+function Game:sendCommit(msg)
+    if not Network or not Network.send or not Network.isConnected or not Network.isConnected() then return end
+    pcall(function()
+        -- Temporarily allow sending while inside remote-apply context
+        local prev = self._applyingRemote
+        self._applyingRemote = false
+        Network.send(msg)
+        self._applyingRemote = prev
+    end)
 end
 
 function Game:draw()
@@ -544,12 +1026,16 @@ function Game:draw()
     -- Draw map
     self.map:draw(0, 0)
 
-    -- Draw province fills and region labels
-    self:drawProvinceBoundaries()
+    -- Determine viewer team (localTeam when networked) for visuals and fog
+    local viewTeam = self.localTeam or self.currentTurn
+
+    -- -- Draw province fills and region labels
+    -- self:drawProvinceBoundaries()
     
-    -- Draw starting areas during placement phase
+    -- Draw starting areas during placement phase (use localTeam view when networked)
     if self.state == "placing" then
-        self:drawStartingAreas()
+        local viewTeam = self.localTeam or self.placementTeam
+        self:drawStartingAreas(viewTeam)
     end
     
     -- Draw grid coordinates for debugging
@@ -558,11 +1044,18 @@ function Game:draw()
     -- Draw bases (only draw placed bases)
     for _, base in ipairs(self.bases) do
         if base.col > 0 and base.row > 0 then  -- Only draw if placed
-            local pixelX, pixelY = self.map:gridToPixels(base.col, base.row)
-            base:draw(pixelX, pixelY, self.hexSideLength)
-            
-            -- Draw influence radius (optional visual indicator)
-            self:drawBaseRadius(base, pixelX, pixelY)
+            local drawBase = true
+            if self.fogOfWar then
+                if base.team ~= viewTeam and not self.fogOfWar:isTileVisible(viewTeam, base.col, base.row) then
+                    drawBase = false
+                end
+            end
+            if drawBase then
+                local pixelX, pixelY = self.map:gridToPixels(base.col, base.row)
+                -- Draw influence radius first so base symbol is rendered on top
+                self:drawBaseRadius(base, pixelX, pixelY, viewTeam)
+                base:draw(pixelX, pixelY, self.hexSideLength)
+            end
         end
     end
 
@@ -593,23 +1086,25 @@ function Game:draw()
         end
     end
     
+    -- (Visibility updated in Game:update; avoid heavy update here)
+
     -- Draw air superiority markers on tiles ("=", "^", "˅") for tiles with AS
-    local asMap = self:calculateAirSuperiorityMap()
+    local asMap = self.airSuperiorityMap or self:calculateAirSuperiorityMap()
     for key, vals in pairs(asMap) do
         local comma = string.find(key, ",")
         if comma then
             local col = tonumber(string.sub(key, 1, comma - 1))
             local row = tonumber(string.sub(key, comma + 1))
             if col and row then
-                -- Respect fog of war: only show markers if tile is visible to current team
-                if self.fogOfWar and not self.fogOfWar:isTileVisible(self.currentTurn, col, row) then
+                -- Respect fog of war: only show markers if tile is visible to the viewer team
+                if self.fogOfWar and not self.fogOfWar:isTileVisible(viewTeam, col, row) then
                     goto continue_as
                 end
 
                 local t1 = vals[1] or 0
                 local t2 = vals[2] or 0
-                local playerAS = (self.currentTurn == 1) and t1 or t2
-                local enemyAS = (self.currentTurn == 1) and t2 or t1
+                local playerAS = (viewTeam == 1) and t1 or t2
+                local enemyAS = (viewTeam == 1) and t2 or t1
 
                 local symbol = nil
                 -- tie and both present
@@ -629,7 +1124,7 @@ function Game:draw()
                         if symbol == "v" then
                             love.graphics.setColor(1, 0, 0)
                         else
-                            if self.currentTurn == 1 then love.graphics.setColor(1, 0, 0) else love.graphics.setColor(0, 0, 1) end
+                            if viewTeam == 1 then love.graphics.setColor(1, 0, 0) else love.graphics.setColor(0, 0, 1) end
                         end
                         love.graphics.setFont(love.graphics.newFont(14))
                         local w = love.graphics.getFont():getWidth(symbol)
@@ -642,11 +1137,20 @@ function Game:draw()
         ::continue_as::
     end
     
-    -- Draw pieces (only draw placed pieces)
+    -- Draw pieces (only draw placed pieces). Respect fog of war for the viewer team.
     for _, piece in ipairs(self.pieces) do
         if piece.col > 0 and piece.row > 0 then  -- Only draw if placed
-            local pixelX, pixelY = self.map:gridToPixels(piece.col, piece.row)
-            piece:draw(pixelX, pixelY, self.hexSideLength)
+            local drawPiece = true
+            if self.fogOfWar then
+                -- Only draw enemy pieces if the tile is visible to the viewer team
+                if piece.team ~= viewTeam and not self.fogOfWar:isTileVisible(viewTeam, piece.col, piece.row) then
+                    drawPiece = false
+                end
+            end
+            if drawPiece then
+                local pixelX, pixelY = self.map:gridToPixels(piece.col, piece.row)
+                piece:draw(pixelX, pixelY, self.hexSideLength)
+            end
         end
     end
     
@@ -701,12 +1205,15 @@ function Game:draw()
         love.graphics.setLineWidth(1)
     end
 
-    -- Draw fog of war for current player's team (after all game elements)
+    -- Draw fog of war for the viewer's team (after all game elements)
     if self.state == "playing" then
-        self.fogOfWar:draw(self.currentTurn, self.camera, 0, 0)
+        -- Use viewer team so local player sees their own visibility regardless of whose turn it is
+        local viewTeam = self.localTeam or self.currentTurn
+        self.fogOfWar:draw(viewTeam, self.camera, 0, 0)
     elseif self.state == "placing" then
-        -- During placement, show fog for the team that's placing
-        self.fogOfWar:draw(self.placementTeam, self.camera, 0, 0)
+        -- During placement, show fog for the local player (or placementTeam if not networked)
+        local viewTeam = self.localTeam or self.placementTeam
+        self.fogOfWar:draw(viewTeam, self.camera, 0, 0)
     end
     
     love.graphics.pop()
@@ -740,24 +1247,32 @@ function Game:drawValidMoves()
 end
 
 function Game:drawValidPlacementTiles()
-    -- Highlight all land tiles that are not occupied
+    -- Highlight valid placement tiles for the local team or current placementTeam
+    local team = self.localTeam or self.placementTeam
     love.graphics.setColor(0, 1, 0, 0.2)
     for col = 1, self.map.cols do
         for row = 1, self.map.rows do
-            local tile = self.map:getTile(col, row)
-            if tile and tile.isLand and not self:getPieceAt(col, row) and not self:getBaseAt(col, row) and not self:getResourceAt(col, row) then
-                local points = tile.points
-                love.graphics.polygon("fill", points)
+            if self:isInStartingArea(col, row, team) then
+                local tile = self.map:getTile(col, row)
+                if tile and tile.isLand and not self:getPieceAt(col, row) and not self:getBaseAt(col, row) and not self:getResourceAt(col, row) then
+                    local points = tile.points
+                    love.graphics.polygon("fill", points)
+                end
             end
         end
     end
 end
 
-function Game:drawStartingAreas()
+function Game:drawStartingAreas(viewTeam)
     -- Draw starting area indicators for both teams (top and bottom strips)
     for team, area in pairs(self.teamStartingAreas) do
         -- Determine color based on team and whether it's the current placement team
-        local isCurrentTeam = (team == self.placementTeam)
+        local isCurrentTeam = false
+        if viewTeam then
+            isCurrentTeam = (team == viewTeam)
+        else
+            isCurrentTeam = (team == self.placementTeam)
+        end
         local alpha = isCurrentTeam and 0.3 or 0.15
         local r, g, b = team == 1 and 1 or 0, 0, team == 1 and 0 or 1  -- Red for team 1, Blue for team 2
         
@@ -772,7 +1287,7 @@ function Game:drawStartingAreas()
             end
         end
         
-        -- Draw outline for current team's starting area
+        -- Draw outline for the view team's starting area
         if isCurrentTeam then
             love.graphics.setColor(r, g, b, 0.6)
             for col = 1, self.mapWidth do
@@ -787,7 +1302,7 @@ function Game:drawStartingAreas()
     end
 end
 
-function Game:drawBaseRadius(base, pixelX, pixelY)
+function Game:drawBaseRadius(base, pixelX, pixelY, viewTeam)
     -- Draw hexagons within the base's influence radius, respecting terrain
     local radius = base:getRadius()
     
@@ -796,8 +1311,9 @@ function Game:drawBaseRadius(base, pixelX, pixelY)
     local visited = {}
     self:getHexesWithinRange(base.col, base.row, radius, visited, base.team)
     
-    -- Only show radius for bases belonging to the current player's team
-    if base.team ~= self.currentTurn then
+    -- Only show radius for bases belonging to the viewer's team
+    local viewer = viewTeam or (self.localTeam or self.currentTurn)
+    if base.team ~= viewer then
         return
     end
 
@@ -835,20 +1351,53 @@ function Game:drawUI()
     love.graphics.setFont(love.graphics.newFont(14))
     
     if self.state == "placing" then
-        -- Placement phase UI
-        local teamName = self.placementTeam == 1 and "Red" or "Blue"
-        local teamPiecesPlaced = 0
+        -- Placement phase UI (simultaneous)
+        local team1Placed, team2Placed = 0, 0
         for _, piece in ipairs(self.pieces) do
-            if piece.team == self.placementTeam and piece.col > 0 and piece.row > 0 then
-                teamPiecesPlaced = teamPiecesPlaced + 1
+            if piece.team == 1 and piece.col > 0 and piece.row > 0 then team1Placed = team1Placed + 1 end
+            if piece.team == 2 and piece.col > 0 and piece.row > 0 then team2Placed = team2Placed + 1 end
+        end
+        local rem1 = math.max(0, self.piecesPerTeam - team1Placed)
+        local rem2 = math.max(0, self.piecesPerTeam - team2Placed)
+        love.graphics.print("Placement Phase - Simultaneous", 10, 10)
+        if self.placementPhase == "pieces" then
+            love.graphics.print(string.format("Team Red remaining: %d  |  Ready: %s", rem1, tostring(self.playerReady[1])), 10, 32)
+            love.graphics.print(string.format("Team Blue remaining: %d  |  Ready: %s", rem2, tostring(self.playerReady[2])), 10, 52)
+            love.graphics.setFont(love.graphics.newFont(10))
+            love.graphics.print("Place your pieces on your starting area. Click the Ready button when done.", 10, 74)
+        else
+            -- Base placement phase
+            local team1Bases, team2Bases = 0, 0
+            for _, b in ipairs(self.bases) do
+                if b.team == 1 and b.col > 0 and b.row > 0 then team1Bases = team1Bases + 1 end
+                if b.team == 2 and b.col > 0 and b.row > 0 then team2Bases = team2Bases + 1 end
+            end
+            local brem1 = math.max(0, self.basesPerTeam - team1Bases)
+            local brem2 = math.max(0, self.basesPerTeam - team2Bases)
+            love.graphics.print(string.format("Team Red bases remaining: %d", brem1), 10, 32)
+            love.graphics.print(string.format("Team Blue bases remaining: %d", brem2), 10, 52)
+            love.graphics.setFont(love.graphics.newFont(10))
+            love.graphics.print("Place your bases (HQ, Ammo, Supply, Airbase) on your starting area.", 10, 74)
+        end
+
+        -- Draw Ready button for local player
+        local btnW, btnH = 120, 32
+        local bx = love.graphics.getWidth() - btnW - 16
+        local by = 16
+        local lt = self.localTeam or 0
+        if lt >= 1 and lt <= 2 then
+            if self.playerReady[lt] then
+                love.graphics.setColor(0.2, 0.6, 0.2)
+                love.graphics.rectangle("fill", bx, by, btnW, btnH, 6, 6)
+                love.graphics.setColor(1,1,1)
+                love.graphics.print("Ready (Unset)", bx + 12, by + 8)
+            else
+                love.graphics.setColor(0.2, 0.2, 0.25)
+                love.graphics.rectangle("fill", bx, by, btnW, btnH, 6, 6)
+                love.graphics.setColor(1,1,1)
+                love.graphics.print("Ready", bx + 36, by + 8)
             end
         end
-        local remaining = self.piecesPerTeam - teamPiecesPlaced
-        love.graphics.print("Placement Phase - Turn 0", 10, 10)
-        love.graphics.print("Team " .. teamName .. " placing", 10, 30)
-        love.graphics.print("Pieces remaining: " .. remaining, 10, 50)
-        love.graphics.setFont(love.graphics.newFont(10))
-        love.graphics.print("Click on land tiles to place your infantry", 10, 70)
     else
         -- Normal gameplay UI
         local teamColor = self.currentTurn == 1 and "Red" or "Blue"
@@ -942,20 +1491,94 @@ function Game:drawUI()
             local controlsY = yOffset
             love.graphics.print("Click to select piece | Right-click to move | E: End Turn | R: Reset", 10, controlsY)
         end
+    
+        -- Hotseat pass overlay (blocks input until accepted)
+        if self.passPending then
+            local w = love.graphics.getWidth()
+            local h = love.graphics.getHeight()
+            love.graphics.setColor(0, 0, 0, 0.6)
+            love.graphics.rectangle("fill", 0, 0, w, h)
+            love.graphics.setColor(1, 1, 1, 1)
+            love.graphics.setFont(love.graphics.newFont(20))
+            local nextTeam = self.pendingNextTeam or (self.currentTurn == 1 and 2 or 1)
+            local teamName = nextTeam == 1 and "Red" or "Blue"
+            local msg = "Pass to " .. teamName .. " — Press Enter or Space to continue"
+            local tw = love.graphics.getFont():getWidth(msg)
+            love.graphics.print(msg, math.floor((w - tw) / 2), math.floor(h / 2 - 10))
+        end
     end
 end
 
 function Game:mousepressed(x, y, button)
+    -- Check ready button click in screen coordinates first (UI sits above camera)
+    if self.state == "placing" and self.localTeam then
+        local btnW, btnH = 120, 32
+        local bx = love.graphics.getWidth() - btnW - 16
+        local by = 16
+        if x >= bx and x <= bx + btnW and y >= by and y <= by + btnH then
+            -- Toggle ready for local team
+            local t = self.localTeam
+            self.playerReady[t] = not self.playerReady[t]
+            pcall(function()
+                if Network and Network.send and Network.isConnected and Network.isConnected() then
+                    Network.send({type = "ready", team = t, ready = self.playerReady[t]})
+                end
+            end)
+            -- If host and both ready, start the game
+            if self.isHost and self.playerReady[1] and self.playerReady[2] then
+                self.state = "playing"
+                self.turnCount = 1
+                self.currentTurn = 1
+                for _, p in ipairs(self.pieces) do p:resetMove() end
+                pcall(function()
+                    if Network and Network.send and Network.isConnected and Network.isConnected() then
+                        Network.send({type = "startPlay"})
+                    end
+                end)
+            end
+            return
+        end
+    end
     local worldX, worldY = self.camera:screenToWorld(x, y)
     local col, row = self.map:pixelsToGrid(worldX, worldY)
+    -- Block input while waiting for hotseat pass
+    if self.passPending then
+        return
+    end
+    -- If this instance represents a networked player, only allow input for that player's team
+    if self.localTeam then
+        if self.state == "playing" then
+            if self.currentTurn ~= self.localTeam then
+                pcall(function() print(string.format("[game] input blocked: playing currentTurn=%s localTeam=%s", tostring(self.currentTurn), tostring(self.localTeam))) end)
+                return
+            end
+        end
+        -- During placement, `localTeam` is allowed to place simultaneously (no block)
+    end
     
     if self.state == "placing" then
         -- Placement phase: place pieces or bases on click
         if button == 1 then  -- Left click
+            local teamArg = nil
+            if self.localTeam then teamArg = self.localTeam end
+            -- Allow local players to place their bases as soon as they've placed all pieces
+            local function teamHasPlacedAllPieces(t)
+                local cnt = 0
+                for _, p in ipairs(self.pieces) do
+                    if p.team == t and p.col and p.col > 0 and p.row and p.row > 0 then cnt = cnt + 1 end
+                end
+                return cnt >= (self.piecesPerTeam or 0)
+            end
+
             if self.placementPhase == "pieces" then
-                self:placePiece(col, row)
+                if teamArg and teamHasPlacedAllPieces(teamArg) then
+                    -- This local team has finished pieces: allow placing bases for them
+                    self:placeBase(col, row, teamArg)
+                else
+                    self:placePiece(col, row, teamArg)
+                end
             else
-                self:placeBase(col, row)
+                self:placeBase(col, row, teamArg)
             end
         end
     else
@@ -1002,9 +1625,11 @@ function Game:mousepressed(x, y, button)
                 return  -- Action menu handled the click
             end
             
+            -- Determine viewer team for visibility checks
+            local viewTeam = self.localTeam or self.currentTurn
             -- Check if clicking on a piece first (pieces have priority over bases)
-            local piece = self:getPieceAt(col, row)
-            local base = self:getBaseAt(col, row)
+            local piece = self:getVisiblePieceAt(col, row, viewTeam)
+            local base = self:getVisibleBaseAt(col, row, viewTeam)
             
             -- If there's a piece, handle piece selection logic
             if piece and piece.team == self.currentTurn and piece.col > 0 and piece.row > 0 then
@@ -1066,8 +1691,11 @@ function Game:selectPiece(col, row)
         return
     end
     
-    -- Find piece at this location
-    local piece = self:getPieceAt(col, row)
+    -- Determine viewer team for visibility checks
+    local viewTeam = self.localTeam or self.currentTurn
+
+    -- Find piece at this location that is visible to the viewer
+    local piece = self:getVisiblePieceAt(col, row, viewTeam)
     
     -- If clicking on the already selected piece, deselect it
     if piece and piece == self.selectedPiece then
@@ -1075,9 +1703,9 @@ function Game:selectPiece(col, row)
         return
     end
     
-    -- Deselect previous piece
+    -- Deselect previous piece properly using its deselect method
     if self.selectedPiece then
-        self.selectedPiece.selected = false
+        self.selectedPiece:deselect(self)
     end
     
     if piece and piece.team == self.currentTurn then
@@ -1087,10 +1715,27 @@ function Game:selectPiece(col, row)
         self:calculateValidMoves()
 
     else
-        self.selectedPiece = nil
-        self.validMoves = {}
-        self.validAttacks = {}
+        if self.selectedPiece then
+            self.selectedPiece:deselect(self)
+        end
     end
+end
+
+
+function Game:getVisiblePieceAt(col, row, viewTeam)
+    -- Return the piece at the location only if it's visible to the specified viewer team
+    for _, piece in ipairs(self.pieces) do
+        if piece.col == col and piece.row == row then
+            -- If fog system exists and piece belongs to enemy, require tile visibility
+            if self.fogOfWar and piece.team ~= viewTeam then
+                if not self.fogOfWar:isTileVisible(viewTeam, col, row) then
+                    return nil
+                end
+            end
+            return piece
+        end
+    end
+    return nil
 end
 
 function Game:getPieceAt(col, row)
@@ -1105,6 +1750,20 @@ end
 function Game:getBaseAt(col, row)
     for _, base in ipairs(self.bases) do
         if base.col == col and base.row == row then
+            return base
+        end
+    end
+    return nil
+end
+
+function Game:getVisibleBaseAt(col, row, viewTeam)
+    for _, base in ipairs(self.bases) do
+        if base.col == col and base.row == row then
+            if self.fogOfWar and base.team ~= viewTeam then
+                if not self.fogOfWar:isTileVisible(viewTeam, col, row) then
+                    return nil
+                end
+            end
             return base
         end
     end
@@ -1632,8 +2291,19 @@ function Game:buildUnitNearBase(base, unitType, team, cost)
             if not self:getPieceAt(neighbor.col, neighbor.row) and 
                not self:getBaseAt(neighbor.col, neighbor.row) and
                not self:getResourceAt(neighbor.col, neighbor.row) then
-                -- Place unit here
+                -- If networked client, request host to build unit
+                if Network and Network.isConnected and Network.isConnected() and not self.isHost and not self._applyingRemote then
+                    pcall(function()
+                        Network.send({type = "buildUnitRequest", baseCol = base.col, baseRow = base.row, unitType = unitType, team = team, col = neighbor.col, row = neighbor.row, cost = cost})
+                    end)
+                    return
+                end
+                -- Place unit here (host or local)
                 self:addPiece(unitType, team, neighbor.col, neighbor.row)
+                -- Host will broadcast at end-turn or can commit immediately
+                if self.isHost and Network and Network.isConnected and Network.isConnected() and not self._applyingRemote then
+                    self:sendCommit({type = "placePiece", team = team, col = neighbor.col, row = neighbor.row, unitType = unitType})
+                end
                 return
             end
         end
@@ -1890,7 +2560,7 @@ end
 
 -- Convenience: get air superiority points for a tile (returns t1, t2)
 function Game:getAirSuperiorityAt(col, row)
-    local map = self:calculateAirSuperiorityMap()
+    local map = self.airSuperiorityMap or self:calculateAirSuperiorityMap()
     local key = col .. "," .. row
     local entry = map[key]
     if not entry then return 0, 0 end
@@ -1991,17 +2661,19 @@ function Game:generateResourceIncome(team)
     -- Add income to team's resources
     self.teamResources[team] = self.teamResources[team] + income
 
-    -- Region control bonuses: +1 resource per controlled region
-    local regionOwners = self:calculateRegionControl()
-    for regionId, owner in pairs(regionOwners) do
-        if owner == team then
-            self.teamResources[team] = self.teamResources[team] + 1
-        end
-    end
+    -- -- Region control bonuses: +1 resource per controlled region
+    -- local regionOwners = self:calculateRegionControl()
+    -- for regionId, owner in pairs(regionOwners) do
+    --     if owner == team then
+    --         self.teamResources[team] = self.teamResources[team] + 1
+    --     end
+    -- end
 end
 
 function Game:movePiece(col, row)
     if not self.selectedPiece then return end
+    local oldCol = self.selectedPiece.col
+    local oldRow = self.selectedPiece.row
     
     -- Check if move is valid
     local isValidMove = false
@@ -2024,22 +2696,50 @@ function Game:movePiece(col, row)
     end
     
     if isValidMove then
+        -- If networked client, send request to host instead of applying locally
+        if Network and Network.isConnected and Network.isConnected() and not self.isHost and not self._applyingRemote then
+            pcall(function()
+                Network.send({type = "moveRequest", fromCol = oldCol, fromRow = oldRow, toCol = col, toRow = row, team = self.localTeam})
+            end)
+            return
+        end
+
         self.selectedPiece:setPosition(col, row)
         -- Check for mines triggered by moving into this tile
         self:triggerMineAt(col, row, self.selectedPiece)
-        
         self:calculateValidMoves()
+        -- Send network update (mirror) if connected and this is a local action
+        if Network and Network.isConnected and Network.isConnected() and not self._applyingRemote then
+            if self.isHost then
+                pcall(function() print(string.format("[game] host commit move %d,%d -> %d,%d", oldCol, oldRow, col, row)) end)
+                self:sendCommit({type = "move", fromCol = oldCol, fromRow = oldRow, toCol = col, toRow = row})
+            end
+        end
+        -- Deselect the piece after moving so it isn't left selected when the turn ends
+        if self.selectedPiece then
+            self.selectedPiece:deselect(self)
+        end
     elseif isValidAttack and targetPiece then
+        -- If networked client, send request to host and don't apply locally
+        if Network and Network.isConnected and Network.isConnected() and not self.isHost and not self._applyingRemote then
+            local damage = self.selectedPiece:getDamage()
+            local movedInto = false -- host will determine moved flag
+            pcall(function()
+                Network.send({type = "attackRequest", fromCol = oldCol, fromRow = oldRow, toCol = col, toRow = row, damage = damage, moved = movedInto, team = self.localTeam})
+            end)
+            return
+        end
+
         -- Check if piece has ammo
         if not self.selectedPiece:hasAmmo() then
             return  -- Can't attack without ammo
         end
-        
-        -- Use ammo and attack
+
+        -- Use ammo and attack (host or local)
         self.selectedPiece:useAmmo()
         local damage = self.selectedPiece:getDamage()
         local wasKilled = targetPiece:takeDamage(damage)
-        
+
         if wasKilled then
             -- Remove dead piece
             for i, piece in ipairs(self.pieces) do
@@ -2048,24 +2748,55 @@ function Game:movePiece(col, row)
                     break
                 end
             end
-            -- Only move to the enemy tile if we killed them
-            -- Only allow the attacker to move into the target tile when the attack was adjacent (melee).
-            -- Ranged attacks (distance > 1) should not result in movement into the target tile.
+            -- Only move to the enemy tile if we killed them and attack was adjacent
             if self:isWithinRange(self.selectedPiece.col, self.selectedPiece.row, col, row, 1) then
                 self.selectedPiece:setPosition(col, row)
                 -- Check for mines when attacker moves into the tile after killing
                 self:triggerMineAt(col, row, self.selectedPiece)
             end
         end
+        -- Send network update for attack (include whether attacker moved into target)
+        if Network and Network.isConnected and Network.isConnected() and not self._applyingRemote then
+            -- If this is a networked client, send request and do not apply local attack effects
+            if not self.isHost then
+                local movedInto = (wasKilled and self:isWithinRange(self.selectedPiece.col, self.selectedPiece.row, col, row, 1))
+                pcall(function()
+                    Network.send({type = "attackRequest", fromCol = oldCol, fromRow = oldRow, toCol = col, toRow = row, damage = damage, moved = movedInto, team = self.localTeam})
+                end)
+                -- Client should wait for authoritative commit; stop here
+                return
+            else
+                local movedInto = (wasKilled and self:isWithinRange(self.selectedPiece.col, self.selectedPiece.row, col, row, 1))
+                pcall(function()
+                    self:sendCommit({type = "attack", fromCol = oldCol, fromRow = oldRow, toCol = col, toRow = row, damage = damage, moved = movedInto})
+                end)
+            end
+        end
         -- If enemy survived, attacker stays in place (no movement)
         -- Mark piece as moved since it attacked
         self.selectedPiece.hasMoved = true
         self:calculateValidMoves()
+        -- Deselect the attacker after resolving the attack
+        if self.selectedPiece then
+            self.selectedPiece:deselect(self)
+        end
     end
 end
 
 function Game:keypressed(key)
+    -- Accept hotseat pass if pending
+    if self.passPending then
+        if key == "return" or key == "space" then
+            self:confirmPass()
+        end
+        return
+    end
     if key == "e" then
+        -- Only allow ending the turn if this instance represents the active team
+        if self.localTeam and self.currentTurn ~= self.localTeam then
+            pcall(function() print(string.format("[game] endTurn blocked: currentTurn=%s localTeam=%s", tostring(self.currentTurn), tostring(self.localTeam))) end)
+            return
+        end
         self:endTurn()
     elseif key == "r" then
         self:resetGame()
@@ -2081,6 +2812,7 @@ function Game:keypressed(key)
 end
 
 function Game:mousemoved(x, y, dx, dy)
+    if self.passPending then return end
     -- Handle camera panning with middle mouse or space
     if love.mouse.isDown(3) then  -- Middle mouse
         self.camera:pan(dx, dy)
@@ -2098,6 +2830,13 @@ end
 function Game:endTurn()
     -- Can't end turn during placement phase
     if self.state == "placing" then
+        return
+    end
+    -- If connected and not the host, request the host to end the turn instead
+    if Network and Network.isConnected and Network.isConnected() and not self.isHost and not self._applyingRemote then
+        pcall(function()
+            if Network and Network.send then Network.send({type = "endTurnRequest"}) end
+        end)
         return
     end
     
@@ -2120,7 +2859,15 @@ function Game:endTurn()
                         end
                     else
                         -- It's a base structure (HQ, Ammo Depot, Supply Depot)
+                        -- Add base and ensure network peers are informed (host authoritative)
                         self:addBase(piece.buildingType, piece.buildingTeam, piece.col, piece.row)
+                        -- Hosted games will broadcast placed bases at end-turn; mark this base as justPlaced
+                        -- (we added the base via addBase, which sets `justPlaced`)
+                        -- Refresh fog so vision from this new base is applied immediately
+                        if self.fogOfWar then
+                            self.fogOfWar:updateVisibility(1, self.pieces, self.bases, self.teamStartingCorners)
+                            self.fogOfWar:updateVisibility(2, self.pieces, self.bases, self.teamStartingCorners)
+                        end
                     end
                     
                     -- Clear building state completely
@@ -2155,24 +2902,81 @@ function Game:endTurn()
     -- Generate resources from captured resource tiles
     self:generateResourceIncome(teamThatEnded)
     
-    self.selectedPiece = nil
-    self.validMoves = {}
-    self.validAttacks = {}
+    if self.selectedPiece then
+        self.selectedPiece:deselect(self)
+    end
+    if self.selectedPiece then
+        self.selectedPiece:deselect(self)
+    end
+
+    -- If host, broadcast any bases that were just completed/placed during this turn so peers register them
+    if self.isHost and Network and Network.isConnected and Network.isConnected() then
+        for _, b in ipairs(self.bases) do
+            if b.justPlaced then
+                pcall(function()
+                    Network.send({type = "placeBase", team = b.team, col = b.col, row = b.row, baseType = b.type})
+                end)
+                b.justPlaced = nil
+            end
+        end
+        -- Broadcast any newly created units (pieces) that were built this turn
+        for _, p in ipairs(self.pieces) do
+            if p.justPlaced then
+                pcall(function()
+                    Network.send({type = "placePiece", team = p.team, col = p.col, row = p.row, unitType = p.type})
+                end)
+                p.justPlaced = nil
+            end
+        end
+    end
     
-    -- Switch to next team's turn
-    self.currentTurn = self.currentTurn == 1 and 2 or 1
-    
-    -- Only increment turn counter when it goes back to team 1 (after both teams have played)
+    -- Networked games should switch immediately and inform peer; hotseat behavior only when not networked
+    if self.hotseatEnabled and (not Network or not Network.isConnected or not Network.isConnected()) then
+        -- Start hotseat pass: prompt players to pass the device before switching
+        self.passPending = true
+        self.pendingNextTeam = self.currentTurn == 1 and 2 or 1
+    else
+        -- Immediate turn switch for networked or dev mode
+        local nextTeam = self.currentTurn == 1 and 2 or 1
+        self.currentTurn = nextTeam
+        if self.currentTurn == 1 then
+            self.turnCount = self.turnCount + 1
+        end
+        for _, piece in ipairs(self.pieces) do
+            if piece.team == self.currentTurn then
+                piece:resetMove()
+            end
+        end
+        -- Notify remote peer of end-turn (if connected and this is a local action)
+        if Network and Network.isConnected and Network.isConnected() and not self._applyingRemote then
+            pcall(function()
+                Network.send({type = "endTurn", nextTeam = nextTeam, teamResources1 = self.teamResources[1], teamResources2 = self.teamResources[2], teamOil1 = self.teamOil[1], teamOil2 = self.teamOil[2]})
+            end)
+        end
+    end
+end
+
+function Game:confirmPass()
+    if not self.passPending then return end
+
+    -- Perform the actual turn switch now that players have passed the device
+    self.currentTurn = self.pendingNextTeam or (self.currentTurn == 1 and 2 or 1)
     if self.currentTurn == 1 then
         self.turnCount = self.turnCount + 1
     end
-    
+
     -- Reset move status for ALL pieces of the current team at the START of their turn
-    -- This includes engineers who just completed building
     for _, piece in ipairs(self.pieces) do
         if piece.team == self.currentTurn then
             piece:resetMove()
         end
+    end
+
+    -- Clear pending state
+    self.passPending = false
+    self.pendingNextTeam = nil
+    if self.selectedPiece then
+        self.selectedPiece:deselect(self)
     end
 end
 
@@ -2185,15 +2989,16 @@ function Game:isInStartingArea(col, row, team)
     return row >= area.rowStart and row <= area.rowEnd
 end
 
-function Game:placePiece(col, row)
+function Game:placePiece(col, row, team)
     -- Check if tile is valid (must be land and not occupied)
     local tile = self.map:getTile(col, row)
     if not tile or not tile.isLand then
         return  -- Can't place on water or invalid tile
     end
     
+    local teamToPlace = team or self.placementTeam
     -- Check if position is within the team's starting area
-    if not self:isInStartingArea(col, row, self.placementTeam) then
+    if not self:isInStartingArea(col, row, teamToPlace) then
         return  -- Can't place outside starting area
     end
     
@@ -2202,29 +3007,38 @@ function Game:placePiece(col, row)
         return  -- Tile already has a piece
     end
     
-    -- Find the first unplaced piece for the current placement team
+    -- Find the first unplaced piece for the requested team
     for _, piece in ipairs(self.pieces) do
-        if piece.team == self.placementTeam and piece.col == 0 and piece.row == 0 then
-            -- Place this piece
+        if piece.team == teamToPlace and piece.col == 0 and piece.row == 0 then
+            -- If networked client, request placement from host
+            if Network and Network.isConnected and Network.isConnected() and not self.isHost and not self._applyingRemote then
+                pcall(function()
+                    Network.send({type = "placePieceRequest", team = teamToPlace, col = col, row = row, unitType = piece.type})
+                end)
+                return
+            end
+            -- Place this piece (host or local play)
             piece:setPosition(col, row)
             self.piecesPlaced = self.piecesPlaced + 1
-            
-            -- Check if current team has finished placing
-            local teamPiecesPlaced = 0
-            for _, p in ipairs(self.pieces) do
-                if p.team == self.placementTeam and p.col > 0 and p.row > 0 then
-                    teamPiecesPlaced = teamPiecesPlaced + 1
-                end
+            -- If host, broadcast commit
+            if Network and Network.isConnected and Network.isConnected() and self.isHost and not self._applyingRemote then
+                self:sendCommit({type = "placePiece", team = teamToPlace, col = col, row = row, unitType = piece.type})
             end
             
-            if teamPiecesPlaced >= self.piecesPerTeam then
-                -- Current team finished placing pieces, switch to bases or next team
-                if self.placementTeam == 1 then
-                    -- Team 1 finished pieces, switch to bases
-                    self.placementPhase = "bases"
-                else
-                    -- Team 2 finished pieces, switch to bases
-                    self.placementPhase = "bases"
+            -- Check if both teams have finished placing pieces; if so, move to bases phase
+            local team1Placed = 0
+            local team2Placed = 0
+            for _, p in ipairs(self.pieces) do
+                if p.team == 1 and p.col > 0 and p.row > 0 then team1Placed = team1Placed + 1 end
+                if p.team == 2 and p.col > 0 and p.row > 0 then team2Placed = team2Placed + 1 end
+            end
+            if team1Placed >= self.piecesPerTeam and team2Placed >= self.piecesPerTeam then
+                self.placementPhase = "bases"
+                pcall(function() print("[game] both teams finished pieces — entering base placement phase") end)
+                if Network and Network.isConnected and Network.isConnected() and not self._applyingRemote then
+                    pcall(function()
+                        Network.send({type = "placementPhase", phase = "bases"})
+                    end)
                 end
             end
             return
@@ -2232,54 +3046,68 @@ function Game:placePiece(col, row)
     end
 end
 
-function Game:placeBase(col, row)
+function Game:placeBase(col, row, team)
     -- Check if tile is valid (must be land and not occupied)
     local tile = self.map:getTile(col, row)
     if not tile or not tile.isLand then
         return  -- Can't place on water or invalid tile
     end
     
+    -- Determine which team is placing (allow optional team arg)
+    local teamToPlace = team or self.placementTeam
     -- Check if position is within the team's starting area
-    if not self:isInStartingArea(col, row, self.placementTeam) then
+    if not self:isInStartingArea(col, row, teamToPlace) then
         return  -- Can't place outside starting area
     end
+    pcall(function() print(string.format("[game] placeBase attempt team=%s col=%s row=%s placementPhase=%s", tostring(teamToPlace), tostring(col), tostring(row), tostring(self.placementPhase))) end)
     
     -- Check if tile is already occupied by piece or base
     if self:getPieceAt(col, row) or self:getBaseAt(col, row) then
         return  -- Tile already has something
     end
     
-    -- Find the first unplaced base for the current placement team
+    -- Find the first unplaced base for the requested team
     for _, base in ipairs(self.bases) do
-        if base.team == self.placementTeam and base.col == 0 and base.row == 0 then
-            -- Place this base
+        if base.team == teamToPlace and base.col == 0 and base.row == 0 then
+            -- If networked client, request base placement from host
+            if Network and Network.isConnected and Network.isConnected() and not self.isHost and not self._applyingRemote then
+                pcall(function()
+                    Network.send({type = "placeBaseRequest", team = teamToPlace, col = col, row = row, baseType = base.type})
+                end)
+                return
+            end
+            -- Place this base (host or local play)
             base:setPosition(col, row)
             self.basesPlaced = self.basesPlaced + 1
-            
-            -- Check if current team has finished placing bases
-            local teamBasesPlaced = 0
-            for _, b in ipairs(self.bases) do
-                if b.team == self.placementTeam and b.col > 0 and b.row > 0 then
-                    teamBasesPlaced = teamBasesPlaced + 1
-                end
+            pcall(function() print(string.format("[game] placed base %s for team=%s at %d,%d", tostring(base.type), tostring(teamToPlace), col, row)) end)
+            -- If host, broadcast commit
+            if Network and Network.isConnected and Network.isConnected() and self.isHost and not self._applyingRemote then
+                self:sendCommit({type = "placeBase", team = teamToPlace, col = col, row = row, baseType = base.type})
             end
-            
-            if teamBasesPlaced >= self.basesPerTeam then
-                -- Current team finished placing bases, switch to next team
-                if self.placementTeam == 1 then
-                    -- Team 1 finished, switch to Team 2 pieces
-                    self.placementTeam = 2
-                    self.placementPhase = "pieces"
-                else
-                    -- Both teams finished placing, start the game
-                    self.state = "playing"
-                    self.turnCount = 1
-                    self.currentTurn = 1  -- Team 1 goes first
-                    -- Reset all pieces so they can move in the first turn
-                    for _, p in ipairs(self.pieces) do
-                        p:resetMove()
+                    -- Update fog visibility immediately so presence/vision of the base is recognized
+                    if self.fogOfWar then
+                        self.fogOfWar:updateVisibility(1, self.pieces, self.bases, self.teamStartingCorners)
+                        self.fogOfWar:updateVisibility(2, self.pieces, self.bases, self.teamStartingCorners)
                     end
+            
+            -- Check if both teams have finished placing bases; if so, start the game
+            local team1Bases = 0
+            local team2Bases = 0
+            for _, b in ipairs(self.bases) do
+                if b.team == 1 and b.col > 0 and b.row > 0 then team1Bases = team1Bases + 1 end
+                if b.team == 2 and b.col > 0 and b.row > 0 then team2Bases = team2Bases + 1 end
+            end
+            if team1Bases >= self.basesPerTeam and team2Bases >= self.basesPerTeam then
+                -- Both teams have placed bases: move to ready phase, require both players to ready-up
+                self.placementPhase = "ready"
+                pcall(function() print("[game] both teams finished bases — entering ready phase") end)
+                -- Notify peer
+                if Network and Network.isConnected and Network.isConnected() and not self._applyingRemote then
+                    pcall(function()
+                        Network.send({type = "placementPhase", phase = "ready"})
+                    end)
                 end
+                -- Do not start the game until both players press Ready (host will send startPlay)
             end
             return
         end
@@ -2302,7 +3130,9 @@ function Game:resetGame()
     self.basesPlaced = 0
     self.placementTeam = 1
     self.placementPhase = "pieces"
-    self.selectedPiece = nil
+    if self.selectedPiece then
+        self.selectedPiece:deselect(self)
+    end
     self.actionMenu = nil
     self.actionMenuContext = nil
     self.actionMenuContextType = nil

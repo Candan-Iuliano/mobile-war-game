@@ -4,11 +4,12 @@
 local FogOfWar = {}
 FogOfWar.__index = FogOfWar
 
-function FogOfWar.new(map, numTeams)
+function FogOfWar.new(map, numTeams, game)
     local self = setmetatable({}, FogOfWar)
     
     self.map = map
     self.numTeams = numTeams or 2
+    self.game = game
     
     -- Track visibility and exploration per team
     -- visible[team][col][row] = true if tile is currently visible
@@ -207,7 +208,28 @@ function FogOfWar:updateVisibility(team, pieces, bases, startingAreas)
             if base.getRadius then
                 visionRange = base:getRadius() or 3
             end
-            self:revealArea(team, base.col, base.row, visionRange, {})
+            -- Airbases grant full visibility inside their radius while the team has air superiority on each tile.
+            -- When superiority is lost on a tile, it should remain explored but not visible.
+            if base.type == "airbase" and self.game and self.game.getTilesWithinRadius and self.game.getAirSuperiorityAt then
+                local tiles = self.game:getTilesWithinRadius(base.col, base.row, base:getRadius())
+                for _, t in ipairs(tiles) do
+                    local col = t.col
+                    local row = t.row
+                    local t1, t2 = self.game:getAirSuperiorityAt(col, row)
+                    local teamAS, enemyAS = t1, t2
+                    if base.team == 2 then teamAS, enemyAS = t2, t1 end
+                    if teamAS > 0 and teamAS > enemyAS then
+                        self:setTileVisible(team, col, row, true)
+                    else
+                        -- Mark as explored but not visible
+                        self:setTileExplored(team, col, row, true)
+                        -- Ensure visible is false (it was cleared at start)
+                        -- (do not call setTileVisible with false because that would overwrite explored state)
+                    end
+                end
+            else
+                self:revealArea(team, base.col, base.row, visionRange, {})
+            end
         end
     end
 end

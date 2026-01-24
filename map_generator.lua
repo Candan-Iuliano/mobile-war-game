@@ -105,18 +105,38 @@ end
 -- Get a built-in generator by name
 function HexMap:getBuiltInGenerator(methodName)
     -- Try to load the requested generator
-    local success, generator = pcall(require, "mapGenerators." .. methodName)
-    
+    local moduleName = "mapGenerators." .. methodName
+    local success, generator = pcall(require, moduleName)
     if success and generator then
         return generator
     end
-    
+
+    -- Diagnostic logging for module load failures
+    print("map_generator: require('" .. moduleName .. "') failed; attempting file fallback")
+
+    -- Attempt to load module file directly as a fallback (useful if package.path isn't configured)
+    local filePath = "mapGenerators/" .. methodName .. ".lua"
+    local f = io.open(filePath, "r")
+    if not f then
+        print("map_generator: fallback file not found: " .. filePath)
+    else
+        f:close()
+        local chunk, loadErr = loadfile(filePath)
+        if not chunk then
+            print("map_generator: loadfile error: " .. tostring(loadErr))
+        else
+            local ok, gen = pcall(chunk)
+            if ok and gen then return gen end
+            if not ok then print("map_generator: chunk execution error: " .. tostring(gen)) end
+        end
+    end
+
     -- Fallback: if generator not found, use balanced
     if methodName ~= "balanced" then
         print("Warning: Generator '" .. methodName .. "' not found, using 'balanced' instead")
         return require("mapGenerators.balanced")
     end
-    
+
     error("Could not load balanced terrain generator")
 end
 
@@ -370,13 +390,8 @@ function HexMap:drawTile(tile, offsetX, offsetY)
     if tile.isIce then
         love.graphics.setColor(0.8, 0.95, 1)  -- Light blue for ice
     elseif tile.isLand then
-        if tile.decorationType == "trees" or tile.decorationType == "forest" then
-            love.graphics.setColor(0.2, 0.6, 0.2)  -- Green for forest
-        elseif tile.decorationType == "rocks" then
-            love.graphics.setColor(0.6, 0.6, 0.6)  -- Gray for rocks
-        else
-            love.graphics.setColor(0.8, 0.7, 0.5)  -- Tan for bare land
-        end
+        -- No decorations: draw land uniformly
+        love.graphics.setColor(0.8, 0.7, 0.5)  -- Tan for bare land
     else
         love.graphics.setColor(0.5, 0.5, 0.5)  -- Gray for mountains
     end

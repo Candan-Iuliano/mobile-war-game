@@ -29,6 +29,13 @@ function M.methods:startBuilding(buildingType, team, buildTurns, resourceTarget,
     if self.deselect then
         self:deselect(game)
     end
+    -- If networked and this is a client (not host), send a build request instead of applying locally
+    if Network and Network.isConnected and Network.isConnected() and not game.isHost and not game._applyingRemote then
+        pcall(function()
+            Network.send({type = "startBuildingRequest", col = self.col, row = self.row, buildingType = buildingType, team = team, buildTurns = buildTurns})
+        end)
+        return
+    end
 end
 
 -- Engineer-specific build helpers (called on the piece instance)
