@@ -289,19 +289,19 @@ end
 --     love.graphics.setColor(1,1,1,1)
 -- end
 
--- Return neighbor offsets for a given column parity (matches HexMap:getNeighbors ordering)
-function Game:getHexNeighborOffsets(col)
-    local odd = (col % 2 ~= 0)
-    if not odd then
-        return {
-            {1, 0}, {1, 1}, {0, 1}, {-1, 0}, {-1, 1}, {0, -1}
-        }
-    else
-        return {
-            {1, -1}, {1, 0}, {0, 1}, {-1, -1}, {-1, 0}, {0, -1}
-        }
-    end
-end
+-- -- Return neighbor offsets for a given column parity (matches HexMap:getNeighbors ordering)
+-- function Game:getHexNeighborOffsets(col)
+--     local odd = (col % 2 ~= 0)
+--     if not odd then
+--         return {
+--             {1, 0}, {1, 1}, {0, 1}, {-1, 0}, {-1, 1}, {0, -1}
+--         }
+--     else
+--         return {
+--             {1, -1}, {1, 0}, {0, 1}, {-1, -1}, {-1, 0}, {0, -1}
+--         }
+--     end
+-- end
 
 -- Generic external edge calculator for a set of tiles.
 -- `tiles` is an array of {col=row, row=row} or a table keyed by "col,row" -> true
@@ -499,6 +499,35 @@ function Game:addBase(baseType, team, col, row)
     end
 end
 
+-- Apply a place-base action locally (used by host request handler and commit handler)
+-- Returns the placed Base instance (existing filled slot or newly created)
+function Game:applyPlaceBase(team, col, row, baseType)
+    if not team or not col or not row then return nil end
+    local placedBase = nil
+    for _, base in ipairs(self.bases) do
+        if base.team == team and (not base.col or base.col == 0) and (not base.row or base.row == 0) then
+            base:setPosition(col, row)
+            self.basesPlaced = (self.basesPlaced or 0) + 1
+            pcall(function() print(string.format("[game] applyPlaceBase -> filled existing slot team=%s col=%s row=%s baseType=%s", tostring(team), tostring(col), tostring(row), tostring(baseType))) end)
+            placedBase = base
+            break
+        end
+    end
+    if not placedBase then
+        local newBase = Base.new(baseType or "hq", team, self.map, col, row)
+        table.insert(self.bases, newBase)
+        self.basesPlaced = (self.basesPlaced or 0) + 1
+        pcall(function() print(string.format("[game] applyPlaceBase -> created new base team=%s col=%s row=%s baseType=%s", tostring(team), tostring(col), tostring(row), tostring(baseType))) end)
+        placedBase = newBase
+    end
+    -- Update fog visibility so the new base's effects are recognized locally
+    if self.fogOfWar then
+        self.fogOfWar:updateVisibility(1, self.pieces, self.bases, self.teamStartingCorners)
+        self.fogOfWar:updateVisibility(2, self.pieces, self.bases, self.teamStartingCorners)
+    end
+    return placedBase
+end
+
 function Game:generateResources()
     -- Helper: avoid starting areas (full-width top/bottom strips)
     local function inStartingArea(col, row)
@@ -663,8 +692,15 @@ function Game:handleNetworkMessage(msg)
             local toRow = tonumber(msg.toRow)
             if fromCol and fromRow and toCol and toRow then
                 self:applyRemoteMove({fromCol = fromCol, fromRow = fromRow, toCol = toCol, toRow = toRow})
-                -- Broadcast authoritative commit
-                self:sendCommit({type = "move", fromCol = fromCol, fromRow = fromRow, toCol = toCol, toRow = toRow})
+                -- After applying move on host, check for mine trigger at destination and handle it (host authoritative)
+                local mover = self:getPieceAt(toCol, toRow)
+                if mover then
+                    -- Broadcast authoritative commit for the move first so clients apply the move
+                    -- and then apply any mine-trigger effects that follow.
+                    self:sendCommit({type = "move", fromCol = fromCol, fromRow = fromRow, toCol = toCol, toRow = toRow})
+                    -- Now host checks for mine trigger at destination and handle it (host authoritative)
+                    self:triggerMineAt(toCol, toRow, mover)
+                end
             end
         end
     elseif msg.type == "startBuildingRequest" then
@@ -701,19 +737,21 @@ function Game:handleNetworkMessage(msg)
             local attacker = self:getPieceAt(amsg.fromCol, amsg.fromRow)
             local target = self:getPieceAt(amsg.toCol, amsg.toRow)
             if attacker and attacker.useAmmo then attacker:useAmmo() end
-            if target then
-                local wasKilled = target:takeDamage(amsg.damage)
-                if wasKilled then
-                    for i, p in ipairs(self.pieces) do
-                        if p == target then table.remove(self.pieces, i); break end
+                if target then
+                    local wasKilled = target:takeDamage(amsg.damage)
+                    if wasKilled then
+                        for i, p in ipairs(self.pieces) do
+                            if p == target then table.remove(self.pieces, i); break end
+                        end
+                        if amsg.moved and attacker then attacker:setPosition(amsg.toCol, amsg.toRow) end
                     end
-                    if amsg.moved and attacker then attacker:setPosition(amsg.toCol, amsg.toRow); self:triggerMineAt(amsg.toCol, amsg.toRow, attacker) end
+                else
+                    if amsg.moved and attacker then attacker:setPosition(amsg.toCol, amsg.toRow) end
                 end
-            else
-                if amsg.moved and attacker then attacker:setPosition(amsg.toCol, amsg.toRow); self:triggerMineAt(amsg.toCol, amsg.toRow, attacker) end
-            end
-            -- Broadcast commit
-            self:sendCommit({type = "attack", fromCol = amsg.fromCol, fromRow = amsg.fromRow, toCol = amsg.toCol, toRow = amsg.toRow, damage = amsg.damage, moved = amsg.moved})
+                -- Broadcast commit first so clients mirror the attack/movement
+                self:sendCommit({type = "attack", fromCol = amsg.fromCol, fromRow = amsg.fromRow, toCol = amsg.toCol, toRow = amsg.toRow, damage = amsg.damage, moved = amsg.moved})
+                -- After broadcasting, host should authoritative trigger any mine effects caused by movement
+                if amsg.moved and attacker then self:triggerMineAt(amsg.toCol, amsg.toRow, attacker) end
         end
     elseif msg.type == "placePieceRequest" then
         if self.isHost then
@@ -740,30 +778,221 @@ function Game:handleNetworkMessage(msg)
                 self:sendCommit({type = "placePiece", team = team, col = col, row = row, unitType = unitType})
             end
         end
-    elseif msg.type == "placeBaseRequest" then
+    elseif msg.type == "placeMineRequest" then
+        -- Host should create the mine and broadcast to peers
         if self.isHost then
-            local team = tonumber(msg.team)
             local col = tonumber(msg.col)
             local row = tonumber(msg.row)
-            local baseType = msg.baseType
-            if team and col and row then
-                local placed = false
-                for _, base in ipairs(self.bases) do
-                    if base.team == team and (not base.col or base.col == 0) and (not base.row or base.row == 0) then
-                        base:setPosition(col, row)
-                        self.basesPlaced = (self.basesPlaced or 0) + 1
-                        placed = true
-                        break
+            local team = tonumber(msg.team)
+            pcall(function() print(string.format("[game] recv.placeMineRequest -> team=%s col=%s row=%s", tostring(team), tostring(col), tostring(row))) end)
+            if col and row and team then
+                -- Only place on land and if no mine exists
+                local tile = self.map and self.map:getTile(col, row)
+                if tile and tile.isLand and not self:getMineAt(col, row) then
+                    local mine = {col = col, row = row, owner = nil, team = team, damage = 5, placedTurn = self.turnCount}
+                    mine.revealedTo = mine.revealedTo or {}
+                    mine.revealedTo[team] = true
+                    -- Attach owner piece if present
+                    local ownerPiece = self:getPieceAt(col, row)
+                    if ownerPiece and ownerPiece.team == team then
+                        mine.owner = ownerPiece
+                        ownerPiece.placedMines = ownerPiece.placedMines or {}
+                        table.insert(ownerPiece.placedMines, mine)
+                    end
+                    self:addMine(mine)
+                    -- Broadcast commit so all peers create the mine locally
+                    pcall(function()
+                        print(string.format("[game] host sending placeMine -> team=%s col=%s row=%s", tostring(team), tostring(col), tostring(row)))
+                        self:sendCommit({type = "placeMine", col = col, row = row, team = team, damage = mine.damage})
+                    end)
+                end
+            end
+        end
+    elseif msg.type == "sweepMinesRequest" then
+        -- Host should perform sweep and broadcast reveals to peers
+        if self.isHost then
+            local col = tonumber(msg.col)
+            local row = tonumber(msg.row)
+            local team = tonumber(msg.team)
+            if col and row and team then
+                local piece = self:getPieceAt(col, row)
+                if piece and piece.team == team then
+                    -- Prefer using the piece-based sweep which marks reveals and broadcasts when host
+                    self:sweepForMines(piece)
+                else
+                    -- Fallback: coordinate-based sweep (use provided range or 1)
+                    local range = 1
+                    if msg.range then range = tonumber(msg.range) or range end
+
+                    local previouslyRevealed = {}
+                    for _, m in ipairs(self.mines or {}) do
+                        previouslyRevealed[m] = (m.revealedTo and m.revealedTo[team]) and true or false
+                    end
+
+                    for _, m in ipairs(self.mines or {}) do
+                        if m.col and m.row and m.team ~= team then
+                            if self:isWithinRange(col, row, m.col, m.row, range) then
+                                m.revealedTo = m.revealedTo or {}
+                                m.revealedTo[team] = true
+                            end
+                        end
+                    end
+
+                    for _, m in ipairs(self.mines or {}) do
+                        if (m.revealedTo and m.revealedTo[team]) and not previouslyRevealed[m] then
+                            pcall(function()
+                                self:sendCommit({type = "revealMine", col = m.col, row = m.row, team = team, mineTeam = m.team})
+                            end)
+                        end
                     end
                 end
-                if not placed then
-                    local newBase = Base.new(baseType or "hq", team, self.map, col, row)
-                    table.insert(self.bases, newBase)
-                    self.basesPlaced = (self.basesPlaced or 0) + 1
-                end
-                -- Broadcast commit
-                self:sendCommit({type = "placeBase", team = team, col = col, row = row, baseType = baseType})
             end
+        end
+    elseif msg.type == "disarmMineRequest" then
+        -- Host should validate disarm request, disarm the mine and broadcast removal
+        if self.isHost then
+            local col = tonumber(msg.col)
+            local row = tonumber(msg.row)
+            local team = tonumber(msg.team)
+            if col and row and team then
+                local mine = self:getMineAt(col, row)
+                if mine and mine.revealedTo and mine.revealedTo[team] and mine.team ~= team then
+                    -- Find an adjacent piece of the requesting team that can disarm (engineer)
+                    local tile = self.map and self.map:getTile(col, row)
+                    local adj = {}
+                    if tile and self.map.getNeighbors then
+                        adj = self.map:getNeighbors(tile, 1) or {}
+                    end
+                    local disarmer = nil
+                    for _, n in ipairs(adj) do
+                        local p = self:getPieceAt(n.col, n.row)
+                        if p and p.team == team and p.stats and p.stats.canBuild then
+                            disarmer = p
+                            break
+                        end
+                    end
+                    if disarmer then
+                        -- Perform disarm (will remove mine and reward engineer)
+                        self:disarmMine(disarmer, mine)
+                        -- Broadcast removal to peers
+                        pcall(function()
+                            self:sendCommit({type = "removeMine", col = col, row = row})
+                        end)
+                    end
+                end
+            end
+        end
+        elseif msg.type == "placeBaseRequest" then
+            if self.isHost then
+                local team = tonumber(msg.team)
+                local col = tonumber(msg.col)
+                local row = tonumber(msg.row)
+                local baseType = msg.baseType
+                if team and col and row then
+                    -- Apply placement locally on host and broadcast commit
+                    self:applyPlaceBase(team, col, row, baseType)
+                    self:sendCommit({type = "placeBase", team = team, col = col, row = row, baseType = baseType})
+                end
+            end
+    elseif msg.type == "revealMine" then
+        local col = tonumber(msg.col)
+        local row = tonumber(msg.row)
+        local team = tonumber(msg.team)
+        if col and row and team then
+            local mine = self:getMineAt(col, row)
+            local mineOwnerTeam = nil
+            if msg.mineTeam then mineOwnerTeam = tonumber(msg.mineTeam) end
+            if mine then
+                mine.revealedTo = mine.revealedTo or {}
+                mine.revealedTo[team] = true
+                pcall(function()
+                    print(string.format("[game] recv.revealMine -> revealedTo=%s col=%s row=%s (mineTeam=%s)", tostring(team), tostring(col), tostring(row), tostring(mine.team)))
+                end)
+            else
+                -- If client doesn't have the mine yet (missed placeMine), create a placeholder so reveal is visible
+                pcall(function()
+                    print(string.format("[game] recv.revealMine: no local mine, creating placeholder revealedTo=%s col=%s row=%s mineTeam=%s", tostring(team), tostring(col), tostring(row), tostring(mineOwnerTeam)))
+                end)
+                local placeholder = {col = col, row = row, owner = nil, team = mineOwnerTeam, damage = 5, placedTurn = self.turnCount}
+                placeholder.revealedTo = {}
+                placeholder.revealedTo[team] = true
+                self:addMine(placeholder)
+            end
+        end
+    elseif msg.type == "removeMine" then
+        local col = tonumber(msg.col)
+        local row = tonumber(msg.row)
+        if col and row then
+            local mine = self:getMineAt(col, row)
+            if mine then self:removeMine(mine) end
+        end
+    elseif msg.type == "airstrikeRequest" then
+        if self.isHost then
+            local col = tonumber(msg.col)
+            local row = tonumber(msg.row)
+            local team = tonumber(msg.team)
+            local damage = tonumber(msg.damage) or 6
+            if col and row and team then
+                -- verify can airstrike
+                if self:canAirstrike(team, col, row) then
+                    -- apply strike
+                    local targetPiece = self:getPieceAt(col, row)
+                    if targetPiece then
+                        local wasKilled = targetPiece:takeDamage(damage)
+                        if wasKilled then
+                            for i, p in ipairs(self.pieces) do
+                                if p == targetPiece then
+                                    table.remove(self.pieces, i)
+                                    break
+                                end
+                            end
+                        end
+                    end
+                    -- broadcast commit
+                    self:sendCommit({type = "airstrike", col = col, row = row, team = team, damage = damage})
+                end
+            end
+        end
+    elseif msg.type == "airstrike" then
+        local col = tonumber(msg.col)
+        local row = tonumber(msg.row)
+        local damage = tonumber(msg.damage) or 6
+        if col and row then
+            local targetPiece = self:getPieceAt(col, row)
+            if targetPiece then
+                local wasKilled = targetPiece:takeDamage(damage)
+                if wasKilled then
+                    for i, p in ipairs(self.pieces) do
+                        if p == targetPiece then
+                            table.remove(self.pieces, i)
+                            break
+                        end
+                    end
+                end
+            end
+        end
+    elseif msg.type == "mineTriggered" then
+        local col = tonumber(msg.col)
+        local row = tonumber(msg.row)
+        local damage = tonumber(msg.damage) or 0
+        local moverCol = tonumber(msg.moverCol)
+        local moverRow = tonumber(msg.moverRow)
+        if col and row and moverCol and moverRow then
+            local piece = self:getPieceAt(moverCol, moverRow)
+            if piece then
+                local wasKilled = piece:takeDamage(damage)
+                if wasKilled then
+                    for i, p in ipairs(self.pieces) do
+                        if p == piece then
+                            table.remove(self.pieces, i)
+                            break
+                        end
+                    end
+                end
+            end
+            -- Ensure mine removed locally
+            local mine = self:getMineAt(col, row)
+            if mine then self:removeMine(mine) end
         end
     elseif msg.type == "buildUnitRequest" then
         if self.isHost then
@@ -802,17 +1031,16 @@ function Game:handleNetworkMessage(msg)
                         break
                     end
                 end
-                -- If attacker moved into the target tile, move it and trigger mines
+                -- If attacker moved into the target tile, move it (do NOT trigger mines here;
+                -- host will broadcast `mineTriggered` commits that clients should apply).
                 if moved and attacker then
                     attacker:setPosition(toCol, toRow)
-                    self:triggerMineAt(toCol, toRow, attacker)
                 end
             end
         else
             -- If target not found, but moved flag set, still try to move attacker
             if moved and attacker then
                 attacker:setPosition(toCol, toRow)
-                self:triggerMineAt(toCol, toRow, attacker)
             end
         end
     elseif msg.type == "placePiece" then
@@ -846,6 +1074,21 @@ function Game:handleNetworkMessage(msg)
                 end
             end
         end
+    elseif msg.type == "placeMine" then
+        -- Host/peer broadcast: create mine if missing
+        local col = tonumber(msg.col)
+        local row = tonumber(msg.row)
+        local team = tonumber(msg.team)
+        local damage = tonumber(msg.damage) or 5
+        if col and row and team then
+            if not self:getMineAt(col, row) then
+                local mine = {col = col, row = row, owner = nil, team = team, damage = damage, placedTurn = self.turnCount}
+                mine.revealedTo = mine.revealedTo or {}
+                mine.revealedTo[team] = true
+                self:addMine(mine)
+                pcall(function() print(string.format("[game] recv.placeMine -> team=%s col=%s row=%s", tostring(team), tostring(col), tostring(row))) end)
+            end
+        end
     elseif msg.type == "placeBase" then
         -- Remote placed a base during placement phase: mirror it
         local team = tonumber(msg.team)
@@ -853,56 +1096,16 @@ function Game:handleNetworkMessage(msg)
         local row = tonumber(msg.row)
         local baseType = msg.baseType
         if team and col and row then
-            local placed = false
-            for _, base in ipairs(self.bases) do
-                if base.team == team and (not base.col or base.col == 0) and (not base.row or base.row == 0) then
-                    pcall(function() print(string.format("[game] recv.placeBase -> team=%s col=%s row=%s baseType=%s (filled existing slot)", tostring(team), tostring(col), tostring(row), tostring(baseType))) end)
-                    if self.fogOfWar then
-                        pcall(function() print("[game] recv.placeBase visibility before: t1=" .. tostring(self.fogOfWar:isTileVisible(1, col, row)) .. " t2=" .. tostring(self.fogOfWar:isTileVisible(2, col, row))) end)
-                    end
-                    base:setPosition(col, row)
-                    self.basesPlaced = (self.basesPlaced or 0) + 1
-                    -- Update fog visibility so the new base is registered for vision
-                    if self.fogOfWar then
-                        self.fogOfWar:updateVisibility(1, self.pieces, self.bases, self.teamStartingCorners)
-                        self.fogOfWar:updateVisibility(2, self.pieces, self.bases, self.teamStartingCorners)
-                        pcall(function() print("[game] recv.placeBase visibility after: t1=" .. tostring(self.fogOfWar:isTileVisible(1, col, row)) .. " t2=" .. tostring(self.fogOfWar:isTileVisible(2, col, row))) end)
-                    end
-                    -- If there is a piece at this tile that was building the base, clear its building state
-                    local builder = self:getPieceAt(col, row)
-                    if builder and builder.isBuilding then
-                        builder.isBuilding = false
-                        builder.buildingType = nil
-                        builder.buildingTurnsRemaining = 0
-                        builder.buildingTeam = nil
-                        builder.buildingResourceTarget = nil
-                        builder.hasMoved = false
-                    end
-                    placed = true
-                    break
-                end
-            end
-            if not placed then
-                -- No placeholder base existed on this client: create a new Base instance to mirror the host
-                pcall(function() print(string.format("[game] recv.placeBase -> creating new base instance team=%s col=%s row=%s baseType=%s", tostring(team), tostring(col), tostring(row), tostring(baseType))) end)
-                local newBase = Base.new(baseType, team, self.map, col, row)
-                table.insert(self.bases, newBase)
-                self.basesPlaced = (self.basesPlaced or 0) + 1
-                if self.fogOfWar then
-                    self.fogOfWar:updateVisibility(1, self.pieces, self.bases, self.teamStartingCorners)
-                    self.fogOfWar:updateVisibility(2, self.pieces, self.bases, self.teamStartingCorners)
-                    pcall(function() print("[game] recv.placeBase visibility after (created): t1=" .. tostring(self.fogOfWar:isTileVisible(1, col, row)) .. " t2=" .. tostring(self.fogOfWar:isTileVisible(2, col, row))) end)
-                end
-                -- If there is a builder at this tile, clear its building state
-                local builder2 = self:getPieceAt(col, row)
-                if builder2 and builder2.isBuilding then
-                    builder2.isBuilding = false
-                    builder2.buildingType = nil
-                    builder2.buildingTurnsRemaining = 0
-                    builder2.buildingTeam = nil
-                    builder2.buildingResourceTarget = nil
-                    builder2.hasMoved = false
-                end
+            local placed = self:applyPlaceBase(team, col, row, baseType)
+            -- If there is a piece at this tile that was building the base, clear its building state
+            local builder = self:getPieceAt(col, row)
+            if builder and builder.isBuilding then
+                builder.isBuilding = false
+                builder.buildingType = nil
+                builder.buildingTurnsRemaining = 0
+                builder.buildingTeam = nil
+                builder.buildingResourceTarget = nil
+                builder.hasMoved = false
             end
         end
     elseif msg.type == "startBuilding" then
@@ -962,12 +1165,13 @@ function Game:handleNetworkMessage(msg)
                 for _, p in ipairs(self.pieces) do p:resetMove() end
                 pcall(function()
                     if Network and Network.send and Network.isConnected and Network.isConnected() then
-                        Network.send({type = "startPlay"})
+                        self:sendCommit({type = "startPlay"})
                     end
                 end)
             end
         end
     elseif msg.type == "endTurnRequest" then
+    
         -- A client asked the host to end their turn. Only the host should process this.
         if self.isHost then
             -- Temporarily clear _applyingRemote so endTurn will send the resulting endTurn message
@@ -999,8 +1203,7 @@ function Game:applyRemoteMove(msg)
     if not piece then return end
     -- Move without validating team/turn (mirroring remote)
     piece:setPosition(toCol, toRow)
-    -- Trigger mines if any
-    self:triggerMineAt(toCol, toRow, piece)
+    -- Do NOT trigger mines here; host will authoritatively send a mineTriggered commit when needed
     -- If this piece was selected locally, deselect it now that the move is applied
     if self.selectedPiece and self.selectedPiece == piece then
         piece:deselect(self)
@@ -1033,7 +1236,7 @@ function Game:draw()
     -- self:drawProvinceBoundaries()
     
     -- Draw starting areas during placement phase (use localTeam view when networked)
-    if self.state == "placing" then
+    if self.state == "placing" or self.devMode then
         local viewTeam = self.localTeam or self.placementTeam
         self:drawStartingAreas(viewTeam)
     end
@@ -1067,20 +1270,24 @@ function Game:draw()
         resource:draw(pixelX, pixelY, self.hexSideLength)
     end
 
-    -- Draw mines (only draw if revealed to the current player's team)
+    -- Draw mines (show if revealed to viewer or owned by viewer). Color by team and render above resources.
     if self.mines then
+        local viewer = viewTeam or (self.localTeam or self.currentTurn)
         for _, mine in ipairs(self.mines) do
             if mine.col and mine.row then
-                local shouldDraw = false
-                if mine.revealedTo and mine.revealedTo[self.currentTurn] then
-                    shouldDraw = true
-                end
-                if shouldDraw then
+                local revealed = mine.revealedTo and mine.revealedTo[viewer]
+                local owned = (mine.team == viewer)
+                if revealed or owned then
                     local mx, my = self.map:gridToPixels(mine.col, mine.row)
-                    love.graphics.setColor(0.1, 0.1, 0.1)
-                    love.graphics.circle("fill", mx, my, self.hexSideLength * 0.15)
-                    love.graphics.setColor(0, 0, 0)
-                    love.graphics.circle("line", mx, my, self.hexSideLength * 0.15)
+                    -- team color: team 1 = red, team 2 = blue, fallback gray
+                    local r, g, b = 0.5, 0.5, 0.5
+                    if mine.team == 1 then r, g, b = 0.85, 0.15, 0.15
+                    elseif mine.team == 2 then r, g, b = 0.15, 0.25, 0.85 end
+                    love.graphics.setColor(r, g, b)
+                    love.graphics.circle("fill", mx, my, self.hexSideLength * 0.17)
+                    love.graphics.setColor(math.max(0, r - 0.4), math.max(0, g - 0.4), math.max(0, b - 0.4))
+                    love.graphics.circle("line", mx, my, self.hexSideLength * 0.17)
+                    love.graphics.setColor(1, 1, 1, 1)
                 end
             end
         end
@@ -1305,45 +1512,38 @@ end
 function Game:drawBaseRadius(base, pixelX, pixelY, viewTeam)
     -- Draw hexagons within the base's influence radius, respecting terrain
     local radius = base:getRadius()
-    
+
     -- Use getHexesWithinRange which respects terrain passability
     -- Pass base's team so enemy pieces don't block the visualization
     local visited = {}
     self:getHexesWithinRange(base.col, base.row, radius, visited, base.team)
-    
+
     -- Only show radius for bases belonging to the viewer's team
     local viewer = viewTeam or (self.localTeam or self.currentTurn)
     if base.team ~= viewer then
         return
     end
 
-    -- Choose color based on team
-    local fillR, fillG, fillB, fillA = 1, 0, 0, 0.15
-    local lineR, lineG, lineB, lineA = 1, 0, 0, 0.4
-    if base.team == 2 then
-        fillR, fillG, fillB, fillA = 0, 0, 1, 0.15
-        lineR, lineG, lineB, lineA = 0, 0, 1, 0.4
-    end
-
-    -- Draw each hex in range (only passable terrain)
-    love.graphics.setColor(fillR, fillG, fillB, fillA)
+    -- Fill the tiles with a faint team-colored overlay
+    local r, g, b = 0.8, 0.8, 0.8
+    if base.getColor then r, g, b = base:getColor() end
+    love.graphics.setColor(r, g, b, 0.12)
     for _, hex in ipairs(visited) do
         local tile = self.map:getTile(hex.col, hex.row)
-        if tile then
-            local points = tile.points
-            love.graphics.polygon("fill", points)
+        if tile and tile.points then
+            love.graphics.polygon("fill", tile.points)
         end
     end
 
     -- Draw outline for hexes in range
-    love.graphics.setColor(lineR, lineG, lineB, lineA)
+    love.graphics.setColor(r, g, b, 0.4)
     for _, hex in ipairs(visited) do
         local tile = self.map:getTile(hex.col, hex.row)
-        if tile then
-            local points = tile.points
-            love.graphics.polygon("line", points)
+        if tile and tile.points then
+            love.graphics.polygon("line", tile.points)
         end
     end
+    love.graphics.setColor(1,1,1,1)
 end
 
 function Game:drawUI()
@@ -1532,7 +1732,7 @@ function Game:mousepressed(x, y, button)
                 for _, p in ipairs(self.pieces) do p:resetMove() end
                 pcall(function()
                     if Network and Network.send and Network.isConnected and Network.isConnected() then
-                        Network.send({type = "startPlay"})
+                        self:sendCommit({type = "startPlay"})
                     end
                 end)
             end
@@ -1600,7 +1800,16 @@ function Game:mousepressed(x, y, button)
                     return
                 end
 
-                -- Apply strike to any piece at that tile
+                -- If networked client, send request to host and wait for authoritative commit
+                if Network and Network.isConnected and Network.isConnected() and not self.isHost and not self._applyingRemote then
+                    pcall(function()
+                        Network.send({type = "airstrikeRequest", col = col, row = row, team = at.team, baseCol = base.col, baseRow = base.row, cost = at.cost})
+                    end)
+                    self.airstrikeTargeting = nil
+                    return
+                end
+
+                -- Host or local apply: Apply strike to any piece at that tile
                 local targetPiece = self:getPieceAt(col, row)
                 local strikeDamage = 6
                 if targetPiece then
@@ -1613,6 +1822,12 @@ function Game:mousepressed(x, y, button)
                             end
                         end
                     end
+                end
+                -- If host, broadcast commit
+                if self.isHost and Network and Network.isConnected and Network.isConnected() and not self._applyingRemote then
+                    pcall(function()
+                        self:sendCommit({type = "airstrike", col = col, row = row, team = at.team, damage = strikeDamage})
+                    end)
                 end
                 self.airstrikeTargeting = nil
                 return
@@ -1830,6 +2045,15 @@ function Game:triggerMineAt(col, row, mover)
             end
         end
     end
+    -- If host, broadcast that the mine was triggered and removed so peers can apply damage and remove it.
+    -- We must broadcast even when currently applying a remote request (self._applyingRemote may be true),
+    -- `sendCommit` temporarily clears that flag while sending, so allow sends unconditionally here.
+    if self.isHost and Network and Network.isConnected and Network.isConnected() then
+        pcall(function()
+            self:sendCommit({type = "mineTriggered", col = col, row = row, moverCol = mover.col, moverRow = mover.row, moverTeam = mover.team, damage = dmg, killed = wasKilled and 1 or 0})
+            self:sendCommit({type = "removeMine", col = col, row = row})
+        end)
+    end
 
     return true
 end
@@ -1845,9 +2069,16 @@ function Game:sweepForMines(piece)
             if mine.team == piece.team then
                 goto continue
             end
-            if self:isWithinRange(piece.col, piece.row, mine.col, mine.row, range) then
+                if self:isWithinRange(piece.col, piece.row, mine.col, mine.row, range) then
                 mine.revealedTo = mine.revealedTo or {}
+                local already = mine.revealedTo[piece.team]
                 mine.revealedTo[piece.team] = true
+                if not already and self.isHost and Network and Network.isConnected and Network.isConnected() then
+                    pcall(function()
+                        print(string.format("[game] host sending revealMine -> team=%s col=%s row=%s", tostring(piece.team), tostring(mine.col), tostring(mine.row)))
+                        self:sendCommit({type = "revealMine", col = mine.col, row = mine.row, team = piece.team, mineTeam = mine.team})
+                    end)
+                end
             end
         end
         ::continue::
@@ -1868,6 +2099,12 @@ function Game:disarmMine(piece, mine)
     -- Reward engineer with 1 resource
     if piece.stats and piece.stats.canBuild then
         self.teamResources[piece.team] = (self.teamResources[piece.team] or 0) + 1
+    end
+    -- If host, broadcast removal so peers mirror the disarm
+    if self.isHost and Network and Network.isConnected and Network.isConnected() then
+        pcall(function()
+            self:sendCommit({type = "removeMine", col = mine.col, row = mine.row})
+        end)
     end
 end
 
@@ -2222,14 +2459,45 @@ function Game:executeAction(option)
     elseif option.id == "sweep_mines" and contextType == "piece" then
         -- Sweep action: reveal mines within piece's view range for this team
         if context then
-            self:sweepForMines(context)
+            -- If networked client, request host to perform sweep (host will broadcast reveals)
+            if Network and Network.isConnected and Network.isConnected() and not self.isHost and not self._applyingRemote then
+                pcall(function()
+                    Network.send({type = "sweepMinesRequest", col = context.col, row = context.row, team = context.team})
+                end)
+            else
+                self:sweepForMines(context)
+                -- If host, broadcast any new reveals to peers
+                if self.isHost and Network and Network.isConnected and Network.isConnected() then
+                    for _, mine in ipairs(self.mines or {}) do
+                        if mine.revealedTo and mine.revealedTo[context.team] then
+                            -- notify clients this mine is revealed to context.team
+                            pcall(function()
+                                self:sendCommit({type = "revealMine", col = mine.col, row = mine.row, team = context.team, mineTeam = mine.team})
+                            end)
+                        end
+                    end
+                end
+            end
             -- consume turn for this piece
             context.hasMoved = true
         end
     elseif option.id == "disarm_mine" and contextType == "piece" then
         -- Disarm a revealed neighboring mine (option carries the targetMine)
         if option.targetMine then
-            self:disarmMine(context, option.targetMine)
+            -- If networked client, request host to disarm (host will remove and broadcast)
+            if Network and Network.isConnected and Network.isConnected() and not self.isHost and not self._applyingRemote then
+                pcall(function()
+                    Network.send({type = "disarmMineRequest", col = option.targetMine.col, row = option.targetMine.row, team = context.team})
+                end)
+            else
+                self:disarmMine(context, option.targetMine)
+                -- If host, broadcast removal to peers
+                if self.isHost and Network and Network.isConnected and Network.isConnected() then
+                    pcall(function()
+                        self:sendCommit({type = "removeMine", col = option.targetMine.col, row = option.targetMine.row})
+                    end)
+                end
+            end
             context.hasMoved = true
         end
     elseif option.id == "deconstruct" and contextType == "base" then
@@ -2705,16 +2973,18 @@ function Game:movePiece(col, row)
         end
 
         self.selectedPiece:setPosition(col, row)
-        -- Check for mines triggered by moving into this tile
-        self:triggerMineAt(col, row, self.selectedPiece)
         self:calculateValidMoves()
         -- Send network update (mirror) if connected and this is a local action
         if Network and Network.isConnected and Network.isConnected() and not self._applyingRemote then
             if self.isHost then
                 pcall(function() print(string.format("[game] host commit move %d,%d -> %d,%d", oldCol, oldRow, col, row)) end)
+                -- Broadcast move commit before triggering any mines so clients will move their piece first
                 self:sendCommit({type = "move", fromCol = oldCol, fromRow = oldRow, toCol = col, toRow = row})
             end
         end
+
+        -- Check for mines triggered by moving into this tile (host will broadcast mine commits)
+        self:triggerMineAt(col, row, self.selectedPiece)
         -- Deselect the piece after moving so it isn't left selected when the turn ends
         if self.selectedPiece then
             self.selectedPiece:deselect(self)
@@ -2750,26 +3020,30 @@ function Game:movePiece(col, row)
             end
             -- Only move to the enemy tile if we killed them and attack was adjacent
             if self:isWithinRange(self.selectedPiece.col, self.selectedPiece.row, col, row, 1) then
-                self.selectedPiece:setPosition(col, row)
-                -- Check for mines when attacker moves into the tile after killing
-                self:triggerMineAt(col, row, self.selectedPiece)
+                    self.selectedPiece:setPosition(col, row)
+                    -- Host will broadcast the attack commit first; mine triggers will be processed
+                    -- after broadcasting so clients apply the movement before damage commits.
             end
         end
         -- Send network update for attack (include whether attacker moved into target)
         if Network and Network.isConnected and Network.isConnected() and not self._applyingRemote then
+            -- Determine whether attacker moved into the target (killed and adjacent from old position)
+            local movedInto = (wasKilled and self:isWithinRange(oldCol, oldRow, col, row, 1))
             -- If this is a networked client, send request and do not apply local attack effects
             if not self.isHost then
-                local movedInto = (wasKilled and self:isWithinRange(self.selectedPiece.col, self.selectedPiece.row, col, row, 1))
                 pcall(function()
                     Network.send({type = "attackRequest", fromCol = oldCol, fromRow = oldRow, toCol = col, toRow = row, damage = damage, moved = movedInto, team = self.localTeam})
                 end)
                 -- Client should wait for authoritative commit; stop here
                 return
             else
-                local movedInto = (wasKilled and self:isWithinRange(self.selectedPiece.col, self.selectedPiece.row, col, row, 1))
                 pcall(function()
                     self:sendCommit({type = "attack", fromCol = oldCol, fromRow = oldRow, toCol = col, toRow = row, damage = damage, moved = movedInto})
                 end)
+                -- After broadcasting, host should authoritative trigger any mine effects caused by movement
+                if movedInto and self.selectedPiece then
+                    self:triggerMineAt(col, row, self.selectedPiece)
+                end
             end
         end
         -- If enemy survived, attacker stays in place (no movement)
@@ -2808,6 +3082,10 @@ function Game:keypressed(key)
         self.camera:pan(20, 0)  -- Move left
     elseif key == "d" then
         self.camera:pan(-20, 0)  -- Move right
+    elseif key == "f1" then
+        -- Toggle developer mode: allows fast placement and relaxed checks for testing
+        self.devMode = not self.devMode
+        pcall(function() print(string.format("[game] devMode -> %s", tostring(self.devMode))) end)
     end
 end
 
@@ -2905,16 +3183,13 @@ function Game:endTurn()
     if self.selectedPiece then
         self.selectedPiece:deselect(self)
     end
-    if self.selectedPiece then
-        self.selectedPiece:deselect(self)
-    end
 
     -- If host, broadcast any bases that were just completed/placed during this turn so peers register them
     if self.isHost and Network and Network.isConnected and Network.isConnected() then
         for _, b in ipairs(self.bases) do
             if b.justPlaced then
                 pcall(function()
-                    Network.send({type = "placeBase", team = b.team, col = b.col, row = b.row, baseType = b.type})
+                    self:sendCommit({type = "placeBase", team = b.team, col = b.col, row = b.row, baseType = b.type})
                 end)
                 b.justPlaced = nil
             end
@@ -2923,7 +3198,7 @@ function Game:endTurn()
         for _, p in ipairs(self.pieces) do
             if p.justPlaced then
                 pcall(function()
-                    Network.send({type = "placePiece", team = p.team, col = p.col, row = p.row, unitType = p.type})
+                    self:sendCommit({type = "placePiece", team = p.team, col = p.col, row = p.row, unitType = p.type})
                 end)
                 p.justPlaced = nil
             end
@@ -2950,7 +3225,7 @@ function Game:endTurn()
         -- Notify remote peer of end-turn (if connected and this is a local action)
         if Network and Network.isConnected and Network.isConnected() and not self._applyingRemote then
             pcall(function()
-                Network.send({type = "endTurn", nextTeam = nextTeam, teamResources1 = self.teamResources[1], teamResources2 = self.teamResources[2], teamOil1 = self.teamOil[1], teamOil2 = self.teamOil[2]})
+                self:sendCommit({type = "endTurn", nextTeam = nextTeam, teamResources1 = self.teamResources[1], teamResources2 = self.teamResources[2], teamOil1 = self.teamOil[1], teamOil2 = self.teamOil[2]})
             end)
         end
     end
@@ -2997,9 +3272,11 @@ function Game:placePiece(col, row, team)
     end
     
     local teamToPlace = team or self.placementTeam
-    -- Check if position is within the team's starting area
-    if not self:isInStartingArea(col, row, teamToPlace) then
-        return  -- Can't place outside starting area
+    -- Check if position is within the team's starting area (unless devMode is enabled)e
+    if not self.devMode then
+        if not self:isInStartingArea(col, row, teamToPlace) then
+            return  -- Can't place outside starting area
+        end
     end
     
     -- Check if tile is already occupied
@@ -3037,7 +3314,7 @@ function Game:placePiece(col, row, team)
                 pcall(function() print("[game] both teams finished pieces — entering base placement phase") end)
                 if Network and Network.isConnected and Network.isConnected() and not self._applyingRemote then
                     pcall(function()
-                        Network.send({type = "placementPhase", phase = "bases"})
+                        self:sendCommit({type = "placementPhase", phase = "bases"})
                     end)
                 end
             end
@@ -3055,9 +3332,11 @@ function Game:placeBase(col, row, team)
     
     -- Determine which team is placing (allow optional team arg)
     local teamToPlace = team or self.placementTeam
-    -- Check if position is within the team's starting area
-    if not self:isInStartingArea(col, row, teamToPlace) then
-        return  -- Can't place outside starting area
+    -- Check if position is within the team's starting area (unless devMode is enabled)
+    if not self.devMode then
+        if not self:isInStartingArea(col, row, teamToPlace) then
+            return  -- Can't place outside starting area
+        end
     end
     pcall(function() print(string.format("[game] placeBase attempt team=%s col=%s row=%s placementPhase=%s", tostring(teamToPlace), tostring(col), tostring(row), tostring(self.placementPhase))) end)
     
@@ -3076,21 +3355,16 @@ function Game:placeBase(col, row, team)
                 end)
                 return
             end
-            -- Place this base (host or local play)
-            base:setPosition(col, row)
-            self.basesPlaced = self.basesPlaced + 1
-            pcall(function() print(string.format("[game] placed base %s for team=%s at %d,%d", tostring(base.type), tostring(teamToPlace), col, row)) end)
+
+            -- Local placement (host or single-player): delegate to helper
+            self:applyPlaceBase(teamToPlace, col, row, base.type)
+
             -- If host, broadcast commit
             if Network and Network.isConnected and Network.isConnected() and self.isHost and not self._applyingRemote then
                 self:sendCommit({type = "placeBase", team = teamToPlace, col = col, row = row, baseType = base.type})
             end
-                    -- Update fog visibility immediately so presence/vision of the base is recognized
-                    if self.fogOfWar then
-                        self.fogOfWar:updateVisibility(1, self.pieces, self.bases, self.teamStartingCorners)
-                        self.fogOfWar:updateVisibility(2, self.pieces, self.bases, self.teamStartingCorners)
-                    end
-            
-            -- Check if both teams have finished placing bases; if so, start the game
+
+            -- Check if both teams have finished placing bases; if so, move to ready phase
             local team1Bases = 0
             local team2Bases = 0
             for _, b in ipairs(self.bases) do
@@ -3098,16 +3372,13 @@ function Game:placeBase(col, row, team)
                 if b.team == 2 and b.col > 0 and b.row > 0 then team2Bases = team2Bases + 1 end
             end
             if team1Bases >= self.basesPerTeam and team2Bases >= self.basesPerTeam then
-                -- Both teams have placed bases: move to ready phase, require both players to ready-up
                 self.placementPhase = "ready"
                 pcall(function() print("[game] both teams finished bases — entering ready phase") end)
-                -- Notify peer
                 if Network and Network.isConnected and Network.isConnected() and not self._applyingRemote then
                     pcall(function()
-                        Network.send({type = "placementPhase", phase = "ready"})
+                        self:sendCommit({type = "placementPhase", phase = "ready"})
                     end)
                 end
-                -- Do not start the game until both players press Ready (host will send startPlay)
             end
             return
         end

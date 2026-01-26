@@ -122,6 +122,14 @@ function M.methods:placeMine(game)
     mine.revealedTo[self.team] = true
 
     table.insert(self.placedMines, mine)
+    -- If networked client, send request to host instead of applying locally
+    if Network and Network.isConnected and Network.isConnected() and not game.isHost and not game._applyingRemote then
+        pcall(function()
+            Network.send({type = "placeMineRequest", col = mine.col, row = mine.row, team = mine.team})
+        end)
+        return true
+    end
+
     game:addMine(mine)
     return true
 end
