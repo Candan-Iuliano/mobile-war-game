@@ -57,6 +57,24 @@ function Piece.new(pieceType, team, gameMap, col, row)
     return self
 end
 
+-- Default hooks for piece-specific behavior (can be overridden by type modules)
+function Piece:getMoveCost(fromCol, fromRow, toCol, toRow)
+    -- Return table of resource costs for moving this piece (e.g., { oil = 1 })
+    -- Default: no extra cost
+    return {}
+end
+
+function Piece:onMove(game, fromCol, fromRow, toCol, toRow)
+    -- Hook invoked after a move is applied. Default: mark as moved.
+    if self.hasMoved == nil then self.hasMoved = true else self.hasMoved = true end
+end
+
+function Piece:getBuildCosts()
+    -- For unit types that define build costs, return table (e.g., { oil = 1 })
+    -- Default: none
+    return {}
+end
+
 function Piece:getMovementRange()
     return self.stats.moveRange
 end

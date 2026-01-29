@@ -691,16 +691,41 @@ function Game:handleNetworkMessage(msg)
             local toCol = tonumber(msg.toCol)
             local toRow = tonumber(msg.toRow)
             if fromCol and fromRow and toCol and toRow then
+                -- Validate move costs using piece hook and deduct on host
+                local mover = self:getPieceAt(fromCol, fromRow)
+                if mover and mover.getMoveCost then
+                    local costs = mover:getMoveCost(fromCol, fromRow, toCol, toRow) or {}
+                    -- Check affordability
+                    for k, v in pairs(costs) do
+                        if k == "oil" then
+                            if (self.teamOil[mover.team] or 0) < v then
+                                pcall(function() print(string.format("[game] host rejecting moveRequest: insufficient %s for team=%s", tostring(k), tostring(mover.team))) end)
+                                goto skip_move_request
+                            end
+                        else
+                            -- other resources could be supported here
+                        end
+                    end
+                    -- Deduct costs
+                    for k, v in pairs(costs) do
+                        if k == "oil" then
+                            self.teamOil[mover.team] = (self.teamOil[mover.team] or 0) - v
+                        end
+                    end
+                end
+
+                -- Apply move now that costs are validated/deducted
                 self:applyRemoteMove({fromCol = fromCol, fromRow = fromRow, toCol = toCol, toRow = toRow})
                 -- After applying move on host, check for mine trigger at destination and handle it (host authoritative)
-                local mover = self:getPieceAt(toCol, toRow)
-                if mover then
+                local mover2 = self:getPieceAt(toCol, toRow)
+                if mover2 then
                     -- Broadcast authoritative commit for the move first so clients apply the move
                     -- and then apply any mine-trigger effects that follow.
                     self:sendCommit({type = "move", fromCol = fromCol, fromRow = fromRow, toCol = toCol, toRow = toRow})
                     -- Now host checks for mine trigger at destination and handle it (host authoritative)
-                    self:triggerMineAt(toCol, toRow, mover)
+                    self:triggerMineAt(toCol, toRow, mover2)
                 end
+                ::skip_move_request::
             end
         end
     elseif msg.type == "startBuildingRequest" then
@@ -737,6 +762,18 @@ function Game:handleNetworkMessage(msg)
             local attacker = self:getPieceAt(amsg.fromCol, amsg.fromRow)
             local target = self:getPieceAt(amsg.toCol, amsg.toRow)
             if attacker and attacker.useAmmo then attacker:useAmmo() end
+            -- If this attack involves moving into target (moved flag), and attacker is a tank,
+            -- enforce oil requirement: if insufficient, cancel movement portion.
+            if amsg.moved and attacker and attacker.type == "tank" then
+                local team = attacker.team
+                local oilCost = 1
+                if (self.teamOil[team] or 0) < oilCost then
+                    amsg.moved = false
+                    pcall(function() print(string.format("[game] host canceling moved flag for attack: insufficient oil team=%s", tostring(team))) end)
+                else
+                    self.teamOil[team] = (self.teamOil[team] or 0) - oilCost
+                end
+            end
                 if target then
                     local wasKilled = target:takeDamage(amsg.damage)
                     if wasKilled then
@@ -1000,7 +1037,28 @@ function Game:handleNetworkMessage(msg)
             local col = tonumber(msg.col)
             local row = tonumber(msg.row)
             local unitType = msg.unitType
-            if team and col and row and unitType then
+            local baseCol = tonumber(msg.baseCol)
+            local baseRow = tonumber(msg.baseRow)
+            local cost = tonumber(msg.cost) or 0
+            if team and col and row and unitType and baseCol and baseRow then
+                -- Validate base ownership and target tile
+                local base = self:getBaseAt(baseCol, baseRow)
+                if not base or base.team ~= team then return end
+                local tile = self.map and self.map:getTile(col, row)
+                if not tile or not tile.isLand then return end
+                if self:getPieceAt(col, row) or self:getBaseAt(col, row) or self:getResourceAt(col, row) then return end
+                -- Ensure target is within reasonable range of base (2 tiles)
+                if not self:isWithinRange(baseCol, baseRow, col, row, 2) then return end
+
+                -- Oil requirement for tanks
+                local oilCost = (unitType == "tank") and 1 or 0
+                if (self.teamResources[team] or 0) < cost then return end
+                if (self.teamOil[team] or 0) < oilCost then return end
+
+                -- Deduct resources and oil, then create unit
+                self.teamResources[team] = self.teamResources[team] - cost
+                if oilCost > 0 then self.teamOil[team] = self.teamOil[team] - oilCost end
+
                 self:addPiece(unitType, team, col, row)
                 -- Broadcast commit as placePiece
                 self:sendCommit({type = "placePiece", team = team, col = col, row = row, unitType = unitType})
@@ -1203,10 +1261,19 @@ function Game:applyRemoteMove(msg)
     if not piece then return end
     -- Move without validating team/turn (mirroring remote)
     piece:setPosition(toCol, toRow)
+    -- Invoke piece hook for any post-move behavior (host-only side-effects handled inside hook)
+    if piece.onMove then
+        pcall(function() piece:onMove(self, fromCol, fromRow, toCol, toRow) end)
+    end
     -- Do NOT trigger mines here; host will authoritatively send a mineTriggered commit when needed
-    -- If this piece was selected locally, deselect it now that the move is applied
+    -- Recalculate valid moves/attacks if this piece is currently selected so UI remains correct
     if self.selectedPiece and self.selectedPiece == piece then
-        piece:deselect(self)
+        self:calculateValidMoves()
+        -- Only deselect if this is NOT the local player's piece. Keep selection for local team so
+        -- players can immediately perform a follow-up attack after a move.
+        if not (self.localTeam and piece.team == self.localTeam) then
+            piece:deselect(self)
+        end
     end
 end
 
@@ -1565,6 +1632,13 @@ function Game:drawUI()
             love.graphics.print(string.format("Team Blue remaining: %d  |  Ready: %s", rem2, tostring(self.playerReady[2])), 10, 52)
             love.graphics.setFont(love.graphics.newFont(10))
             love.graphics.print("Place your pieces on your starting area. Click the Ready button when done.", 10, 74)
+            -- Dev-mode control hint
+            if self.devMode then
+                local ctrl = "Both"
+                if self.localTeam == 1 then ctrl = "Red" elseif self.localTeam == 2 then ctrl = "Blue" end
+                love.graphics.setFont(love.graphics.newFont(10))
+                love.graphics.print(string.format("Dev Control: %s  (Tab to toggle placement team; 1/2 to lock team; 0 for both)", ctrl), 10, 92)
+            end
         else
             -- Base placement phase
             local team1Bases, team2Bases = 0, 0
@@ -1578,6 +1652,12 @@ function Game:drawUI()
             love.graphics.print(string.format("Team Blue bases remaining: %d", brem2), 10, 52)
             love.graphics.setFont(love.graphics.newFont(10))
             love.graphics.print("Place your bases (HQ, Ammo, Supply, Airbase) on your starting area.", 10, 74)
+            if self.devMode then
+                local ctrl = "Both"
+                if self.localTeam == 1 then ctrl = "Red" elseif self.localTeam == 2 then ctrl = "Blue" end
+                love.graphics.setFont(love.graphics.newFont(10))
+                love.graphics.print(string.format("Dev Control: %s  (Tab to toggle placement team; 1/2 to lock team; 0 for both)", ctrl), 10, 92)
+            end
         end
 
         -- Draw Ready button for local player
@@ -1724,8 +1804,9 @@ function Game:mousepressed(x, y, button)
                     Network.send({type = "ready", team = t, ready = self.playerReady[t]})
                 end
             end)
-            -- If host and both ready, start the game
-            if self.isHost and self.playerReady[1] and self.playerReady[2] then
+            -- If host or offline (single-player/dev) and both ready, start the game
+            local offline = not (Network and Network.isConnected and Network.isConnected and Network.isConnected())
+            if (self.isHost or offline) and self.playerReady[1] and self.playerReady[2] then
                 self.state = "playing"
                 self.turnCount = 1
                 self.currentTurn = 1
@@ -2423,16 +2504,8 @@ function Game:executeAction(option)
         -- Build a sniper near the base
         self:buildUnitNearBase(context, "sniper", team, option.cost)
     elseif option.id == "build_tank" and contextType == "base" then
-        -- Build a tank near the base
-        -- Tanks require oil in addition to generic resources
-        local oilCost = 1
-        if self.teamOil[team] and self.teamOil[team] >= oilCost then
-            self.teamOil[team] = self.teamOil[team] - oilCost
-            self:buildUnitNearBase(context, "tank", team, option.cost)
-        else
-            -- Not enough oil: do nothing (could show message)
-            return
-        end
+        -- Build a tank near the base (oil requirement enforced server-side)
+        self:buildUnitNearBase(context, "tank", team, option.cost)
     elseif option.id == "build_engineer" and contextType == "base" then
         -- Build an engineer near the base
         self:buildUnitNearBase(context, "engineer", team, option.cost)
@@ -2544,7 +2617,16 @@ function Game:buildUnitNearBase(base, unitType, team, cost)
         return
     end
 
-    -- Deduct cost
+    -- Oil requirement for tanks: if building locally on host, ensure oil is available and deduct it.
+    local oilCost = (unitType == "tank") and 1 or 0
+    if self.isHost and oilCost > 0 then
+        if (self.teamOil[team] or 0) < oilCost then
+            return
+        end
+        self.teamOil[team] = self.teamOil[team] - oilCost
+    end
+
+    -- Deduct cost (generic resources)
     self.teamResources[team] = self.teamResources[team] - cost
     
     -- Find an adjacent empty land tile to place the unit
@@ -2559,14 +2641,23 @@ function Game:buildUnitNearBase(base, unitType, team, cost)
             if not self:getPieceAt(neighbor.col, neighbor.row) and 
                not self:getBaseAt(neighbor.col, neighbor.row) and
                not self:getResourceAt(neighbor.col, neighbor.row) then
-                -- If networked client, request host to build unit
+                -- If networked client, validate locally (enforce oil/resource) then request host to build unit (do NOT deduct locally)
+                local oilCost = (unitType == "tank") and 1 or 0
                 if Network and Network.isConnected and Network.isConnected() and not self.isHost and not self._applyingRemote then
+                    -- Client-side enforcement: require both generic resources and oil available before sending request
+                    if (self.teamResources[team] or 0) < cost then return end
+                    if (self.teamOil[team] or 0) < oilCost then return end
                     pcall(function()
                         Network.send({type = "buildUnitRequest", baseCol = base.col, baseRow = base.row, unitType = unitType, team = team, col = neighbor.col, row = neighbor.row, cost = cost})
                     end)
                     return
                 end
                 -- Place unit here (host or local)
+                -- If host building, deduct oilCost here (host authoritative)
+                if self.isHost and oilCost > 0 then
+                    if (self.teamOil[team] or 0) < oilCost then return end
+                    self.teamOil[team] = self.teamOil[team] - oilCost
+                end
                 self:addPiece(unitType, team, neighbor.col, neighbor.row)
                 -- Host will broadcast at end-turn or can commit immediately
                 if self.isHost and Network and Network.isConnected and Network.isConnected() and not self._applyingRemote then
@@ -2651,27 +2742,43 @@ function Game:calculateValidMoves()
     
     if not self.selectedPiece then return end
     
-    -- If piece has already moved this turn or is currently building, don't show any moves
-    -- Make sure to handle pieces without building properties (old pieces)
+    -- If piece is currently building, don't show any moves or attacks
     local isBuilding = self.selectedPiece.isBuilding or false
-    if self.selectedPiece.hasMoved or isBuilding then
-        return
-    end
+    if isBuilding then return end
+
+    -- If the piece has already moved this turn, do not populate `validMoves` (can't move again),
+    -- but still compute `validAttacks` so a unit may move then attack.
+    local hasMovedAlready = self.selectedPiece.hasMoved or false
     
     local moveRange = self.selectedPiece:getMovementRange()
     local attackRange = self.selectedPiece:getAttackRange()
     
     -- Get all neighbors within move range (enemy pieces block movement)
-    local visited = {}
-    self:getHexesWithinRange(self.selectedPiece.col, self.selectedPiece.row, moveRange, visited, self.selectedPiece.team)
-    
-    for _, hex in ipairs(visited) do
-        if hex.col ~= self.selectedPiece.col or hex.row ~= self.selectedPiece.row then
-            local tile = self.map:getTile(hex.col, hex.row)
-            if tile and tile.isLand and not self:getPieceAt(hex.col, hex.row) then
-                -- Only allow moving to tiles visible to this piece's team
-                if self.fogOfWar and self.fogOfWar:isTileVisible(self.selectedPiece.team, hex.col, hex.row) then
-                    table.insert(self.validMoves, hex)
+    if not hasMovedAlready then
+        local visited = {}
+        self:getHexesWithinRange(self.selectedPiece.col, self.selectedPiece.row, moveRange, visited, self.selectedPiece.team)
+        -- Build a quick lookup set for tiles reachable by movement range
+        local allowedSet = {}
+        for _, h in ipairs(visited) do allowedSet[h.col .. "," .. h.row] = true end
+
+        for _, hex in ipairs(visited) do
+            if hex.col ~= self.selectedPiece.col or hex.row ~= self.selectedPiece.row then
+                local tile = self.map:getTile(hex.col, hex.row)
+                if tile and tile.isLand and not self:getPieceAt(hex.col, hex.row) then
+                    -- Only allow moving to tiles visible to this piece's team AND which have
+                    -- a continuous path of visible tiles back to the piece
+                    if self.fogOfWar then
+                        if self.fogOfWar:isTileVisible(self.selectedPiece.team, hex.col, hex.row) then
+                            if self:hasVisiblePath(self.selectedPiece.col, self.selectedPiece.row, hex.col, hex.row, self.selectedPiece.team, allowedSet) then
+                                table.insert(self.validMoves, hex)
+                            end
+                        end
+                    else
+                        -- No fog system: allow based on connectivity only
+                        if self:hasVisiblePath(self.selectedPiece.col, self.selectedPiece.row, hex.col, hex.row, self.selectedPiece.team, allowedSet) then
+                            table.insert(self.validMoves, hex)
+                        end
+                    end
                 end
             end
         end
@@ -2767,6 +2874,56 @@ function Game:getHexesWithinRange(col, row, range, visited, team)
         end
         ::continue::
     end
+end
+
+
+-- Return true if there exists a path from (startCol,startRow) to (targetCol,targetRow)
+-- traveling only through tiles that are passable (land), optionally limited to tiles in allowedSet,
+-- and (when fogOfWar is present) only through tiles visible to `team`.
+function Game:hasVisiblePath(startCol, startRow, targetCol, targetRow, team, allowedSet)
+    if not startCol or not startRow or not targetCol or not targetRow then return false end
+    if startCol == targetCol and startRow == targetRow then return true end
+    local startHex = self.map:getTile(startCol, startRow)
+    local targetHex = self.map:getTile(targetCol, targetRow)
+    if not startHex or not targetHex then return false end
+
+    local q = {{col = startCol, row = startRow}}
+    local seen = {}
+    seen[startCol .. "," .. startRow] = true
+
+    while #q > 0 do
+        local cur = table.remove(q, 1)
+        local hex = self.map:getTile(cur.col, cur.row)
+        if not hex then goto continue end
+        local neighbors = self.map:getNeighbors(hex, 1)
+        for _, n in ipairs(neighbors) do
+            local key = n.col .. "," .. n.row
+            if not seen[key] then
+                seen[key] = true
+                -- Respect allowedSet if provided (limit to movement-range reachable tiles)
+                if allowedSet and not allowedSet[key] then goto neighbor_continue end
+                local ntile = self.map:getTile(n.col, n.row)
+                if not ntile or not ntile.isLand then goto neighbor_continue end
+                -- Exclude blocking tiles: enemy-occupied, bases, resources
+                local occ = self:getPieceAt(n.col, n.row)
+                if occ and occ.team ~= team then goto neighbor_continue end
+                -- Allow moving onto a base tile if it is the intended target; otherwise treat bases as blocking
+                if self:getBaseAt(n.col, n.row) and not (n.col == targetCol and n.row == targetRow) then goto neighbor_continue end
+                -- Allow moving onto a resource tile if it is the intended target (so units can occupy resources to build/defend mines)
+                if self:getResourceAt(n.col, n.row) and not (n.col == targetCol and n.row == targetRow) then goto neighbor_continue end
+                -- If fog is enabled, tile must be visible to team to be part of continuous trail
+                if self.fogOfWar and not self.fogOfWar:isTileVisible(team, n.col, n.row) then goto neighbor_continue end
+                -- Tile is passable for the visible path
+                table.insert(q, {col = n.col, row = n.row})
+                if n.col == targetCol and n.row == targetRow then
+                    return true
+                end
+                ::neighbor_continue::
+            end
+        end
+        ::continue::
+    end
+    return false
 end
 
 -- Get all tiles within a radius regardless of passability (used for airbase influence)
@@ -2965,11 +3122,29 @@ function Game:movePiece(col, row)
     
     if isValidMove then
         -- If networked client, send request to host instead of applying locally
+        -- Tank movement requires oil: client-side check to avoid sending invalid request
+        if self.selectedPiece and self.selectedPiece.type == "tank" then
+            local team = self.selectedPiece.team
+            if (self.teamOil[team] or 0) < 1 then
+                pcall(function() print(string.format("[game] move blocked: insufficient oil for tank team=%s", tostring(team))) end)
+                return
+            end
+        end
         if Network and Network.isConnected and Network.isConnected() and not self.isHost and not self._applyingRemote then
             pcall(function()
                 Network.send({type = "moveRequest", fromCol = oldCol, fromRow = oldRow, toCol = col, toRow = row, team = self.localTeam})
             end)
             return
+        end
+
+        -- If host performing the move locally, deduct tank oil cost here
+        if self.isHost and self.selectedPiece and self.selectedPiece.type == "tank" then
+            local team = self.selectedPiece.team
+            if (self.teamOil[team] or 0) < 1 then
+                pcall(function() print(string.format("[game] host move blocked: insufficient oil for tank team=%s", tostring(team))) end)
+                return
+            end
+            self.teamOil[team] = (self.teamOil[team] or 0) - 1
         end
 
         self.selectedPiece:setPosition(col, row)
@@ -2985,10 +3160,10 @@ function Game:movePiece(col, row)
 
         -- Check for mines triggered by moving into this tile (host will broadcast mine commits)
         self:triggerMineAt(col, row, self.selectedPiece)
-        -- Deselect the piece after moving so it isn't left selected when the turn ends
-        if self.selectedPiece then
-            self.selectedPiece:deselect(self)
-        end
+
+        -- Recalculate valid moves/attacks after any mine effects and keep the piece selected
+        -- so the player can attack after moving if valid targets exist.
+        self:calculateValidMoves()
     elseif isValidAttack and targetPiece then
         -- If networked client, send request to host and don't apply locally
         if Network and Network.isConnected and Network.isConnected() and not self.isHost and not self._applyingRemote then
@@ -3010,7 +3185,7 @@ function Game:movePiece(col, row)
         local damage = self.selectedPiece:getDamage()
         local wasKilled = targetPiece:takeDamage(damage)
 
-        if wasKilled then
+            if wasKilled then
             -- Remove dead piece
             for i, piece in ipairs(self.pieces) do
                 if piece == targetPiece then
@@ -3020,7 +3195,18 @@ function Game:movePiece(col, row)
             end
             -- Only move to the enemy tile if we killed them and attack was adjacent
             if self:isWithinRange(self.selectedPiece.col, self.selectedPiece.row, col, row, 1) then
-                    self.selectedPiece:setPosition(col, row)
+                    -- If moving into the tile is a tank movement and host enforces oil, check/deduct
+                    if self.isHost and self.selectedPiece and self.selectedPiece.type == "tank" then
+                        local team = self.selectedPiece.team
+                        if (self.teamOil[team] or 0) >= 1 then
+                            self.teamOil[team] = (self.teamOil[team] or 0) - 1
+                            self.selectedPiece:setPosition(col, row)
+                        else
+                            pcall(function() print(string.format("[game] host attack movement blocked: insufficient oil for tank team=%s", tostring(team))) end)
+                        end
+                    else
+                        self.selectedPiece:setPosition(col, row)
+                    end
                     -- Host will broadcast the attack commit first; mine triggers will be processed
                     -- after broadcasting so clients apply the movement before damage commits.
             end
@@ -3029,6 +3215,13 @@ function Game:movePiece(col, row)
         if Network and Network.isConnected and Network.isConnected() and not self._applyingRemote then
             -- Determine whether attacker moved into the target (killed and adjacent from old position)
             local movedInto = (wasKilled and self:isWithinRange(oldCol, oldRow, col, row, 1))
+            -- Client-side: if movement would move a tank, ensure oil available; if not, cancel movement flag
+            if movedInto and self.selectedPiece and self.selectedPiece.type == "tank" then
+                local team = self.selectedPiece.team
+                if (self.teamOil[team] or 0) < 1 then
+                    movedInto = false
+                end
+            end
             -- If this is a networked client, send request and do not apply local attack effects
             if not self.isHost then
                 pcall(function()
@@ -3086,6 +3279,41 @@ function Game:keypressed(key)
         -- Toggle developer mode: allows fast placement and relaxed checks for testing
         self.devMode = not self.devMode
         pcall(function() print(string.format("[game] devMode -> %s", tostring(self.devMode))) end)
+    end
+
+    -- Developer controls: switch which team you're controlling in devMode
+    if self.devMode then
+        -- During placement, Tab switches the active placement team (1 <-> 2)
+        if key == "tab" then
+            if self.state == "placing" then
+                self.placementTeam = (self.placementTeam == 1) and 2 or 1
+                pcall(function() print(string.format("[game] placementTeam -> %s", tostring(self.placementTeam))) end)
+            else
+                -- During normal play, Tab toggles local control between teams
+                if not self.localTeam then
+                    self.localTeam = 1
+                else
+                    self.localTeam = (self.localTeam == 1) and 2 or nil
+                end
+                pcall(function() print(string.format("[game] localTeam -> %s", tostring(self.localTeam))) end)
+            end
+            return
+        end
+
+        -- Directly set control to team 1 or 2 with keys '1' and '2'; '0' clears local control
+        if key == "1" then
+            self.localTeam = 1
+            pcall(function() print("[game] localTeam -> 1") end)
+            return
+        elseif key == "2" then
+            self.localTeam = 2
+            pcall(function() print("[game] localTeam -> 2") end)
+            return
+        elseif key == "0" then
+            self.localTeam = nil
+            pcall(function() print("[game] localTeam cleared -> simultaneous placement") end)
+            return
+        end
     end
 end
 
@@ -3204,6 +3432,38 @@ function Game:endTurn()
             end
         end
     end
+
+    -- Capture-on-hold: if the team that just ended its turn has an exclusive piece on an enemy base tile,
+    -- mark the base as pending capture so the enemy has one full turn to contest it.
+    do
+        local team = teamThatEnded
+        for _, b in ipairs(self.bases) do
+            if b.col and b.row and b.col > 0 and b.row > 0 then
+                if b.team and b.team ~= team then
+                    local capturerPresent = false
+                    local ownerPresent = false
+                    for _, p in ipairs(self.pieces) do
+                        if p.col == b.col and p.row == b.row then
+                            if p.team == team then capturerPresent = true end
+                            if p.team == b.team then ownerPresent = true end
+                        end
+                    end
+                    if capturerPresent and not ownerPresent then
+                        -- Mark pending capture by this team; will be resolved when that team next becomes active
+                        b.capturePending = team
+                        b.capturePendingSince = self.turnCount
+                        pcall(function() print(string.format("[game] base at %d,%d pending capture by team %d (was %d)", b.col, b.row, team, b.team)) end)
+                    else
+                        -- If conditions not met, clear any pending flag
+                        if b.capturePending then
+                            b.capturePending = nil
+                            b.capturePendingSince = nil
+                        end
+                    end
+                end
+            end
+        end
+    end
     
     -- Networked games should switch immediately and inform peer; hotseat behavior only when not networked
     if self.hotseatEnabled and (not Network or not Network.isConnected or not Network.isConnected()) then
@@ -3220,6 +3480,41 @@ function Game:endTurn()
         for _, piece in ipairs(self.pieces) do
             if piece.team == self.currentTurn then
                 piece:resetMove()
+            end
+        end
+        -- Resolve any pending base captures for the team that just became active
+        for _, b in ipairs(self.bases) do
+            if b.capturePending and b.capturePending == self.currentTurn then
+                -- Check if capturer still exclusively occupies the base tile
+                local capturerPresent = false
+                local ownerPresent = false
+                for _, p in ipairs(self.pieces) do
+                    if p.col == b.col and p.row == b.row then
+                        if p.team == self.currentTurn then capturerPresent = true end
+                        if p.team == b.team then ownerPresent = true end
+                    end
+                end
+                if capturerPresent and not ownerPresent then
+                    pcall(function() print(string.format("[game] base at %d,%d capture finalized: team %d (was %d)", b.col, b.row, self.currentTurn, b.team)) end)
+                    b.team = self.currentTurn
+                    b.capturePending = nil
+                    b.capturePendingSince = nil
+                    -- Update fog visibility to reflect new base ownership
+                    if self.fogOfWar then
+                        self.fogOfWar:updateVisibility(1, self.pieces, self.bases, self.teamStartingCorners)
+                        self.fogOfWar:updateVisibility(2, self.pieces, self.bases, self.teamStartingCorners)
+                    end
+                    -- Broadcast as placeBase commit for peers
+                    if self.isHost and Network and Network.isConnected and Network.isConnected() and not self._applyingRemote then
+                        pcall(function()
+                            self:sendCommit({type = "placeBase", team = b.team, col = b.col, row = b.row, baseType = b.type})
+                        end)
+                    end
+                else
+                    -- Cancel pending if contested or capturer gone
+                    b.capturePending = nil
+                    b.capturePendingSince = nil
+                end
             end
         end
         -- Notify remote peer of end-turn (if connected and this is a local action)

@@ -145,11 +145,37 @@ function love.draw()
             local jy = menuLayout.startY + (menuLayout.bh + 12) * 3 + 24
             love.graphics.setColor(0.95, 0.95, 0.95)
             love.graphics.rectangle("fill", jx, jy, menuLayout.bw, menuLayout.bh * 2 + 12)
+            -- IP input
             love.graphics.setColor(0,0,0)
             love.graphics.print("Host IP:", jx + 8, jy + 6)
-            love.graphics.print(joinState.ip or "", jx + 80, jy + 6)
+            love.graphics.setColor(1,1,1)
+            local ipBoxX = jx + 80
+            local ipBoxY = jy
+            local ipBoxW = menuLayout.bw - 88
+            local ipBoxH = menuLayout.bh
+            love.graphics.setColor(0.95, 0.95, 0.95)
+            love.graphics.rectangle("fill", ipBoxX, ipBoxY, ipBoxW, ipBoxH)
+            if joinState.focus == "ip" then
+                love.graphics.setColor(1, 0.9, 0.2)
+                love.graphics.rectangle("line", ipBoxX, ipBoxY, ipBoxW, ipBoxH)
+            end
+            love.graphics.setColor(0,0,0)
+            love.graphics.print(joinState.ip or "", ipBoxX + 4, ipBoxY + 6)
+            -- Name input
+            love.graphics.setColor(1,1,1)
             love.graphics.print("Your name:", jx + 8, jy + 6 + menuLayout.bh + 6)
-            love.graphics.print(joinState.guestName or "Guest", jx + 80, jy + 6 + menuLayout.bh + 6)
+            local nameBoxX = jx + 80
+            local nameBoxY = jy + menuLayout.bh + 6
+            local nameBoxW = menuLayout.bw - 88
+            local nameBoxH = menuLayout.bh
+            love.graphics.setColor(0.95, 0.95, 0.95)
+            love.graphics.rectangle("fill", nameBoxX, nameBoxY, nameBoxW, nameBoxH)
+            if joinState.focus == "name" then
+                love.graphics.setColor(1, 0.9, 0.2)
+                love.graphics.rectangle("line", nameBoxX, nameBoxY, nameBoxW, nameBoxH)
+            end
+            love.graphics.setColor(0,0,0)
+            love.graphics.print(joinState.guestName or "Guest", nameBoxX + 4, nameBoxY + 6)
             -- buttons
             love.graphics.setColor(0.2,0.2,0.25)
             love.graphics.rectangle("fill", jx, jy + (menuLayout.bh + 12) * 2, menuLayout.bw/2 - 8, menuLayout.bh, 6,6)
@@ -174,6 +200,13 @@ function love.draw()
         love.graphics.rectangle("fill", hx + 60, hy, lobbyState.w - 60, lobbyState.h)
         love.graphics.setColor(0,0,0)
         love.graphics.print(lobbyState.hostName, hx + 66, hy + 6)
+        -- Show host IP and port for remote players (right-aligned to avoid overlap)
+        love.graphics.setColor(1,1,1)
+        love.graphics.setFont(love.graphics.newFont(11))
+        local hip = lobbyState.hostIP or "127.0.0.1"
+        local hport = lobbyState.hostPort or 22122
+        love.graphics.print("Host IP: " .. hip .. ":" .. tostring(hport), hx + math.max(0, lobbyState.w - 180), hy + 120)
+        love.graphics.setFont(love.graphics.newFont(14))
 
         -- Guest name field
         local gy = hy + lobbyState.h + 12
@@ -222,6 +255,8 @@ function love.mousepressed(x, y, button)
                     gameInstance = Game.new()
                     gameInstance.devMode = true
                     gameInstance.hotseatEnabled = false
+                    -- In dev mode, default control to team 1 but allow switching in-game
+                    gameInstance.localTeam = 1
                     gameInstance.passPending = false
                     gameInstance.pendingNextTeam = nil
                     -- Keep default placement phase so you can place troops in Dev Mode
@@ -237,6 +272,8 @@ function love.mousepressed(x, y, button)
                         guestName = "",
                         focus = "host", -- "host" or "guest" or nil
                         guestConnected = false,
+                        hostIP = Network.getLocalAddress and Network.getLocalAddress() or "127.0.0.1",
+                        hostPort = Network.serverPort or 22122,
                         buttons = {
                             start = {label = "Start Game", x = menuLayout.cx, y = menuLayout.startY + (menuLayout.bh + 12) * 3 + 10, w = menuLayout.bw/2 - 8, h = menuLayout.bh, id = "start"},
                             close = {label = "Close Lobby", x = menuLayout.cx + menuLayout.bw/2 + 8, y = menuLayout.startY + (menuLayout.bh + 12) * 3 + 10, w = menuLayout.bw/2 - 8, h = menuLayout.bh, id = "close"},
@@ -248,8 +285,8 @@ function love.mousepressed(x, y, button)
                     }
                     appState = "lobby"
                 elseif b.id == "join" then
-                    -- Open join dialog
-                    joinState = { ip = "127.0.0.1", guestName = "Guest", focus = "ip" }
+                    -- Open join dialog (accept ip or ip:port)
+                    joinState = { ip = "127.0.0.1:22122", guestName = "Guest", focus = "ip" }
                     return
                 end
                 break

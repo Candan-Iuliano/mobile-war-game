@@ -9,6 +9,7 @@ M.connected = false
 M.inbox = {}
 M._suppressOutgoing = false
 M.acceptedClient = nil
+M.serverPort = nil
 
 local function serialize(tbl)
     local parts = {}
@@ -51,6 +52,7 @@ function M.startServer(port)
     M.server = srv
     M.client = nil
     M.connected = false
+    M.serverPort = port
     print("[network] Server listening on port " .. port)
     return true
 end
@@ -59,6 +61,12 @@ function M.connect(host, port)
     if not M.enabled then
         print("[network] LuaSocket not available; cannot connect")
         return false
+    end
+    -- allow "host:port" in the host string
+    if host and tostring(host):find(":") then
+        local h, p = string.match(tostring(host), "([^:]+):?(%d*)")
+        if h and h ~= "" then host = h end
+        if p and tonumber(p) then port = tonumber(p) end
     end
     host = host or "127.0.0.1"
     port = port or 22122
@@ -82,6 +90,23 @@ function M.connect(host, port)
     M.connected = true
     print("[network] Connected to " .. host .. ":" .. tostring(port))
     return true
+end
+
+-- Return a best-effort local IP address for display (does not send packets)
+function M.getLocalAddress()
+    if not M.enabled then return "127.0.0.1" end
+    local udp = socket.udp()
+    if not udp then return "127.0.0.1" end
+    -- Connect to a public DNS server (no data sent) to get outbound interface
+    local ok, err = pcall(function() udp:setpeername("8.8.8.8", 80) end)
+    if not ok then
+        pcall(function() udp:close() end)
+        return "127.0.0.1"
+    end
+    local ip, _ = udp:getsockname()
+    pcall(function() udp:close() end)
+    if ip and ip ~= "" then return ip end
+    return "127.0.0.1"
 end
 
 function M.disconnect()

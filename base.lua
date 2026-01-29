@@ -66,7 +66,7 @@ function Base:getColor()
 end
 
 function Base:draw(pixelX, pixelY, hexSideLength)
-    local size = hexSideLength * 0.6
+    local size = hexSideLength * 0.9
     local r, g, b = self:getColor()
     
     -- TODO: Replace with image assets later
@@ -76,13 +76,19 @@ function Base:draw(pixelX, pixelY, hexSideLength)
     -- end
     
     -- Draw different generic shapes for each base type
+    -- Draw a larger, semi-transparent base background so pieces on same tile remain visible
+    love.graphics.setColor(r, g, b, 0.18)
+    love.graphics.circle("fill", pixelX, pixelY, size * 0.6)
+    love.graphics.setColor(r, g, b, 0.6)
+    love.graphics.circle("line", pixelX, pixelY, size * 0.62)
+
     if self.type == "hq" then
-        -- HQ: Pentagon
+        -- HQ: Pentagon (drawn smaller on top of background)
         love.graphics.setColor(r, g, b)
         local points = {}
         for i = 0, 4 do
             local angle = (i * 2 * math.pi / 5) - math.pi / 2
-            local radius = size * 0.5
+            local radius = size * 0.36
             table.insert(points, pixelX + radius * math.cos(angle))
             table.insert(points, pixelY + radius * math.sin(angle))
         end
@@ -91,12 +97,12 @@ function Base:draw(pixelX, pixelY, hexSideLength)
         love.graphics.polygon("line", points)
         
     elseif self.type == "supplyDepot" then
-        -- Ammo Depot: Hexagon
+        -- Supply Depot: Hexagon (smaller icon)
         love.graphics.setColor(r, g, b)
         local points = {}
         for i = 0, 5 do
             local angle = (i * 2 * math.pi / 6) - math.pi / 2
-            local radius = size * 0.5
+            local radius = size * 0.36
             table.insert(points, pixelX + radius * math.cos(angle))
             table.insert(points, pixelY + radius * math.sin(angle))
         end
@@ -105,40 +111,40 @@ function Base:draw(pixelX, pixelY, hexSideLength)
         love.graphics.polygon("line", points)
         
     elseif self.type == "ammoDepot" then
-        -- Supply Depot: Triangle
+        -- Ammo Depot: Triangle (smaller icon)
         love.graphics.setColor(r, g, b)
         local points = {
-            pixelX, pixelY - size * 0.5,
-            pixelX - size * 0.4, pixelY + size * 0.4,
-            pixelX + size * 0.4, pixelY + size * 0.4
+            pixelX, pixelY - size * 0.36,
+            pixelX - size * 0.28, pixelY + size * 0.28,
+            pixelX + size * 0.28, pixelY + size * 0.28
         }
         love.graphics.polygon("fill", points)
         love.graphics.setColor(0, 0, 0)
         love.graphics.polygon("line", points)
         
     else
-        -- Default: Square
+        -- Default: Square (smaller icon on top of background)
         love.graphics.setColor(r, g, b)
-        love.graphics.rectangle("fill", pixelX - size/2, pixelY - size/2, size, size)
+        love.graphics.rectangle("fill", pixelX - size * 0.36, pixelY - size * 0.36, size * 0.72, size * 0.72)
         love.graphics.setColor(0, 0, 0)
-        love.graphics.rectangle("line", pixelX - size/2, pixelY - size/2, size, size)
+        love.graphics.rectangle("line", pixelX - size * 0.36, pixelY - size * 0.36, size * 0.72, size * 0.72)
     end
     -- Airbase visual
     if self.type == "airbase" then
         love.graphics.setColor(1, 1, 1)
         -- Draw a simple airplane/star icon: central circle + two wings
         love.graphics.setColor(r, g, b)
-        love.graphics.circle("fill", pixelX, pixelY, size * 0.4)
+        love.graphics.circle("fill", pixelX, pixelY, size * 0.36)
         love.graphics.setColor(0, 0, 0)
-        love.graphics.circle("line", pixelX, pixelY, size * 0.4)
+        love.graphics.circle("line", pixelX, pixelY, size * 0.36)
         -- left wing
         love.graphics.setColor(r, g, b)
-        love.graphics.polygon("fill", pixelX - size * 0.7, pixelY, pixelX - size * 0.15, pixelY - size * 0.15, pixelX - size * 0.15, pixelY + size * 0.15)
+        love.graphics.polygon("fill", pixelX - size * 0.58, pixelY, pixelX - size * 0.12, pixelY - size * 0.12, pixelX - size * 0.12, pixelY + size * 0.12)
         -- right wing
-        love.graphics.polygon("fill", pixelX + size * 0.7, pixelY, pixelX + size * 0.15, pixelY - size * 0.15, pixelX + size * 0.15, pixelY + size * 0.15)
+        love.graphics.polygon("fill", pixelX + size * 0.58, pixelY, pixelX + size * 0.12, pixelY - size * 0.12, pixelX + size * 0.12, pixelY + size * 0.12)
         love.graphics.setColor(0,0,0)
-        love.graphics.polygon("line", pixelX - size * 0.7, pixelY, pixelX - size * 0.15, pixelY - size * 0.15, pixelX - size * 0.15, pixelY + size * 0.15)
-        love.graphics.polygon("line", pixelX + size * 0.7, pixelY, pixelX + size * 0.15, pixelY - size * 0.15, pixelX + size * 0.15, pixelY + size * 0.15)
+        love.graphics.polygon("line", pixelX - size * 0.58, pixelY, pixelX - size * 0.12, pixelY - size * 0.12, pixelX - size * 0.12, pixelY + size * 0.12)
+        love.graphics.polygon("line", pixelX + size * 0.58, pixelY, pixelX + size * 0.12, pixelY - size * 0.12, pixelX + size * 0.12, pixelY + size * 0.12)
     end
 end
 
