@@ -21,6 +21,12 @@ function HexTile.new(col, row, pixelX, pixelY, hexSideLength)
     
     -- Terrain properties
     self.isLand = true           -- true = land, false = mountain (impassable)
+    -- Terrain subtype: "plain", "hill", "forest", etc.
+    self.terrain = "plain"
+    self.terrainCost = 1         -- movement cost multiplier (entering)
+    self.terrainViewBonus = 0    -- view range bonus when occupying this tile
+    self.isForest = false
+    self.isHill = false
     
     -- Calculate hex points for rendering
     self.points = {}
@@ -390,8 +396,14 @@ function HexMap:drawTile(tile, offsetX, offsetY)
     if tile.isIce then
         love.graphics.setColor(0.8, 0.95, 1)  -- Light blue for ice
     elseif tile.isLand then
-        -- No decorations: draw land uniformly
-        love.graphics.setColor(0.8, 0.7, 0.5)  -- Tan for bare land
+        -- Terrain subtypes: hill, forest, plain
+        if tile.isHill then
+            love.graphics.setColor(0.36, 0.20, 0.08) -- dark brown for hills
+        elseif tile.isForest then
+            love.graphics.setColor(0.42, 0.55, 0.3) -- green for forest
+        else
+            love.graphics.setColor(0.8, 0.7, 0.5)  -- Tan for bare land
+        end
     else
         love.graphics.setColor(0.5, 0.5, 0.5)  -- Gray for mountains
     end
@@ -409,6 +421,18 @@ function HexMap:drawTile(tile, offsetX, offsetY)
     -- Draw outline
     love.graphics.setColor(0.3, 0.3, 0.3)
     love.graphics.polygon("line", scaledPoints)
+
+    -- Draw simple forest decoration (small trees) if forest
+    if tile.isForest then
+        local cx, cy = tile.pixelX + offsetX, tile.pixelY + offsetY
+        love.graphics.setColor(0.12, 0.4, 0.08)
+        for i = 1, 3 do
+            local angle = (i - 2) * 0.7
+            local tx = cx + math.cos(angle) * (self.hexSideLength * 0.18)
+            local ty = cy + math.sin(angle) * (self.hexSideLength * 0.18)
+            love.graphics.circle("fill", tx, ty, self.hexSideLength * 0.08)
+        end
+    end
 end
 
 function HexMap:drawGridCoordinates()

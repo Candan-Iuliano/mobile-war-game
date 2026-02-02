@@ -53,6 +53,9 @@ function Piece.new(pieceType, team, gameMap, col, row)
     if col and row then
         self.hexTile = gameMap:getTile(col, row)
     end
+    -- Forest stealth state
+    self.hiddenInForest = false
+    self.revealedTo = self.revealedTo or {}
     
     return self
 end
@@ -144,6 +147,13 @@ function Piece:setPosition(col, row)
     -- Mark as moved if position actually changed
     if oldCol ~= col or oldRow ~= row then
         self.hasMoved = true
+    end
+    -- Entering a forest tile hides the unit from enemy teams until revealed
+    if self.hexTile and self.hexTile.isForest then
+        self.hiddenInForest = true
+        self.revealedTo = {}
+    else
+        self.hiddenInForest = false
     end
 end
 

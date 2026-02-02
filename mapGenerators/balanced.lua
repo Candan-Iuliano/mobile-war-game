@@ -43,6 +43,31 @@ function BalancedGenerator:generate(map)
             end
         end
     end
+
+    -- Assign terrain subtypes (hills/forests) on land tiles with low probability
+    for col = 1, map.cols do
+        for row = 1, map.rows do
+            local tile = map:getTile(col, row)
+            if tile and tile.isLand then
+                tile.terrain = "plain"
+                tile.terrainCost = 1
+                tile.terrainViewBonus = 0
+                tile.isForest = false
+                tile.isHill = false
+                -- small chance for hill
+                if math.random() < 0.06 then
+                    tile.terrain = "hill"
+                    tile.terrainCost = 2
+                    tile.terrainViewBonus = 1
+                    tile.isHill = true
+                elseif math.random() < 0.08 then
+                    tile.terrain = "forest"
+                    tile.isForest = true
+                    tile.terrainCost = 1
+                end
+            end
+        end
+    end
 end
 
 function BalancedGenerator:smoothTerrain(map, startRow, endRow)

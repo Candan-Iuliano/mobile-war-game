@@ -268,8 +268,14 @@ function FogOfWar:draw(team, camera, sectionOffsetX, sectionOffsetY)
     local startRow = math.max(1, math.floor((sectionMinY - padding) / self.map.verticalSpacing))
     local endRow = math.min(self.map.rows, math.ceil((sectionMaxY + padding) / self.map.verticalSpacing))
     
+    -- Choose fog opacity/colors based on dev mode
+    local dev = (self.game and self.game.devMode) and true or false
     -- Draw unexplored fog (dark) for visible tiles only
-    love.graphics.setColor(0, 0, 0, 0.8) -- Black fog for unexplored
+    if dev then
+        love.graphics.setColor(0, 0, 0, 0.8) -- Dev: slightly transparent black for testing
+    else
+        love.graphics.setColor(0, 0, 0, 1.0) -- Normal: solid black (no see-through)
+    end
     for row = startRow, endRow do
         for col = startCol, endCol do
             local hexTile = self.map:getTile(col, row)
@@ -290,8 +296,8 @@ function FogOfWar:draw(team, camera, sectionOffsetX, sectionOffsetY)
         end
     end
     
-    -- Draw explored fog (semi-transparent grey) for visible tiles only
-    love.graphics.setColor(0.2, 0.2, 0.2, 0.5) -- Grey fog for explored but not visible
+    -- Draw explored fog (grey) for visible tiles only (same transparency in both modes)
+    love.graphics.setColor(0.2, 0.2, 0.2, 0.5)
     for row = startRow, endRow do
         for col = startCol, endCol do
             local hexTile = self.map:getTile(col, row)

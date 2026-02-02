@@ -155,6 +155,23 @@ function M:generate(map)
                     if tile then
                         tile.isLand = (cellVal == true)
                         tile.decorationType = nil
+                        -- default terrain fields
+                        tile.terrain = "plain"
+                        tile.terrainCost = 1
+                        tile.terrainViewBonus = 0
+                        tile.isForest = false
+                        tile.isHill = false
+                        if tile.isLand then
+                            if math.random() < 0.06 then
+                                tile.terrain = "hill"
+                                tile.terrainCost = 2
+                                tile.terrainViewBonus = 1
+                                tile.isHill = true
+                            elseif math.random() < 0.08 then
+                                tile.terrain = "forest"
+                                tile.isForest = true
+                            end
+                        end
                     end
                 end
             end

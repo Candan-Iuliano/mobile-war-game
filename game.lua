@@ -658,6 +658,14 @@ function Game:addPiece(pieceType, team, col, row)
     end
 end
 
+-- Reveal a piece to a specific team (core mechanic, works in single-player)
+function Game:revealPieceToTeam(piece, team)
+    if not piece or not team then return end
+    piece.revealedTo = piece.revealedTo or {}
+    piece.revealedTo[team] = true
+    piece.hiddenInForest = false
+end
+
 function Game:update(dt)
     -- Update game logic here
     if self.state == "playing" then
@@ -762,6 +770,25 @@ function Game:handleNetworkMessage(msg)
             local attacker = self:getPieceAt(amsg.fromCol, amsg.fromRow)
             local target = self:getPieceAt(amsg.toCol, amsg.toRow)
             if attacker and attacker.useAmmo then attacker:useAmmo() end
+            -- Reveal attacker if it was hidden in forest (host-side authoritative reveal)
+            if attacker and attacker.hiddenInForest then
+                local revealTeam = nil
+                if target and target.team then
+                    revealTeam = target.team
+                else
+                    revealTeam = (attacker.team and (3 - attacker.team)) or nil
+                end
+                if revealTeam then
+                    self:revealPieceToTeam(attacker, revealTeam)
+                    -- Broadcast reveal so remote clients are notified consistently
+                    if Network and Network.isConnected and Network.isConnected() then
+                        pcall(function()
+                            print(string.format("[game] host sending revealForest (attack) -> team=%s col=%s row=%s unitTeam=%s", tostring(revealTeam), tostring(attacker.col), tostring(attacker.row), tostring(attacker.team)))
+                            self:sendCommit({type = "revealForest", col = attacker.col, row = attacker.row, team = revealTeam, unitTeam = attacker.team})
+                        end)
+                    end
+                end
+            end
             -- If this attack involves moving into target (moved flag), and attacker is a tank,
             -- enforce oil requirement: if insufficient, cancel movement portion.
             if amsg.moved and attacker and attacker.type == "tank" then
@@ -1080,6 +1107,8 @@ function Game:handleNetworkMessage(msg)
         if attacker and attacker.useAmmo then
             attacker:useAmmo()
         end
+        -- Reveal-on-attack is handled authoritatively by the host via a separate `revealForest` commit.
+        -- Clients applying the `attack` commit should not perform additional reveal logic here.
         if target then
             local wasKilled = target:takeDamage(damage)
             if wasKilled then
@@ -1418,6 +1447,12 @@ function Game:draw()
             if self.fogOfWar then
                 -- Only draw enemy pieces if the tile is visible to the viewer team
                 if piece.team ~= viewTeam and not self.fogOfWar:isTileVisible(viewTeam, piece.col, piece.row) then
+                    drawPiece = false
+                end
+            end
+            -- If piece is hidden in forest, only reveal to owner or teams that have revealed it
+            if piece.hiddenInForest and piece.team ~= viewTeam then
+                if not (piece.revealedTo and piece.revealedTo[viewTeam]) then
                     drawPiece = false
                 end
             end
@@ -2028,6 +2063,12 @@ function Game:getVisiblePieceAt(col, row, viewTeam)
                     return nil
                 end
             end
+            -- If piece is hidden in forest, only reveal to owner or teams that have revealed it
+            if piece.hiddenInForest and piece.team ~= viewTeam then
+                if not (piece.revealedTo and piece.revealedTo[viewTeam]) then
+                    return nil
+                end
+            end
             return piece
         end
     end
@@ -2163,6 +2204,23 @@ function Game:sweepForMines(piece)
             end
         end
         ::continue::
+    end
+    -- Also reveal hidden forest units within range (treat like mines)
+    for _, target in ipairs(self.pieces or {}) do
+        if target.col and target.row and target.team and target.team ~= piece.team and target.hiddenInForest then
+            if self:isWithinRange(piece.col, piece.row, target.col, target.row, range) then
+                target.revealedTo = target.revealedTo or {}
+                local already = target.revealedTo[piece.team]
+                target.revealedTo[piece.team] = true
+                target.hiddenInForest = false
+                if not already and self.isHost and Network and Network.isConnected and Network.isConnected() then
+                    pcall(function()
+                        print(string.format("[game] host sending revealForest -> team=%s col=%s row=%s unitTeam=%s", tostring(piece.team), tostring(target.col), tostring(target.row), tostring(target.team)))
+                        self:sendCommit({type = "revealForest", col = target.col, row = target.row, team = piece.team, unitTeam = target.team})
+                    end)
+                end
+            end
+        end
     end
 end
 
@@ -2792,8 +2850,9 @@ function Game:calculateValidMoves()
         
         for _, hex in ipairs(attackHexes) do
             if hex.col ~= self.selectedPiece.col or hex.row ~= self.selectedPiece.row then
-                local piece = self:getPieceAt(hex.col, hex.row)
-                if piece and piece.team ~= self.selectedPiece.team then
+                -- Use visibility-aware lookup so hidden forest units aren't targetable
+                local target = self:getVisiblePieceAt(hex.col, hex.row, self.selectedPiece.team)
+                if target and target.team ~= self.selectedPiece.team then
                     table.insert(self.validAttacks, hex)
                 end
             end
@@ -2811,16 +2870,21 @@ function Game:getHexesWithinRange(col, row, range, visited, team)
     local startHex = self.map:getTile(col, row)
     if not startHex then return end
     
-    -- Use BFS to explore hexes, but only through passable terrain
-    local queue = {{hex = startHex, distance = 0}}
-    local visitedSet = {}
-    visitedSet[col .. "," .. row] = true
-    
-    while #queue > 0 do
-        local current = table.remove(queue, 1)
+    -- Use Dijkstra-like exploration to respect terrain movement costs (terrainCost)
+    local frontier = {{hex = startHex, distance = 0}}
+    local best = {}
+    best[startHex.col .. "," .. startHex.row] = 0
+
+    while #frontier > 0 do
+        -- Pop the entry with smallest distance
+        table.sort(frontier, function(a,b) return a.distance < b.distance end)
+        local current = table.remove(frontier, 1)
         local currentHex = current.hex
         local currentDistance = current.distance
-        
+
+        -- If currentDistance exceeds range, stop exploring
+        if currentDistance > range then break end
+
         -- Add to visited if it's not the starting hex and within range
         if currentDistance > 0 and currentDistance <= range then
             local key = currentHex.col .. "," .. currentHex.row
@@ -2829,50 +2893,38 @@ function Game:getHexesWithinRange(col, row, range, visited, team)
                 table.insert(visited, currentHex)
             end
         end
-        
-        -- Stop if we've reached the maximum range
-        if currentDistance >= range then
-            goto continue
-        end
-        
-        -- Get immediate neighbors (range 1)
+
+        -- Explore neighbors
         local neighbors = self.map:getNeighbors(currentHex, 1)
-        
         for _, neighbor in ipairs(neighbors) do
-            local neighborKey = neighbor.col .. "," .. neighbor.row
+            local neighborTile = self.map:getTile(neighbor.col, neighbor.row)
+            if not neighborTile then goto neighbor_continue end
+            if not neighborTile.isLand then goto neighbor_continue end
 
-            -- Only explore if not visited and terrain is passable (land)
-            if not visitedSet[neighborKey] then
-                local neighborTile = self.map:getTile(neighbor.col, neighbor.row)
-                if neighborTile and neighborTile.isLand then
-                    -- Check if tile is occupied by enemy piece (blocks movement past it)
-                    local pieceOnTile = self:getPieceAt(neighbor.col, neighbor.row)
-                    local isEnemyOccupied = pieceOnTile and pieceOnTile.team ~= team
+            -- Movement cost entering neighbor
+            local cost = neighborTile.terrainCost or 1
 
-                    -- Mark as seen so we don't process it again
-                    visitedSet[neighborKey] = true
-                    local nextDistance = currentDistance + 1
+            -- Check occupancy: enemy pieces block passing beyond that tile
+            local pieceOnTile = self:getPieceAt(neighbor.col, neighbor.row)
+            local isEnemyOccupied = pieceOnTile and pieceOnTile.team ~= team
 
-                    -- If within range, include the tile. If enemy-occupied, include it but don't enqueue for further exploration.
-                    if nextDistance <= range then
-                        local key = neighborTile.col .. "," .. neighborTile.row
-                        if not visited[key] then
-                            visited[key] = neighborTile
-                            table.insert(visited, neighborTile)
-                        end
-                    end
-
-                    if not isEnemyOccupied and nextDistance < range then
-                        -- Terrain is passable and not blocked by enemy, enqueue to explore further
-                        table.insert(queue, {
-                            hex = neighborTile,
-                            distance = nextDistance
-                        })
-                    end
+            local newDist = currentDistance + cost
+            local nkey = neighbor.col .. "," .. neighbor.row
+            if newDist <= range then
+                -- If we've found a better distance to neighbor, update and add to frontier
+                if not best[nkey] or newDist < best[nkey] then
+                    best[nkey] = newDist
+                    table.insert(frontier, {hex = neighborTile, distance = newDist})
                 end
             end
+
+            -- If tile is enemy-occupied, do not expand further beyond it
+            if isEnemyOccupied then
+                goto neighbor_continue
+            end
+
+            ::neighbor_continue::
         end
-        ::continue::
     end
 end
 
@@ -3182,6 +3234,18 @@ function Game:movePiece(col, row)
 
         -- Use ammo and attack (host or local)
         self.selectedPiece:useAmmo()
+        -- If attacker was hidden in forest, reveal to the enemy team now (core game mechanic)
+        if self.selectedPiece and self.selectedPiece.hiddenInForest then
+            local revealTeam = nil
+            if targetPiece and targetPiece.team then
+                revealTeam = targetPiece.team
+            else
+                revealTeam = (self.selectedPiece.team and (3 - self.selectedPiece.team)) or nil
+            end
+            if revealTeam then
+                self:revealPieceToTeam(self.selectedPiece, revealTeam)
+            end
+        end
         local damage = self.selectedPiece:getDamage()
         local wasKilled = targetPiece:takeDamage(damage)
 
