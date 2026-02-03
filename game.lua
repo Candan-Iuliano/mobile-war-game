@@ -75,6 +75,8 @@ function Game.new()
     
     -- Fog of War system
     self.fogOfWar = FogOfWar.new(self.map, 2, self)
+    -- Combat animations (dice roll displays)
+    self.combatAnimations = {} -- { {x,y,rollsA,rollsD,ttl} }
     
     -- Initialize starting areas as explored and visible for each team
     for team = 1, 2 do
@@ -105,10 +107,100 @@ function Game.new()
     -- Hotseat/network/dev flags
     self.hotseatEnabled = true
     self.devMode = false
+    -- Dev placement menu state
+    self.devPlacementMenuOpen = false
+    self.devPlacementSelected = nil -- { kind = "unit"|"base", name = "infantry" }
     -- Per-player ready flags for simultaneous placement
     self.playerReady = {[1] = false, [2] = false}
     
     return self
+end
+
+
+-- Dice roll helpers and combat resolution
+function Game:rollDice(n, maxFace)
+    local rolls = {}
+    n = n or 1
+    maxFace = maxFace or 6
+    if n <= 0 then return rolls end
+    for i = 1, n do rolls[i] = math.random(1, maxFace) end
+    table.sort(rolls, function(a,b) return a > b end)
+    return rolls
+end
+
+-- Compare sorted descending dice arrays like Risk; return damageToTarget, damageToAttacker
+function Game:computeDiceOutcome(attackerDice, defenderDice)
+    local dmgToTarget = 0
+    local dmgToAttacker = 0
+    local na = #attackerDice
+    local nd = #defenderDice
+    -- If one side has zero dice (e.g., defender out of range), derive damage as the sum of attacker's rolls
+    if na > 0 and nd == 0 then
+        for i = 1, na do
+            dmgToTarget = dmgToTarget + attackerDice[i]
+        end
+        return dmgToTarget, dmgToAttacker
+    end
+    if nd > 0 and na == 0 then
+        for i = 1, nd do
+            dmgToAttacker = dmgToAttacker + defenderDice[i]
+        end
+        return dmgToTarget, dmgToAttacker
+    end
+
+    local pairs = math.min(na, nd)
+    for i = 1, pairs do
+        local a = attackerDice[i]
+        local d = defenderDice[i]
+        if a > d then
+            dmgToTarget = dmgToTarget + math.abs(a - d)
+        elseif d > a then
+            dmgToAttacker = dmgToAttacker + math.abs(d - a)
+        end
+    end
+    return dmgToTarget, dmgToAttacker
+end
+
+function Game:spawnCombatAnimation(x, y, rollsA, rollsD, attackerTeam, defenderTeam)
+    local anim = {x = x, y = y, rollsA = rollsA or {}, rollsD = rollsD or {}, ttl = 0.9, attackerTeam = attackerTeam, defenderTeam = defenderTeam}
+    table.insert(self.combatAnimations, anim)
+    return anim
+end
+
+function Game:updateCombatAnimations(dt)
+    for i = #self.combatAnimations, 1, -1 do
+        local a = self.combatAnimations[i]
+        a.ttl = a.ttl - dt
+        if a.ttl <= 0 then table.remove(self.combatAnimations, i) end
+    end
+end
+
+function Game:drawCombatAnimations()
+    for _, a in ipairs(self.combatAnimations) do
+        local x, y = a.x, a.y
+        -- draw attacker rolls above, defender below; color by team
+        love.graphics.setFont(love.graphics.newFont(12))
+        -- attacker box (background colored by team) and white text
+        local aTeam = a.attackerTeam
+        local abr, abg, abb = 0.45, 0.45, 0.45
+        if aTeam == 1 then abr, abg, abb = 1, 0.15, 0.15
+        elseif aTeam == 2 then abr, abg, abb = 0.15, 0.25, 0.85 end
+        love.graphics.setColor(abr, abg, abb, 0.95)
+        love.graphics.rectangle("fill", x-28, y-30, 56, 24, 4, 4)
+        love.graphics.setColor(1,1,1,1)
+        love.graphics.printf(table.concat(a.rollsA, ","), x-28, y-28, 56, "center")
+
+        -- defender box (background colored by team) and white text
+        local dTeam = a.defenderTeam
+        local dbr, dbg, dbb = 0.45, 0.45, 0.45
+        if dTeam == 1 then dbr, dbg, dbb = 1, 0.15, 0.15
+        elseif dTeam == 2 then dbr, dbg, dbb = 0.15, 0.25, 0.85 end
+        love.graphics.setColor(dbr, dbg, dbb, 0.95)
+        love.graphics.rectangle("fill", x-28, y+6, 56, 24, 4, 4)
+        love.graphics.setColor(1,1,1,1)
+        love.graphics.printf(table.concat(a.rollsD, ","), x-28, y+8, 56, "center")
+    end
+    love.graphics.setColor(1,1,1,1)
 end
 
 function Game:generateMapTerrain()
@@ -495,6 +587,12 @@ function Game:addBase(baseType, team, col, row)
             self.fogOfWar:updateVisibility(1, self.pieces, self.bases, self.teamStartingCorners)
             self.fogOfWar:updateVisibility(2, self.pieces, self.bases, self.teamStartingCorners)
             pcall(function() print("[game] addBase visibility after: t1=" .. tostring(self.fogOfWar:isTileVisible(1, base.col, base.row)) .. " t2=" .. tostring(self.fogOfWar:isTileVisible(2, base.col, base.row))) end)
+            -- Cache tiles within this base's radius to avoid repeated BFS calls during fog updates
+            if self.getTilesWithinRadius then
+                base._tilesInRadius = self:getTilesWithinRadius(base.col, base.row, base:getRadius())
+            end
+            -- Recompute air superiority because a base (possibly an airbase) was placed
+            self.airSuperiorityMap = self:calculateAirSuperiorityMap()
         end
     end
 end
@@ -522,6 +620,13 @@ function Game:applyPlaceBase(team, col, row, baseType)
     end
     -- Update fog visibility so the new base's effects are recognized locally
     if self.fogOfWar then
+        -- Cache tiles within this placed base's radius to avoid repeated BFS calls
+        if placedBase and placedBase.col and placedBase.col > 0 and self.getTilesWithinRadius then
+            placedBase._tilesInRadius = self:getTilesWithinRadius(placedBase.col, placedBase.row, placedBase:getRadius())
+        end
+        -- Recompute air superiority because a base (possibly an airbase) was placed
+        self.airSuperiorityMap = self:calculateAirSuperiorityMap()
+        -- Now update fog using the fresh air superiority map and caches
         self.fogOfWar:updateVisibility(1, self.pieces, self.bases, self.teamStartingCorners)
         self.fogOfWar:updateVisibility(2, self.pieces, self.bases, self.teamStartingCorners)
     end
@@ -671,18 +776,25 @@ function Game:update(dt)
     if self.state == "playing" then
         -- Update pieces, animations, etc.
         
-        -- Calculate air superiority map once per update (cached) to avoid repeated expensive recalcs
-        self.airSuperiorityMap = self:calculateAirSuperiorityMap()
+        -- Air superiority is expensive; compute once per turn instead of every frame
 
         -- Update fog of war visibility for all teams (visibility logic will query cached air superiority)
         for team = 1, 2 do
             self.fogOfWar:updateVisibility(team, self.pieces, self.bases, self.teamStartingCorners)
         end
+        -- Update combat animations
+        self:updateCombatAnimations(dt)
         -- network messages are polled by main.lua and forwarded to Game:handleNetworkMessage
     elseif self.state == "placing" then
         -- Update fog of war for the team that's placing (or local team if networked)
-        local viewTeam = self.localTeam or self.placementTeam
-        self.fogOfWar:updateVisibility(viewTeam, self.pieces, self.bases, self.teamStartingCorners)
+        -- In devMode we avoid per-frame fog recalculation; update only after placements
+        if not self.devMode then
+            local viewTeam = self.localTeam or self.placementTeam
+            if self.fogOfWar then
+                self.fogOfWar:updateVisibility(viewTeam, self.pieces, self.bases, self.teamStartingCorners)
+            end
+        end
+        self:updateCombatAnimations(dt)
     end
 end
 
@@ -760,17 +872,31 @@ function Game:handleNetworkMessage(msg)
     elseif msg.type == "attackRequest" then
         if self.isHost then
             local amsg = msg
-            amsg.damage = tonumber(amsg.damage) or 0
             amsg.fromCol = tonumber(amsg.fromCol)
             amsg.fromRow = tonumber(amsg.fromRow)
             amsg.toCol = tonumber(amsg.toCol)
             amsg.toRow = tonumber(amsg.toRow)
-            -- Apply attack on host (reuse attack commit handling below by calling it directly)
-            -- We'll apply same logic as commit
             local attacker = self:getPieceAt(amsg.fromCol, amsg.fromRow)
             local target = self:getPieceAt(amsg.toCol, amsg.toRow)
             if attacker and attacker.useAmmo then attacker:useAmmo() end
-            -- Reveal attacker if it was hidden in forest (host-side authoritative reveal)
+
+            -- Perform dice resolution on host
+            local aDice = (attacker and attacker.getAttackDice and attacker:getAttackDice()) or 1
+            local dDice = (target and target.getDefenseDice and target:getDefenseDice()) or 1
+            -- Option B: defender only rolls if attacker is within defender's attack range
+            if target and target.getAttackRange and attacker then
+                local defRange = target:getAttackRange() or 1
+                if not self:isWithinRange(target.col, target.row, attacker.col, attacker.row, defRange) then
+                    dDice = 0
+                end
+            end
+            local maxA = (attacker and attacker.getDieMax and attacker:getDieMax()) or 6
+            local maxD = (target and target.getDieMax and target:getDieMax()) or 6
+            local rollsA = self:rollDice(aDice, maxA)
+            local rollsD = self:rollDice(dDice, maxD)
+            local damageToTarget, damageToAttacker = self:computeDiceOutcome(rollsA, rollsD)
+
+            -- Reveal attacker if hidden (authoritative)
             if attacker and attacker.hiddenInForest then
                 local revealTeam = nil
                 if target and target.team then
@@ -780,7 +906,6 @@ function Game:handleNetworkMessage(msg)
                 end
                 if revealTeam then
                     self:revealPieceToTeam(attacker, revealTeam)
-                    -- Broadcast reveal so remote clients are notified consistently
                     if Network and Network.isConnected and Network.isConnected() then
                         pcall(function()
                             print(string.format("[game] host sending revealForest (attack) -> team=%s col=%s row=%s unitTeam=%s", tostring(revealTeam), tostring(attacker.col), tostring(attacker.row), tostring(attacker.team)))
@@ -789,33 +914,45 @@ function Game:handleNetworkMessage(msg)
                     end
                 end
             end
-            -- If this attack involves moving into target (moved flag), and attacker is a tank,
-            -- enforce oil requirement: if insufficient, cancel movement portion.
-            if amsg.moved and attacker and attacker.type == "tank" then
+
+            -- Apply damage on host
+            local moved = false
+            if target and damageToTarget > 0 then
+                local wasKilled = target:takeDamage(damageToTarget)
+                if wasKilled then
+                    for i, p in ipairs(self.pieces) do if p == target then table.remove(self.pieces, i); break end end
+                    -- If killed and adjacent, consider movement into tile
+                    if attacker and self:isWithinRange(attacker.col, attacker.row, amsg.toCol, amsg.toRow, 1) then
+                        moved = true
+                    end
+                end
+            end
+            if attacker and damageToAttacker > 0 then
+                local wasKilledA = attacker:takeDamage(damageToAttacker)
+                if wasKilledA then
+                    for i, p in ipairs(self.pieces) do if p == attacker then table.remove(self.pieces, i); break end end
+                end
+            end
+
+            -- If moving into the tile is a tank movement and host enforces oil, check/deduct
+            if moved and attacker and attacker.type == "tank" then
                 local team = attacker.team
                 local oilCost = 1
                 if (self.teamOil[team] or 0) < oilCost then
-                    amsg.moved = false
+                    moved = false
                     pcall(function() print(string.format("[game] host canceling moved flag for attack: insufficient oil team=%s", tostring(team))) end)
                 else
                     self.teamOil[team] = (self.teamOil[team] or 0) - oilCost
                 end
             end
-                if target then
-                    local wasKilled = target:takeDamage(amsg.damage)
-                    if wasKilled then
-                        for i, p in ipairs(self.pieces) do
-                            if p == target then table.remove(self.pieces, i); break end
-                        end
-                        if amsg.moved and attacker then attacker:setPosition(amsg.toCol, amsg.toRow) end
-                    end
-                else
-                    if amsg.moved and attacker then attacker:setPosition(amsg.toCol, amsg.toRow) end
-                end
-                -- Broadcast commit first so clients mirror the attack/movement
-                self:sendCommit({type = "attack", fromCol = amsg.fromCol, fromRow = amsg.fromRow, toCol = amsg.toCol, toRow = amsg.toRow, damage = amsg.damage, moved = amsg.moved})
-                -- After broadcasting, host should authoritative trigger any mine effects caused by movement
-                if amsg.moved and attacker then self:triggerMineAt(amsg.toCol, amsg.toRow, attacker) end
+
+            if moved and attacker then attacker:setPosition(amsg.toCol, amsg.toRow) end
+
+            -- Broadcast commit with dice rolls and damage so clients can animate and apply results
+            self:sendCommit({type = "attack", fromCol = amsg.fromCol, fromRow = amsg.fromRow, toCol = amsg.toCol, toRow = amsg.toRow, attackerRolls = rollsA, defenderRolls = rollsD, damageToTarget = damageToTarget, damageToAttacker = damageToAttacker, moved = moved, attackerTeam = attacker and attacker.team or nil, defenderTeam = target and target.team or nil})
+
+            -- After broadcasting, host should authoritative trigger any mine effects caused by movement
+            if moved and attacker then self:triggerMineAt(amsg.toCol, amsg.toRow, attacker) end
         end
     elseif msg.type == "placePieceRequest" then
         if self.isHost then
@@ -983,6 +1120,21 @@ function Game:handleNetworkMessage(msg)
                 self:addMine(placeholder)
             end
         end
+    elseif msg.type == "revealForest" then
+        local col = tonumber(msg.col)
+        local row = tonumber(msg.row)
+        local team = tonumber(msg.team)
+        if col and row and team then
+            local piece = self:getPieceAt(col, row)
+            if piece then
+                piece.revealedTo = piece.revealedTo or {}
+                piece.revealedTo[team] = true
+                piece.hiddenInForest = false
+                pcall(function() print(string.format("[game] recv.revealForest -> team=%s col=%s row=%s unitTeam=%s", tostring(team), tostring(col), tostring(row), tostring(piece.team))) end)
+            else
+                pcall(function() print(string.format("[game] recv.revealForest: no piece at %s,%s to reveal for team=%s", tostring(col), tostring(row), tostring(team))) end)
+            end
+        end
     elseif msg.type == "removeMine" then
         local col = tonumber(msg.col)
         local row = tonumber(msg.row)
@@ -1099,35 +1251,44 @@ function Game:handleNetworkMessage(msg)
         local fromRow = tonumber(msg.fromRow)
         local toCol = tonumber(msg.toCol)
         local toRow = tonumber(msg.toRow)
-        local damage = tonumber(msg.damage) or 0
+        local attackerRolls = msg.attackerRolls or {}
+        local defenderRolls = msg.defenderRolls or {}
+        local damageToTarget = tonumber(msg.damageToTarget) or 0
+        local damageToAttacker = tonumber(msg.damageToAttacker) or 0
         local moved = msg.moved and true or false
         local attacker = self:getPieceAt(fromCol, fromRow)
         local target = self:getPieceAt(toCol, toRow)
         -- Mirror ammo consumption on attacker if present
-        if attacker and attacker.useAmmo then
-            attacker:useAmmo()
+        if attacker and attacker.useAmmo then attacker:useAmmo() end
+
+        -- Spawn animation (midpoint) if rolls provided
+        local ax, ay = self.map:gridToPixels(fromCol, fromRow)
+        local bx, by = self.map:gridToPixels(toCol, toRow)
+        local mx, my = (ax + bx) / 2, (ay + by) / 2
+        if #attackerRolls > 0 or #defenderRolls > 0 then
+            local aTeam = tonumber(msg.attackerTeam) or nil
+            local dTeam = tonumber(msg.defenderTeam) or nil
+            self:spawnCombatAnimation(mx, my, attackerRolls, defenderRolls, aTeam, dTeam)
         end
-        -- Reveal-on-attack is handled authoritatively by the host via a separate `revealForest` commit.
-        -- Clients applying the `attack` commit should not perform additional reveal logic here.
-        if target then
-            local wasKilled = target:takeDamage(damage)
+
+        -- Apply damage to target
+        if target and damageToTarget > 0 then
+            local wasKilled = target:takeDamage(damageToTarget)
             if wasKilled then
-                for i, p in ipairs(self.pieces) do
-                    if p == target then
-                        table.remove(self.pieces, i)
-                        break
-                    end
-                end
-                -- If attacker moved into the target tile, move it (do NOT trigger mines here;
-                -- host will broadcast `mineTriggered` commits that clients should apply).
-                if moved and attacker then
-                    attacker:setPosition(toCol, toRow)
-                end
+                for i, p in ipairs(self.pieces) do if p == target then table.remove(self.pieces, i); break end end
+            end
+            if wasKilled and moved and attacker then
+                attacker:setPosition(toCol, toRow)
             end
         else
-            -- If target not found, but moved flag set, still try to move attacker
-            if moved and attacker then
-                attacker:setPosition(toCol, toRow)
+            if moved and attacker then attacker:setPosition(toCol, toRow) end
+        end
+
+        -- Apply damage to attacker (if still present)
+        if attacker and damageToAttacker > 0 then
+            local wasKilledA = attacker:takeDamage(damageToAttacker)
+            if wasKilledA then
+                for i, p in ipairs(self.pieces) do if p == attacker then table.remove(self.pieces, i); break end end
             end
         end
     elseif msg.type == "placePiece" then
@@ -1274,6 +1435,12 @@ function Game:handleNetworkMessage(msg)
             self.turnCount = 1
             self.currentTurn = 1
             for _, p in ipairs(self.pieces) do p:resetMove() end
+            -- Compute air superiority at start of play
+            self.airSuperiorityMap = self:calculateAirSuperiorityMap()
+            if self.fogOfWar then
+                self.fogOfWar:updateVisibility(1, self.pieces, self.bases, self.teamStartingCorners)
+                self.fogOfWar:updateVisibility(2, self.pieces, self.bases, self.teamStartingCorners)
+            end
         end
     end
     self._applyingRemote = false
@@ -1464,6 +1631,8 @@ function Game:draw()
     end
     
     -- Draw valid moves if a piece is selected
+    -- Draw combat animations (dice rolls) on top of pieces
+    self:drawCombatAnimations()
     if self.selectedPiece then
         self:drawValidMoves()
     end
@@ -1487,48 +1656,88 @@ function Game:draw()
         self:drawActionMenu()
     end
 
-    -- Draw airstrike targeting UI (crosshair + highlight) if active (rendered above pieces)
-    if self.airstrikeTargeting then
-        local mx, my = love.mouse.getPosition()
-        local worldX, worldY = self.camera:screenToWorld(mx, my)
-        local tcol, trow = self.map:pixelsToGrid(worldX, worldY)
+     -- During placement, show fog for the local player (or placementTeam if not networked)
+    local viewTeam = self.localTeam or self.placementTeam
+    self.fogOfWar:draw(viewTeam, self.camera, 0, 0)
 
-        -- Highlight tile under cursor
-        local tile = self.map:getTile(tcol, trow)
-        if tile then
-            local can = self:canAirstrike(self.airstrikeTargeting.team, tcol, trow)
-            if can then
-                love.graphics.setColor(0, 1, 0, 0.4)
-            else
-                love.graphics.setColor(1, 0, 0, 0.4)
-            end
-            love.graphics.polygon("fill", tile.points)
-        end
-
-        -- Draw crosshair at mouse (in world coords)
-        love.graphics.setColor(1, 1, 1)
-        local size = 16
-        love.graphics.setLineWidth(2)
-        love.graphics.line(worldX - size, worldY, worldX + size, worldY)
-        love.graphics.line(worldX, worldY - size, worldX, worldY + size)
-        love.graphics.setLineWidth(1)
-    end
-
-    -- Draw fog of war for the viewer's team (after all game elements)
-    if self.state == "playing" then
-        -- Use viewer team so local player sees their own visibility regardless of whose turn it is
-        local viewTeam = self.localTeam or self.currentTurn
-        self.fogOfWar:draw(viewTeam, self.camera, 0, 0)
-    elseif self.state == "placing" then
-        -- During placement, show fog for the local player (or placementTeam if not networked)
-        local viewTeam = self.localTeam or self.placementTeam
-        self.fogOfWar:draw(viewTeam, self.camera, 0, 0)
-    end
     
     love.graphics.pop()
     
     -- Draw UI (always on screen)
     self:drawUI()
+    -- Draw global dev placement UI when applicable
+    self:drawDevPlacementUI()
+end
+
+-- Draw dev placement button/menu globally for dev single-player
+function Game:drawDevPlacementUI()
+    if not self.devMode then return end
+    local offline = not (Network and Network.isConnected and Network.isConnected and Network.isConnected())
+    if not offline then return end
+
+    local btnW, btnH = 120, 28
+    local bx = love.graphics.getWidth() - btnW - 16
+    local by = 16 + 40
+    love.graphics.setColor(0.1, 0.1, 0.1, 0.9)
+    love.graphics.rectangle("fill", bx, by, btnW, btnH, 6, 6)
+    love.graphics.setColor(1,1,1,1)
+    love.graphics.printf("Dev Placement", bx, by + 6, btnW, "center")
+
+    if self.devPlacementMenuOpen then
+        local menuW = 180
+        local menuX = bx - 190
+        local menuY = by
+        local units = {"infantry","engineer","sniper","tank"}
+        local bases = {"hq","ammoDepot","supplyDepot","airbase"}
+        local labelGap = 20
+        local itemH = 22
+        local itemSpacing = 26
+        local smallGap = 4
+
+        local unitsLabelY = menuY + 30
+        local unitsItemsStartY = unitsLabelY + labelGap
+        local unitsAreaH = #units * itemSpacing
+
+        local afterUnitsY = unitsItemsStartY + unitsAreaH
+        local basesLabelY = afterUnitsY + smallGap
+        local basesItemsStartY = basesLabelY + labelGap
+        local basesAreaH = #bases * itemSpacing
+
+        local instrY = basesItemsStartY + basesAreaH + 8
+        local menuH = instrY + 18
+
+        love.graphics.setColor(0,0,0,0.85)
+        love.graphics.rectangle("fill", menuX, menuY, menuW, menuH, 6, 6)
+        love.graphics.setColor(1,1,1,1)
+        love.graphics.printf("Dev Placement Menu", menuX, menuY + 6, menuW, "center")
+        love.graphics.setFont(love.graphics.newFont(12))
+
+        love.graphics.printf("Units:", menuX + 8, unitsLabelY, menuW - 16, "left")
+        local y = unitsItemsStartY
+        for i, u in ipairs(units) do
+            local itX, itY, itW, itH = menuX + 8, y, menuW - 16, itemH
+            love.graphics.setColor(0.2,0.2,0.2,0.9)
+            love.graphics.rectangle("fill", itX, itY, itW, itH, 4, 4)
+            love.graphics.setColor(1,1,1,1)
+            love.graphics.print(u, itX + 6, itY + 4)
+            y = y + itemSpacing
+        end
+
+        love.graphics.printf("Bases:", menuX + 8, basesLabelY, menuW - 16, "left")
+        y = basesItemsStartY
+        for i, b in ipairs(bases) do
+            local itX, itY, itW, itH = menuX + 8, y, menuW - 16, itemH
+            love.graphics.setColor(0.2,0.2,0.2,0.9)
+            love.graphics.rectangle("fill", itX, itY, itW, itH, 4, 4)
+            love.graphics.setColor(1,1,1,1)
+            love.graphics.print(b, itX + 6, itY + 4)
+            y = y + itemSpacing
+        end
+
+        love.graphics.setFont(love.graphics.newFont(10))
+        love.graphics.setColor(1,1,1,0.8)
+        love.graphics.printf("Click an item to enable free placement for the selected team.", menuX + 8, instrY, menuW - 16, "left")
+    end
 end
 
 
@@ -1615,6 +1824,11 @@ function Game:drawBaseRadius(base, pixelX, pixelY, viewTeam)
     -- Draw hexagons within the base's influence radius, respecting terrain
     local radius = base:getRadius()
 
+    -- Temporary: skip drawing airbase radius while debugging performance
+    if base and base.type == "airbase" then
+        return
+    end
+
     -- Use getHexesWithinRange which respects terrain passability
     -- Pass base's team so enemy pieces don't block the visualization
     local visited = {}
@@ -1673,6 +1887,7 @@ function Game:drawUI()
                 if self.localTeam == 1 then ctrl = "Red" elseif self.localTeam == 2 then ctrl = "Blue" end
                 love.graphics.setFont(love.graphics.newFont(10))
                 love.graphics.print(string.format("Dev Control: %s  (Tab to toggle placement team; 1/2 to lock team; 0 for both)", ctrl), 10, 92)
+                -- Dev placement hint (button moved to top-right for dev single-player)
             end
         else
             -- Base placement phase
@@ -1686,6 +1901,10 @@ function Game:drawUI()
             love.graphics.print(string.format("Team Red bases remaining: %d", brem1), 10, 32)
             love.graphics.print(string.format("Team Blue bases remaining: %d", brem2), 10, 52)
             love.graphics.setFont(love.graphics.newFont(10))
+            -- If we placed into a slot, cache tiles for airbase radius
+            if placedBase and placedBase.type == "airbase" and self.getTilesWithinRadius then
+                placedBase._tilesInRadius = self:getTilesWithinRadius(placedBase.col, placedBase.row, placedBase:getRadius())
+            end
             love.graphics.print("Place your bases (HQ, Ammo, Supply, Airbase) on your starting area.", 10, 74)
             if self.devMode then
                 local ctrl = "Both"
@@ -1855,6 +2074,63 @@ function Game:mousepressed(x, y, button)
             return
         end
     end
+    -- Dev placement button click (visible when devMode)
+    if self.devMode then
+        local btnW, btnH = 120, 28
+        local bx = love.graphics.getWidth() - btnW - 16
+        local by = 16 + 40
+        if x >= bx and x <= bx + btnW and y >= by and y <= by + btnH then
+            self.devPlacementMenuOpen = not self.devPlacementMenuOpen
+            return
+        end
+        -- If menu open, check for menu item clicks
+        if self.devPlacementMenuOpen then
+            local menuW = 180
+            local menuX = bx - 190
+            local menuY = by
+            local units = {"infantry","engineer","sniper","tank"}
+            local bases = {"hq","ammoDepot","supplyDepot","airbase"}
+            local labelGap = 20
+            local itemSpacing = 26
+            local smallGap = 4
+
+            local unitsLabelY = menuY + 30
+            local unitsItemsStartY = unitsLabelY + labelGap
+            local unitsAreaH = #units * itemSpacing
+
+            local afterUnitsY = unitsItemsStartY + unitsAreaH
+            local basesLabelY = afterUnitsY + smallGap
+            local basesItemsStartY = basesLabelY + labelGap
+            local basesAreaH = #bases * itemSpacing
+
+            local instrY = basesItemsStartY + basesAreaH + 8
+            local menuH = instrY + 18
+
+            if x >= menuX and x <= menuX + menuW and y >= menuY and y <= menuY + menuH then
+                -- Units section
+                local relY = y - unitsItemsStartY
+                if relY >= 0 and relY < unitsAreaH then
+                    local idx = math.floor(relY / itemSpacing) + 1
+                    local sel = units[idx]
+                    if sel then
+                        self.devPlacementSelected = { kind = "unit", name = sel }
+                    end
+                    return
+                end
+
+                -- Bases section
+                local relY2 = y - basesItemsStartY
+                if relY2 >= 0 and relY2 < basesAreaH then
+                    local idx = math.floor(relY2 / itemSpacing) + 1
+                    local sel = bases[idx]
+                    if sel then
+                        self.devPlacementSelected = { kind = "base", name = sel }
+                    end
+                    return
+                end
+            end
+        end
+    end
     local worldX, worldY = self.camera:screenToWorld(x, y)
     local col, row = self.map:pixelsToGrid(worldX, worldY)
     -- Block input while waiting for hotseat pass
@@ -1871,7 +2147,46 @@ function Game:mousepressed(x, y, button)
         end
         -- During placement, `localTeam` is allowed to place simultaneously (no block)
     end
-    
+    -- Dev placement quick placement (if a dev item is selected)
+    if self.devPlacementSelected and button == 1 then
+        local sel = self.devPlacementSelected
+        local teamArg = self.localTeam or self.placementTeam or self.currentTurn
+        local tile = self.map and self.map:getTile(col, row)
+        if tile and tile.isLand then
+            -- prevent placing on top of existing structures/pieces
+            if sel.kind == "unit" then
+                if not self:getPieceAt(col, row) and not self:getBaseAt(col, row) and not self:getResourceAt(col, row) then
+                    self:addPiece(sel.name, teamArg, col, row)
+                    if self.isHost and Network and Network.isConnected and Network.isConnected() then
+                        pcall(function() self:sendCommit({type = "placePiece", team = teamArg, col = col, row = row, unitType = sel.name}) end)
+                    end
+                    -- Update fog once for this placement (dev quick placement)
+                    if self.fogOfWar then
+                        self.fogOfWar:updateVisibility(teamArg, self.pieces, self.bases, self.teamStartingCorners)
+                    end
+                    -- Exit dev placement mode after one placement
+                    self.devPlacementSelected = nil
+                    self.devPlacementMenuOpen = false
+                end
+            elseif sel.kind == "base" then
+                if not self:getBaseAt(col, row) and not self:getResourceAt(col, row) then
+                    self:applyPlaceBase(teamArg, col, row, sel.name)
+                    if self.isHost and Network and Network.isConnected and Network.isConnected() then
+                        pcall(function() self:sendCommit({type = "placeBase", team = teamArg, col = col, row = row, baseType = sel.name}) end)
+                    end
+                    -- applyPlaceBase already updates fog for the placing team; ensure it's updated here as well
+                    if self.fogOfWar then
+                        self.fogOfWar:updateVisibility(teamArg, self.pieces, self.bases, self.teamStartingCorners)
+                    end
+                    -- Exit dev placement mode after one placement
+                    self.devPlacementSelected = nil
+                    self.devPlacementMenuOpen = false
+                end
+            end
+        end
+        return
+    end
+
     if self.state == "placing" then
         -- Placement phase: place pieces or bases on click
         if button == 1 then  -- Left click
@@ -2985,16 +3300,20 @@ function Game:getTilesWithinRadius(col, row, radius)
     local startHex = self.map:getTile(col, row)
     if not startHex then return tiles end
 
-    local queue = {{col = col, row = row, distance = 0}}
+    -- Use index-based queue to avoid O(n) table.remove at index 1
+    local queue = {}
+    local qhead = 1
+    queue[#queue+1] = {col = col, row = row, distance = 0}
     local visitedSet = {}
     visitedSet[col .. "," .. row] = true
 
-    while #queue > 0 do
-        local current = table.remove(queue, 1)
-        if current.distance > 0 and current.distance <= radius then
+    while qhead <= #queue do
+        local current = queue[qhead]
+        qhead = qhead + 1
+        if current.distance <= radius then
             local hex = self.map:getTile(current.col, current.row)
             if hex then
-                table.insert(tiles, hex)
+                tiles[#tiles+1] = hex
             end
         end
 
@@ -3009,7 +3328,7 @@ function Game:getTilesWithinRadius(col, row, radius)
                 local key = n.col .. "," .. n.row
                 if not visitedSet[key] then
                     visitedSet[key] = true
-                    table.insert(queue, { col = n.col, row = n.row, distance = current.distance + 1 })
+                    queue[#queue+1] = { col = n.col, row = n.row, distance = current.distance + 1 }
                 end
             end
         end
@@ -3218,11 +3537,10 @@ function Game:movePiece(col, row)
         self:calculateValidMoves()
     elseif isValidAttack and targetPiece then
         -- If networked client, send request to host and don't apply locally
+        -- If networked client, send request to host and don't apply locally
         if Network and Network.isConnected and Network.isConnected() and not self.isHost and not self._applyingRemote then
-            local damage = self.selectedPiece:getDamage()
-            local movedInto = false -- host will determine moved flag
             pcall(function()
-                Network.send({type = "attackRequest", fromCol = oldCol, fromRow = oldRow, toCol = col, toRow = row, damage = damage, moved = movedInto, team = self.localTeam})
+                Network.send({type = "attackRequest", fromCol = oldCol, fromRow = oldRow, toCol = col, toRow = row, team = self.localTeam})
             end)
             return
         end
@@ -3232,9 +3550,28 @@ function Game:movePiece(col, row)
             return  -- Can't attack without ammo
         end
 
-        -- Use ammo and attack (host or local)
+        -- Use ammo
         self.selectedPiece:useAmmo()
-        -- If attacker was hidden in forest, reveal to the enemy team now (core game mechanic)
+
+        -- Determine dice counts (use piece hooks when available)
+        local aDice = (self.selectedPiece.getAttackDice and self.selectedPiece:getAttackDice()) or 1
+        local dDice = (targetPiece.getDefenseDice and targetPiece:getDefenseDice()) or 1
+        -- Option B: defender only rolls if attacker is within defender's attack range
+        if targetPiece and targetPiece.getAttackRange and self.selectedPiece then
+            local defRange = targetPiece:getAttackRange() or 1
+            if not self:isWithinRange(targetPiece.col, targetPiece.row, oldCol, oldRow, defRange) then
+                dDice = 0
+            end
+        end
+        -- Roll dice with per-unit max faces
+        local maxA = (self.selectedPiece and self.selectedPiece.getDieMax and self.selectedPiece:getDieMax()) or 6
+        local maxD = (targetPiece and targetPiece.getDieMax and targetPiece:getDieMax()) or 6
+        local rollsA = self:rollDice(aDice, maxA)
+        local rollsD = self:rollDice(dDice, maxD)
+        -- Compute damage from dice comparisons
+        local damageToTarget, damageToAttacker = self:computeDiceOutcome(rollsA, rollsD)
+
+        -- Reveal attacker if hidden (local single-player or host handles reveal broadcast elsewhere)
         if self.selectedPiece and self.selectedPiece.hiddenInForest then
             local revealTeam = nil
             if targetPiece and targetPiece.team then
@@ -3244,73 +3581,81 @@ function Game:movePiece(col, row)
             end
             if revealTeam then
                 self:revealPieceToTeam(self.selectedPiece, revealTeam)
-            end
-        end
-        local damage = self.selectedPiece:getDamage()
-        local wasKilled = targetPiece:takeDamage(damage)
-
-            if wasKilled then
-            -- Remove dead piece
-            for i, piece in ipairs(self.pieces) do
-                if piece == targetPiece then
-                    table.remove(self.pieces, i)
-                    break
+                if self.isHost and Network and Network.isConnected and Network.isConnected() then
+                    pcall(function()
+                        self:sendCommit({type = "revealForest", col = self.selectedPiece.col, row = self.selectedPiece.row, team = revealTeam, unitTeam = self.selectedPiece.team})
+                    end)
                 end
             end
-            -- Only move to the enemy tile if we killed them and attack was adjacent
-            if self:isWithinRange(self.selectedPiece.col, self.selectedPiece.row, col, row, 1) then
-                    -- If moving into the tile is a tank movement and host enforces oil, check/deduct
-                    if self.isHost and self.selectedPiece and self.selectedPiece.type == "tank" then
-                        local team = self.selectedPiece.team
-                        if (self.teamOil[team] or 0) >= 1 then
-                            self.teamOil[team] = (self.teamOil[team] or 0) - 1
-                            self.selectedPiece:setPosition(col, row)
-                        else
-                            pcall(function() print(string.format("[game] host attack movement blocked: insufficient oil for tank team=%s", tostring(team))) end)
-                        end
+        end
+
+        -- Spawn combat animation at midpoint
+        local ax, ay = self.map:gridToPixels(oldCol, oldRow)
+        local bx, by = self.map:gridToPixels(col, row)
+        local mx, my = (ax + bx) / 2, (ay + by) / 2
+        self:spawnCombatAnimation(mx, my, rollsA, rollsD, self.selectedPiece and self.selectedPiece.team or nil, targetPiece and targetPiece.team or nil)
+
+        -- Apply damage results locally now (host authoritative for networked games)
+        if damageToTarget > 0 and targetPiece then
+            local wasKilled = targetPiece:takeDamage(damageToTarget)
+            if wasKilled then
+                for i, p in ipairs(self.pieces) do if p == targetPiece then table.remove(self.pieces, i); break end end
+            end
+        end
+        if damageToAttacker > 0 and self.selectedPiece then
+            local wasKilledA = self.selectedPiece:takeDamage(damageToAttacker)
+            if wasKilledA then
+                for i, p in ipairs(self.pieces) do if p == self.selectedPiece then table.remove(self.pieces, i); break end end
+                self.selectedPiece = nil
+            end
+        end
+
+        -- Determine movedInto: attacker moves in on kill if adjacent
+        local movedInto = false
+        if targetPiece and targetPiece.col and targetPiece.row then
+            local killed = (damageToTarget > 0 and not self:getPieceAt(col, row)) or (targetPiece and targetPiece.col and targetPiece.row and not self:getPieceAt(col, row))
+            -- simpler: if target was removed and adjacent from old position
+            if self:isWithinRange(oldCol, oldRow, col, row, 1) and (damageToTarget > 0) and not self:getPieceAt(col, row) then
+                movedInto = true
+            end
+        end
+
+        -- Handle movement into target tile (tank oil cost applies for host)
+        if movedInto and self.selectedPiece then
+            if self.selectedPiece.type == "tank" then
+                local team = self.selectedPiece.team
+                if self.isHost then
+                    if (self.teamOil[team] or 0) >= 1 then
+                        self.teamOil[team] = (self.teamOil[team] or 0) - 1
+                        self.selectedPiece:setPosition(col, row)
                     else
+                        pcall(function() print(string.format("[game] host attack movement blocked: insufficient oil for tank team=%s", tostring(team))) end)
+                    end
+                else
+                    -- single-player or non-host: deduct if available
+                    if (self.teamOil[team] or 0) >= 1 then
+                        self.teamOil[team] = (self.teamOil[team] or 0) - 1
                         self.selectedPiece:setPosition(col, row)
                     end
-                    -- Host will broadcast the attack commit first; mine triggers will be processed
-                    -- after broadcasting so clients apply the movement before damage commits.
-            end
-        end
-        -- Send network update for attack (include whether attacker moved into target)
-        if Network and Network.isConnected and Network.isConnected() and not self._applyingRemote then
-            -- Determine whether attacker moved into the target (killed and adjacent from old position)
-            local movedInto = (wasKilled and self:isWithinRange(oldCol, oldRow, col, row, 1))
-            -- Client-side: if movement would move a tank, ensure oil available; if not, cancel movement flag
-            if movedInto and self.selectedPiece and self.selectedPiece.type == "tank" then
-                local team = self.selectedPiece.team
-                if (self.teamOil[team] or 0) < 1 then
-                    movedInto = false
                 end
-            end
-            -- If this is a networked client, send request and do not apply local attack effects
-            if not self.isHost then
-                pcall(function()
-                    Network.send({type = "attackRequest", fromCol = oldCol, fromRow = oldRow, toCol = col, toRow = row, damage = damage, moved = movedInto, team = self.localTeam})
-                end)
-                -- Client should wait for authoritative commit; stop here
-                return
             else
-                pcall(function()
-                    self:sendCommit({type = "attack", fromCol = oldCol, fromRow = oldRow, toCol = col, toRow = row, damage = damage, moved = movedInto})
-                end)
-                -- After broadcasting, host should authoritative trigger any mine effects caused by movement
-                if movedInto and self.selectedPiece then
-                    self:triggerMineAt(col, row, self.selectedPiece)
-                end
+                self.selectedPiece:setPosition(col, row)
             end
         end
-        -- If enemy survived, attacker stays in place (no movement)
-        -- Mark piece as moved since it attacked
-        self.selectedPiece.hasMoved = true
-        self:calculateValidMoves()
-        -- Deselect the attacker after resolving the attack
-        if self.selectedPiece then
-            self.selectedPiece:deselect(self)
+
+        -- If host, broadcast attack commit with roll details so clients can animate and apply same results
+        if self.isHost and Network and Network.isConnected and Network.isConnected() then
+            pcall(function()
+                    self:sendCommit({type = "attack", fromCol = oldCol, fromRow = oldRow, toCol = col, toRow = row, attackerRolls = rollsA, defenderRolls = rollsD, damageToTarget = damageToTarget, damageToAttacker = damageToAttacker, moved = movedInto, attackerTeam = self.selectedPiece and self.selectedPiece.team or nil, defenderTeam = targetPiece and targetPiece.team or nil})
+            end)
+            -- After broadcasting, trigger mines if moved into tile
+            if movedInto and self.selectedPiece then self:triggerMineAt(col, row, self.selectedPiece) end
         end
+
+        -- Mark piece as moved since it attacked (if still alive)
+        if self.selectedPiece then self.selectedPiece.hasMoved = true end
+        self:calculateValidMoves()
+        if self.selectedPiece then self.selectedPiece:deselect(self) end
     end
 end
 
@@ -3546,6 +3891,13 @@ function Game:endTurn()
                 piece:resetMove()
             end
         end
+
+        -- Recompute air superiority at the start of the new turn (once-per-turn)
+        self.airSuperiorityMap = self:calculateAirSuperiorityMap()
+        if self.fogOfWar then
+            self.fogOfWar:updateVisibility(1, self.pieces, self.bases, self.teamStartingCorners)
+            self.fogOfWar:updateVisibility(2, self.pieces, self.bases, self.teamStartingCorners)
+        end
         -- Resolve any pending base captures for the team that just became active
         for _, b in ipairs(self.bases) do
             if b.capturePending and b.capturePending == self.currentTurn then
@@ -3563,11 +3915,12 @@ function Game:endTurn()
                     b.team = self.currentTurn
                     b.capturePending = nil
                     b.capturePendingSince = nil
-                    -- Update fog visibility to reflect new base ownership
+                    -- Update fog visibility and air superiority to reflect new base ownership
                     if self.fogOfWar then
                         self.fogOfWar:updateVisibility(1, self.pieces, self.bases, self.teamStartingCorners)
                         self.fogOfWar:updateVisibility(2, self.pieces, self.bases, self.teamStartingCorners)
                     end
+                    self.airSuperiorityMap = self:calculateAirSuperiorityMap()
                     -- Broadcast as placeBase commit for peers
                     if self.isHost and Network and Network.isConnected and Network.isConnected() and not self._applyingRemote then
                         pcall(function()
@@ -3656,6 +4009,11 @@ function Game:placePiece(col, row, team)
             -- Place this piece (host or local play)
             piece:setPosition(col, row)
             self.piecesPlaced = self.piecesPlaced + 1
+            -- Refresh fog visibility for both teams after placement
+            if self.fogOfWar then
+                self.fogOfWar:updateVisibility(teamToPlace, self.pieces, self.bases, self.teamStartingCorners)
+                self.fogOfWar:updateVisibility((teamToPlace == 1) and 2 or 1, self.pieces, self.bases, self.teamStartingCorners)
+            end
             -- If host, broadcast commit
             if Network and Network.isConnected and Network.isConnected() and self.isHost and not self._applyingRemote then
                 self:sendCommit({type = "placePiece", team = teamToPlace, col = col, row = row, unitType = piece.type})

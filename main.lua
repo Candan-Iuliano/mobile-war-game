@@ -65,6 +65,7 @@ local function processNetworkMessages(msgs)
                 -- Host told us to start the game (client/guest path)
                 if not gameInstance then
                     gameInstance = Game.new()
+                    
                     gameInstance.hotseatEnabled = true
                     gameInstance.devMode = false
                     gameInstance.hostName = msg.hostName or (lobbyState and lobbyState.hostName) or "Host"
@@ -254,6 +255,7 @@ function love.mousepressed(x, y, button)
                     print("Starting Dev Mode")
                     gameInstance = Game.new()
                     gameInstance.devMode = true
+                    --gameInstance.disableFog = true
                     gameInstance.hotseatEnabled = false
                     -- In dev mode, default control to team 1 but allow switching in-game
                     gameInstance.localTeam = 1

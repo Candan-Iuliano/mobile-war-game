@@ -2,16 +2,25 @@ local M = {}
 
 M.stats = {
     name = "Tank",
-    moveRange = 4,
-    attackRange = 3,
-    hp = 15,
-    damage = 7,
-    speed = 3,
+    hp = 12,
+    attackDice = 2,
+    defenseDice = 2,
+    moveRange = 3,
+    attackRange = 1,
+    viewRange = 3,
+    damage = 3,
     maxAmmo = 4,
-    maxSupply = 5,
+    maxDie = 6,
 }
 
 M.methods = {}
+
+function M.methods:drawIcon(pixelX, pixelY, hexSideLength)
+    love.graphics.setColor(1,1,1)
+    love.graphics.rectangle("fill", pixelX - hexSideLength*0.24, pixelY - hexSideLength*0.18, hexSideLength*0.48, hexSideLength*0.36)
+    love.graphics.setColor(0,0,0)
+    love.graphics.rectangle("line", pixelX - hexSideLength*0.24, pixelY - hexSideLength*0.18, hexSideLength*0.48, hexSideLength*0.36)
+end
 
 -- Tank-specific behavior
 M.stats.buildCosts = { oil = 1 }

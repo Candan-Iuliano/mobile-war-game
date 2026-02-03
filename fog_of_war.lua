@@ -175,6 +175,9 @@ function FogOfWar:revealArea(team, centerCol, centerRow, radius, visited)
 end
 
 function FogOfWar:updateVisibility(team, pieces, bases, startingAreas)
+    -- Allow tests to disable fog entirely
+    if self.game and self.game.disableFog then return end
+
     -- Clear current visibility for this team
     if self.visible[team] then
         self.visible[team] = {}
@@ -210,9 +213,10 @@ function FogOfWar:updateVisibility(team, pieces, bases, startingAreas)
             end
             -- Airbases grant full visibility inside their radius while the team has air superiority on each tile.
             -- When superiority is lost on a tile, it should remain explored but not visible.
-            if base.type == "airbase" and self.game and self.game.getTilesWithinRadius and self.game.getAirSuperiorityAt then
-                local tiles = self.game:getTilesWithinRadius(base.col, base.row, base:getRadius())
-                for _, t in ipairs(tiles) do
+            if base.type == "airbase" and self.game and self.game.getAirSuperiorityAt then
+                -- Use cached tiles if available to avoid repeated BFS
+                local tiles = base._tilesInRadius or (self.game.getTilesWithinRadius and self.game:getTilesWithinRadius(base.col, base.row, base:getRadius()))
+                for _, t in ipairs(tiles or {}) do
                     local col = t.col
                     local row = t.row
                     local t1, t2 = self.game:getAirSuperiorityAt(col, row)
@@ -223,8 +227,6 @@ function FogOfWar:updateVisibility(team, pieces, bases, startingAreas)
                     else
                         -- Mark as explored but not visible
                         self:setTileExplored(team, col, row, true)
-                        -- Ensure visible is false (it was cleared at start)
-                        -- (do not call setTileVisible with false because that would overwrite explored state)
                     end
                 end
             else
@@ -235,6 +237,7 @@ function FogOfWar:updateVisibility(team, pieces, bases, startingAreas)
 end
 
 function FogOfWar:draw(team, camera, sectionOffsetX, sectionOffsetY)
+    if self.game and self.game.disableFog then return end
     if not self.visible[team] then return end
     
     sectionOffsetX = sectionOffsetX or 0
@@ -283,13 +286,8 @@ function FogOfWar:draw(team, camera, sectionOffsetX, sectionOffsetY)
                 if not self:isTileVisible(team, col, row) and not self:isTileExplored(team, col, row) then
                     local points = hexTile.points
                     if points then
-                        -- Apply section offset to points
-                        local offsetPoints = {}
-                        for i = 1, #points, 2 do
-                            table.insert(offsetPoints, points[i] + sectionOffsetX)
-                            table.insert(offsetPoints, points[i + 1] + sectionOffsetY)
-                        end
-                        love.graphics.polygon("fill", offsetPoints)
+                        -- Draw using precomputed tile points (camera transform already applied)
+                        love.graphics.polygon("fill", points)
                     end
                 end
             end
@@ -305,13 +303,8 @@ function FogOfWar:draw(team, camera, sectionOffsetX, sectionOffsetY)
                 if not self:isTileVisible(team, col, row) and self:isTileExplored(team, col, row) then
                     local points = hexTile.points
                     if points then
-                        -- Apply section offset to points
-                        local offsetPoints = {}
-                        for i = 1, #points, 2 do
-                            table.insert(offsetPoints, points[i] + sectionOffsetX)
-                            table.insert(offsetPoints, points[i + 1] + sectionOffsetY)
-                        end
-                        love.graphics.polygon("fill", offsetPoints)
+                        -- Draw using precomputed tile points (camera transform already applied)
+                        love.graphics.polygon("fill", points)
                     end
                 end
             end

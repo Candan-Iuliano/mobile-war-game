@@ -2,12 +2,15 @@ local M = {}
 
 M.stats = {
     name = "Engineer",
-    moveRange = 3,
-    attackRange = 0,
-    hp = 8,
+    hp = 6,
+    attackDice = 1,
+    defenseDice = 0,
+    moveRange = 2,
+    attackRange = 1,
+    viewRange = 2,
     damage = 0,
-    speed = 2,
     maxAmmo = 0,
+    maxDie = 4,
     maxSupply = 5,
     canBuild = true,
     maxMines = 2,
@@ -135,3 +138,4 @@ function M.methods:placeMine(game)
 end
 
 return M
+

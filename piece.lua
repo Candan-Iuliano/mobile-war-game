@@ -3,6 +3,22 @@
 local Piece = {}
 Piece.__index = Piece
 
+-- Toggle to disable ammo consumption/checks for testing
+Piece.IGNORE_AMMO = true
+
+-- Generic fallback stats if a type module omits a property
+local GENERIC_DEFAULTS = {
+    hp = 1,
+    attackDice = 1,
+    defenseDice = 1,
+    maxAmmo = 0,
+    moveRange = 1,
+    viewRange = 1,
+    attackRange = 1,
+    maxDie = 6,
+    damage = 1,
+}
+
 -- Piece types with their properties
 -- Piece types are implemented as separate modules (e.g. infantry.lua, sniper.lua)
 -- Each type module should return a table: { stats = {...}, methods = {...} }
@@ -25,12 +41,16 @@ function Piece.new(pieceType, team, gameMap, col, row)
 
     self.gameMap = gameMap
     self.type = pieceType
-    self.stats = typeMod.stats or {}
+    -- Merge provided stats with generic defaults
+    local provided = typeMod.stats or {}
+    self.stats = {}
+    for k, v in pairs(GENERIC_DEFAULTS) do self.stats[k] = v end
+    for k, v in pairs(provided) do self.stats[k] = v end
     self.team = team or 1
     self.col = col or 0
     self.row = row or 0
-    self.hp = self.stats.hp or 1
     self.maxHp = self.stats.hp or 1
+    self.hp = self.maxHp
     self.selected = false
     self.canMove = true
     self.hasMoved = false
@@ -90,11 +110,26 @@ function Piece:getAttackRange()
     return self.stats.attackRange
 end
 
+function Piece:getAttackDice()
+    return self.stats.attackDice or 1
+end
+
+function Piece:getDefenseDice()
+    return self.stats.defenseDice or 1
+end
+
+function Piece:getDieMax()
+    return self.stats.maxDie or 6
+end
+
 function Piece:getDamage()
     return self.stats.damage or 1
 end
 
 function Piece:useAmmo()
+    if Piece.IGNORE_AMMO then
+        return true
+    end
     if self.ammo > 0 then
         self.ammo = self.ammo - 1
         return true
@@ -103,6 +138,7 @@ function Piece:useAmmo()
 end
 
 function Piece:hasAmmo()
+    if Piece.IGNORE_AMMO then return true end
     return self.ammo > 0
 end
 
@@ -229,13 +265,10 @@ function Piece:draw(pixelX, pixelY, hexSideLength)
     end
 
     -- Draw "I" for infantry pieces
-    if self.type == "infantry" then
-        love.graphics.setColor(1, 1, 1)
-        love.graphics.setFont(love.graphics.newFont(16))
-        local text = "I"
-        local textWidth = love.graphics.getFont():getWidth(text)
-        local textHeight = love.graphics.getFont():getHeight()
-        love.graphics.print(text, pixelX - textWidth / 2, pixelY - textHeight / 2)
+    -- Draw type-specific icon if the type supplies one
+    if self.drawIcon then
+        -- type module provides drawIcon(pixelX, pixelY, hexSideLength)
+        pcall(function() self:drawIcon(pixelX, pixelY, hexSideLength) end)
     end
 end
 
