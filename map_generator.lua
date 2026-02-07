@@ -222,6 +222,27 @@ function HexMap:getNeighbors(startHex, range)
     return neighbors
 end
 
+-- Get all tiles in a ring around the origin at a specific distance
+function HexMap:getRingTiles(origin, radius)
+    local tiles = {}
+    
+    if radius == 0 then
+        table.insert(tiles, origin)
+        return tiles
+    end
+    
+    -- Get all neighbors up to the radius distance
+    local allNeighbors = self:getNeighbors(origin, radius)
+    
+    -- Filter to only include tiles at exactly the specified radius
+    for _, neighbor in ipairs(allNeighbors) do
+        if neighbor.distance == radius then
+            table.insert(tiles, neighbor)
+        end
+    end
+    
+    return tiles
+end
 
 -- Get a tile by grid coordinates
 function HexMap:getTile(col, row)

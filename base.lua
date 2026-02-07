@@ -3,23 +3,24 @@
 local Base = {}
 Base.__index = Base
 
--- Base types with their properties
--- Load specialized base modules
-local AIRBASE = {}
-local ok_air, air_mod = pcall(require, "airbase")
-if ok_air and air_mod and air_mod.stats then
-    AIRBASE = air_mod.stats
-end
-
+-- Base type default stats (used as fallback, but specific types can override via modules)
 local BASE_TYPES = {
-    hq = { name = "HQ", radius = 3, suppliesAmmo = true, suppliesSupply = true, unitCapacity = 10 },
+    hq = {},  -- Will be loaded from hq.lua module
     ammoDepot = { name = "Ammo Depot", radius = 2, suppliesAmmo = true, suppliesSupply = false },
     supplyDepot = { name = "Supply Depot", radius = 2, suppliesAmmo = false, suppliesSupply = true },
-    airbase = AIRBASE,
+    airbase = {},  -- Will be loaded from airbase.lua module
 }
 
 function Base.new(baseType, team, gameMap, col, row)
-    local self = setmetatable({}, Base)
+    -- Try to load type-specific module (e.g., "hq.lua", "airbase.lua")
+    local typeProto = Base
+    local ok, typeMod = pcall(require, baseType)
+    if ok and typeMod and typeMod.methods then
+        typeProto = typeMod.methods
+        setmetatable(typeProto, { __index = Base })
+    end
+    
+    local self = setmetatable({}, { __index = typeProto })
     
     if not BASE_TYPES[baseType] then
         error("Unknown base type: " .. baseType)
@@ -27,7 +28,14 @@ function Base.new(baseType, team, gameMap, col, row)
     
     self.gameMap = gameMap
     self.type = baseType
-    self.stats = BASE_TYPES[baseType]
+    
+    -- Load stats from module, fallback to BASE_TYPES default
+    if ok and typeMod and typeMod.stats then
+        self.stats = typeMod.stats
+    else
+        self.stats = BASE_TYPES[baseType]
+    end
+    
     self.team = team or 1  -- Team 1 or 2
     self.col = col or 0  -- 0 means not placed yet
     self.row = row or 0
@@ -63,6 +71,21 @@ function Base:getColor()
     else
         return 0, 0, 1  -- Blue for team 2
     end
+end
+
+function Base:getActionOptions(game)
+    local options = {}
+    
+    -- Add deconstruct option to all bases
+    table.insert(options, {
+        id = "deconstruct",
+        name = "Deconstruct",
+        cost = 0,
+        icon = "X",
+        isDeconstruct = true
+    })
+    
+    return options
 end
 
 function Base:draw(pixelX, pixelY, hexSideLength)
@@ -137,20 +160,6 @@ function Base:draw(pixelX, pixelY, hexSideLength)
         love.graphics.rectangle("fill", -size * 0.36, -size * 0.36, size * 0.72, size * 0.72)
         love.graphics.setColor(0, 0, 0)
         love.graphics.rectangle("line", -size * 0.36, -size * 0.36, size * 0.72, size * 0.72)
-    end
-
-    -- Airbase visual (use cached wing offsets)
-    if self.type == "airbase" then
-        love.graphics.setColor(r, g, b)
-        love.graphics.circle("fill", 0, 0, size * 0.36)
-        love.graphics.setColor(0, 0, 0)
-        love.graphics.circle("line", 0, 0, size * 0.36)
-        love.graphics.setColor(r, g, b)
-        love.graphics.polygon("fill", self._drawCache.wingL)
-        love.graphics.polygon("fill", self._drawCache.wingR)
-        love.graphics.setColor(0,0,0)
-        love.graphics.polygon("line", self._drawCache.wingL)
-        love.graphics.polygon("line", self._drawCache.wingR)
     end
 
     love.graphics.pop()

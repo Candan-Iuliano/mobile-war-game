@@ -77,6 +77,10 @@ function Piece.new(pieceType, team, gameMap, col, row)
     self.hiddenInForest = false
     self.revealedTo = self.revealedTo or {}
     
+    -- Waypoint system for multi-step moves
+    self.waypoints = {}  -- List of {col, row} waypoints to follow
+    self.currentWaypointIndex = 0  -- Index of the waypoint being moved toward
+    
     return self
 end
 
@@ -221,6 +225,108 @@ function Piece:getColor()
     end
 end
 
+function Piece:getActionOptions(game)
+    local options = {}
+    
+    if not game then
+        return options  -- Return empty options if game isn't provided
+    end
+    
+    if self.stats.canBuild and not self.isBuilding then
+        local onResourceTile = game:getResourceAt(self.col, self.row) ~= nil
+        local hasBase = game:getBaseAt(self.col, self.row) ~= nil
+        
+        table.insert(options, {
+            id = "build_hq",
+            name = "Build HQ",
+            cost = 10,
+            buildTurns = 4,
+            icon = "hq",
+            disabled = onResourceTile or hasBase
+        })
+        table.insert(options, {
+            id = "build_ammo_depot",
+            name = "Build Ammo Depot",
+            cost = 5,
+            buildTurns = 2,
+            icon = "ammo_depot",
+            disabled = onResourceTile or hasBase
+        })
+        table.insert(options, {
+            id = "build_supply_depot",
+            name = "Build Supply Depot",
+            cost = 5,
+            buildTurns = 2,
+            icon = "supply_depot",
+            disabled = onResourceTile or hasBase
+        })
+        table.insert(options, {
+            id = "build_resource_mine",
+            name = "Build Resource Mine",
+            cost = 3,
+            buildTurns = 3,
+            icon = "resource_mine",
+            disabled = hasBase
+        })
+        table.insert(options, {
+            id = "build_airbase",
+            name = "Build Airbase",
+            cost = 8,
+            oilCost = 2,
+            buildTurns = 4,
+            icon = "airbase",
+            disabled = onResourceTile or hasBase
+        })
+        table.insert(options, {
+            id = "place_mine",
+            name = "Place Mine",
+            cost = 2,
+            icon = "mine",
+            disabled = (game and game:getMineAt(self.col, self.row) ~= nil) or false
+        })
+        table.insert(options, {
+            id = "build_defense",
+            name = "Build Defense",
+            cost = 1,
+            icon = "defense",
+            disabled = (game and game:getDefenseAt(self.col, self.row) ~= nil) or false
+        })
+    end
+    
+    -- Sweep for mines
+    local disabled = (self.hasMoved or self.isBuilding)
+    table.insert(options, {
+        id = "sweep_mines",
+        name = "Sweep For Mines",
+        cost = 0,
+        icon = "sweep",
+        shortcut = "S",
+        disabled = disabled
+    })
+    
+    -- Disarm options
+    local startTile = game.map:getTile(self.col, self.row)
+    if startTile then
+        local neighbors = game.map:getNeighbors(startTile, 1)
+        for _, neighbor in ipairs(neighbors) do
+            local mine = game:getMineAt(neighbor.col, neighbor.row)
+            if mine and mine.revealedTo and mine.revealedTo[self.team] and mine.team ~= self.team then
+                table.insert(options, {
+                    id = "disarm_mine",
+                    name = "Disarm Mine",
+                    cost = 0,
+                    icon = "disarm",
+                    shortcut = "D",
+                    targetMine = mine,
+                    disabled = (self.hasMoved or self.isBuilding)
+                })
+            end
+        end
+    end
+    
+    return options
+end
+
 function Piece:draw(pixelX, pixelY, hexSideLength)
     local r, g, b = self:getColor()
     
@@ -246,29 +352,26 @@ function Piece:draw(pixelX, pixelY, hexSideLength)
     love.graphics.rectangle("fill", pixelX - 15, pixelY - 30, 30 * healthPercent, 4)
     
     -- Draw "E" for engineer pieces
-    if self.type == "engineer" then
-        love.graphics.setColor(1, 1, 1)
-        love.graphics.setFont(love.graphics.newFont(16))
-        local text = "E"
-        local textWidth = love.graphics.getFont():getWidth(text)
-        local textHeight = love.graphics.getFont():getHeight()
-        love.graphics.print(text, pixelX - textWidth / 2, pixelY - textHeight / 2)
-    end
-    -- Draw "S" for sniper pieces
-    if self.type == "sniper" then
-        love.graphics.setColor(1, 1, 1)
-        love.graphics.setFont(love.graphics.newFont(16))
-        local text = "S"
-        local textWidth = love.graphics.getFont():getWidth(text)
-        local textHeight = love.graphics.getFont():getHeight()
-        love.graphics.print(text, pixelX - textWidth / 2, pixelY - textHeight / 2)
-    end
-
-    -- Draw "I" for infantry pieces
     -- Draw type-specific icon if the type supplies one
-    if self.drawIcon then
+    if self.drawIcon and self.type ~= "sam" then
         -- type module provides drawIcon(pixelX, pixelY, hexSideLength)
         pcall(function() self:drawIcon(pixelX, pixelY, hexSideLength) end)
+    end
+
+    -- Draw veteran badge (small gold star) if veteran
+    if self.veteran then
+        local bx = pixelX + hexSideLength * 0.28
+        local by = pixelY - hexSideLength * 0.28
+        love.graphics.setColor(1, 0.85, 0)
+        -- simple star: draw a small filled circle as badge background and a star char
+        love.graphics.circle("fill", bx, by, hexSideLength * 0.14)
+        love.graphics.setColor(0, 0, 0)
+        love.graphics.setFont(love.graphics.newFont(10))
+        local text = "^"
+        local w = love.graphics.getFont():getWidth(text)
+        local h = love.graphics.getFont():getHeight()
+        love.graphics.setColor(0, 0, 0)
+        love.graphics.print(text, bx - w/2, by - h/2)
     end
 end
 

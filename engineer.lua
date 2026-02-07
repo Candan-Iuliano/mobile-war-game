@@ -135,6 +135,18 @@ function M.methods:placeMine(game)
 
     game:addMine(mine)
     return true
+
+
+
+end
+
+function M.methods:drawIcon(pixelX, pixelY, hexSideLength)
+    love.graphics.setColor(1,1,1)
+    love.graphics.setFont(love.graphics.newFont(16))
+    local text = "E"
+    local w = love.graphics.getFont():getWidth(text)
+    local h = love.graphics.getFont():getHeight()
+    love.graphics.print(text, pixelX - w/2, pixelY - h/2)
 end
 
 return M

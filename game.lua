@@ -11,6 +11,7 @@ local Resource = require("resource")
 local ActionMenu = require("action_menu")
 local FogOfWar = require("fog_of_war")
 local Network = require("network")
+local NewMenu = require("new_menu")
 
 function Game.new()
     local self = setmetatable({}, Game)
@@ -53,19 +54,26 @@ function Game.new()
     self:initializePieces()
     -- Mines placed on the map
     self.mines = {}
+    -- Defenses (tile improvements built by engineers)
+    -- defenses[col][row] = { team = team_id }
+    self.defenses = {}
     
     -- Bases (structures)
     self.bases = {}
     self:initializeBases()
+    -- UI: actions button state for selected context (shows bottom Actions button)
+    self.actionsButtonVisible = false
+    self.actionsButtonContext = nil
+    self.actionsButtonContextType = nil
     
     -- Resources
     self.resources = {}
     self:generateResources()
     
     -- Resource currency (for building units/bases)
-    self.teamResources = {[1] = 0, [2] = 0}  -- Resources owned by each team
+    self.teamResources = {[1] = 10, [2] = 10}  -- Resources owned by each team
     -- Oil resource (separate currency used for late-game units)
-    self.teamOil = {[1] = 0, [2] = 0}
+    self.teamOil = {[1] = 10, [2] = 0}
 
     -- Province/Region control data (disabled for now)
     self.provinces = nil
@@ -98,6 +106,11 @@ function Game.new()
     self.dragStartX = 0
     self.dragStartY = 0
     
+    -- Waypoint mode for multi-step moves
+    self.waypointMode = false  -- Are we setting waypoints?
+    self.waypointModePiece = nil  -- The piece we're setting waypoints for
+    self.tempWaypoints = {}  -- Temporary waypoints being set
+    
     -- Action menu UI (reusable for bases, pieces, resources, etc.)
     self.actionMenu = nil  -- ActionMenu instance
     self.actionMenuContext = nil  -- Context object (base, piece, etc.) that opened the menu
@@ -107,7 +120,8 @@ function Game.new()
     -- Hotseat/network/dev flags
     self.hotseatEnabled = true
     self.devMode = false
-    -- Dev placement menu state
+    -- Dev placement menu removed (dev menu cleaned up)
+    -- Dev placement menu state (uses reusable `new_menu`)
     self.devPlacementMenuOpen = false
     self.devPlacementSelected = nil -- { kind = "unit"|"base", name = "infantry" }
     -- Per-player ready flags for simultaneous placement
@@ -159,6 +173,31 @@ function Game:computeDiceOutcome(attackerDice, defenderDice)
         end
     end
     return dmgToTarget, dmgToAttacker
+end
+
+-- Compute morale bonus for a piece: veteran + adjacent commander buffs
+function Game:computeMorale(piece)
+    if not piece then return 0 end
+    local morale = 0
+    if piece.veteran then morale = morale + 1 end
+    return morale
+end
+
+
+-- Count adjacent commanders belonging to the same team as `piece`
+function Game:countAdjacentCommanders(piece)
+    if not piece or not piece.col or not piece.row or not piece.team then return 0 end
+    local hex = self.map:getTile(piece.col, piece.row)
+    if not hex then return 0 end
+    local cnt = 0
+    local neighbors = self.map:getNeighbors(hex, 1)
+    for _, n in ipairs(neighbors) do
+        local p = self:getPieceAt(n.col, n.row)
+        if p and p.team == piece.team and p.type == "commander" then
+            cnt = cnt + 1
+        end
+    end
+    return cnt
 end
 
 function Game:spawnCombatAnimation(x, y, rollsA, rollsD, attackerTeam, defenderTeam)
@@ -395,106 +434,137 @@ end
 --     end
 -- end
 
+
+
+
+
+
+
+
+
+-- Return neighbor offsets for a given column parity (matches HexMap:getNeighbors ordering)
+function Game:getHexNeighborOffsets(col)
+    local odd = (col % 2 ~= 0)
+    if not odd then
+        return {
+            {1, 0}, {1, 1}, {0, 1}, {-1, 0}, {-1, 1}, {0, -1}
+        }
+    else
+        return {
+            {1, -1}, {1, 0}, {0, 1}, {-1, -1}, {-1, 0}, {0, -1}
+        }
+    end
+end
+
+
 -- Generic external edge calculator for a set of tiles.
 -- `tiles` is an array of {col=row, row=row} or a table keyed by "col,row" -> true
 -- Returns array of edges: { {x1,y1,x2,y2}, ... }
--- function Game:calculateExternalEdges(tiles)
---     local tileSet = {}
---     if not tiles then return {} end
---     if #tiles > 0 then
---         for _, t in ipairs(tiles) do
---             tileSet[t.col .. "," .. t.row] = true
---         end
---     else
---         -- assume table keyed style
---         for k, v in pairs(tiles) do
---             if v then tileSet[k] = true end
---         end
---     end
+function Game:calculateExternalEdges(tiles)
+    local tileSet = {}
+    if not tiles then return {} end
+    if #tiles > 0 then
+        for _, t in ipairs(tiles) do
+            tileSet[t.col .. "," .. t.row] = true
+        end
+    else
+        -- assume table keyed style
+        for k, v in pairs(tiles) do
+            if v then tileSet[k] = true end
+        end
+    end
 
---     local edges = {}
---     for key, _ in pairs(tileSet) do
---         local comma = string.find(key, ",")
---         if not comma then goto continue_tile end
---         local col = tonumber(string.sub(key, 1, comma - 1))
---         local row = tonumber(string.sub(key, comma + 1))
---         local tile = self.map:getTile(col, row)
---         if not tile or not tile.points then goto continue_tile end
+    local edges = {}
+    for key, _ in pairs(tileSet) do
+        local comma = string.find(key, ",")
+        if not comma then goto continue_tile end
+        local col = tonumber(string.sub(key, 1, comma - 1))
+        local row = tonumber(string.sub(key, comma + 1))
+        local tile = self.map:getTile(col, row)
+        if not tile or not tile.points then goto continue_tile end
 
---         local offsets = self:getHexNeighborOffsets(col)
---         for i = 1, 6 do
---             local off = offsets[i]
---             local ncol = col + off[1]
---             local nrow = row + off[2]
---             local nkey = ncol .. "," .. nrow
---             if not tileSet[nkey] then
---                 -- Neighbor missing: pick the edge whose midpoint faces the neighbor center
---                 local cx, cy = self.map:gridToPixels(col, row)
---                 local ncx, ncy = self.map:gridToPixels(ncol, nrow)
---                 local vx, vy = ncx - cx, ncy - cy
---                 local vdist = math.sqrt(vx * vx + vy * vy)
---                 local vnx, vny = 0, 0
---                 if vdist > 0 then vnx, vny = vx / vdist, vy / vdist end
+        local offsets = self:getHexNeighborOffsets(col)
+        for i = 1, 6 do
+            local off = offsets[i]
+            local ncol = col + off[1]
+            local nrow = row + off[2]
+            local nkey = ncol .. "," .. nrow
+            if not tileSet[nkey] then
+                -- Neighbor missing: pick the edge whose midpoint faces the neighbor center
+                local cx, cy = self.map:gridToPixels(col, row)
+                local ncx, ncy = self.map:gridToPixels(ncol, nrow)
+                local vx, vy = ncx - cx, ncy - cy
+                local vdist = math.sqrt(vx * vx + vy * vy)
+                local vnx, vny = 0, 0
+                if vdist > 0 then vnx, vny = vx / vdist, vy / vdist end
 
---                 local bestJ, bestDot = 1, -999
---                 -- Find edge midpoint most aligned with neighbor direction
---                 for j = 1, 6 do
---                     local p1j = (j - 1) * 2 + 1
---                     local p2j = (j % 6) * 2 + 1
---                     local ax = tile.points[p1j]
---                     local ay = tile.points[p1j + 1]
---                     local bx = tile.points[p2j]
---                     local by = tile.points[p2j + 1]
---                     local mx = (ax + bx) * 0.5
---                     local my = (ay + by) * 0.5
---                     local ex, ey = mx - cx, my - cy
---                     local ed = math.sqrt(ex * ex + ey * ey)
---                     if ed > 0 and vdist > 0 then
---                         local enx, eny = ex / ed, ey / ed
---                         local dot = enx * vnx + eny * vny
---                         if dot > bestDot then
---                             bestDot = dot
---                             bestJ = j
---                         end
---                     elseif vdist == 0 then
---                         bestJ = i
---                         break
---                     end
---                 end
+                local bestJ, bestDot = 1, -999
+                -- Find edge midpoint most aligned with neighbor direction
+                for j = 1, 6 do
+                    local p1j = (j - 1) * 2 + 1
+                    local p2j = (j % 6) * 2 + 1
+                    local ax = tile.points[p1j]
+                    local ay = tile.points[p1j + 1]
+                    local bx = tile.points[p2j]
+                    local by = tile.points[p2j + 1]
+                    local mx = (ax + bx) * 0.5
+                    local my = (ay + by) * 0.5
+                    local ex, ey = mx - cx, my - cy
+                    local ed = math.sqrt(ex * ex + ey * ey)
+                    if ed > 0 and vdist > 0 then
+                        local enx, eny = ex / ed, ey / ed
+                        local dot = enx * vnx + eny * vny
+                        if dot > bestDot then
+                            bestDot = dot
+                            bestJ = j
+                        end
+                    elseif vdist == 0 then
+                        bestJ = i
+                        break
+                    end
+                end
 
---                 local p1i = (bestJ - 1) * 2 + 1
---                 local p2i = (bestJ % 6) * 2 + 1
---                 local ax = tile.points[p1i]
---                 local ay = tile.points[p1i + 1]
---                 local bx = tile.points[p2i]
---                 local by = tile.points[p2i + 1]
+                local p1i = (bestJ - 1) * 2 + 1
+                local p2i = (bestJ % 6) * 2 + 1
+                local ax = tile.points[p1i]
+                local ay = tile.points[p1i + 1]
+                local bx = tile.points[p2i]
+                local by = tile.points[p2i + 1]
 
---                 -- Midpoint and inward normal
---                 local mx = (ax + bx) * 0.5
---                 local my = (ay + by) * 0.5
---                 local dx = cx - mx
---                 local dy = cy - my
---                 local distn = math.sqrt(dx * dx + dy * dy)
---                 local nx, ny = 0, 0
---                 if distn > 0 then nx, ny = dx / distn, dy / distn end
+                -- Midpoint and inward normal
+                local mx = (ax + bx) * 0.5
+                local my = (ay + by) * 0.5
+                local dx = cx - mx
+                local dy = cy - my
+                local distn = math.sqrt(dx * dx + dy * dy)
+                local nx, ny = 0, 0
+                if distn > 0 then nx, ny = dx / distn, dy / distn end
 
---                 -- Slightly smaller inset so borders sit closer to hex edges
---                 local inset = math.min(6, (self.hexSideLength or 32) * 0.12)
---                 local ox = nx * inset
---                 local oy = ny * inset
+                -- Minimal inset to push lines closer to hex edges
+                local inset = math.min(2, (self.hexSideLength or 32) * 0.03)
+                local ox = nx * inset
+                local oy = ny * inset
 
---                 local x1 = ax + ox
---                 local y1 = ay + oy
---                 local x2 = bx + ox
---                 local y2 = by + oy
---                 table.insert(edges, {x1, y1, x2, y2})
---             end
---         end
---         ::continue_tile::
---     end
+                local x1 = ax + ox
+                local y1 = ay + oy
+                local x2 = bx + ox
+                local y2 = by + oy
+                table.insert(edges, {x1, y1, x2, y2})
+            end
+        end
+        ::continue_tile::
+    end
 
---     return edges
--- end
+    return edges
+end
+
+-- Return external edges for tiles within a radius from a center (useful for airbase outer ring drawing)
+function Game:getRingEdges(centerCol, centerRow, radius)
+    if not centerCol or not centerRow or not radius or radius <= 0 then return {} end
+    local tiles = self:getTilesWithinRadius(centerCol, centerRow, radius)
+    if not tiles or #tiles == 0 then return {} end
+    return self:calculateExternalEdges(tiles)
+end
 
 -- -- Determine owner of a province (returns team number or nil). A team owns a province if it has one or more HQs in that province and no HQs of other teams.
 -- function Game:getProvinceOwner(provinceId)
@@ -647,6 +717,27 @@ function Game:generateResources()
         return false
     end
 
+    -- Helper: check if tile is a valid resource location (land only, no water/forest/hills/mountains)
+    local function isValidResourceTile(tile)
+        if not tile then return false end
+        -- Only allow flat land tiles; exclude water, forest, hills, mountains
+        return tile.isLand and not tile.isWater and not tile.isForest and not tile.isHill and not tile.isMountain
+    end
+
+    -- Helper: check if resource is too close to existing resources (minimum distance)
+    local minResourceDistance = 5  -- Minimum hex distance between resources
+    local function isTooCloseToResources(col, row)
+        for _, resource in ipairs(self.resources) do
+            local dx = col - resource.col
+            local dy = row - resource.row
+            local dist = math.sqrt(dx * dx + dy * dy)
+            if dist < minResourceDistance then
+                return true
+            end
+        end
+        return false
+    end
+
     -- First, create resources marked by the map generator (tile.resourceType)
     local centerCol = math.floor(self.mapWidth / 2)
     local centerRow = math.floor(self.mapHeight / 2)
@@ -654,7 +745,7 @@ function Game:generateResources()
     for col = 1, self.mapWidth do
         for row = 1, self.mapHeight do
             local tile = self.map:getTile(col, row)
-            if tile and tile.resourceType and tile.isLand and not self:getResourceAt(col, row) and not inStartingArea(col, row) then
+            if tile and tile.resourceType and isValidResourceTile(tile) and not self:getResourceAt(col, row) and not inStartingArea(col, row) and not isTooCloseToResources(col, row) then
                 local rtype = tile.resourceType or "generic"
                 -- Only place oil if it's reasonably close to the map center
                 if rtype == "oil" then
@@ -687,8 +778,8 @@ function Game:generateResources()
             local col = math.random(5, self.mapWidth - 5)  -- Avoid edges
             local row = math.random(5, self.mapHeight - 5)
             local tile = self.map:getTile(col, row)
-            if tile and tile.isLand then
-                if not self:getPieceAt(col, row) and not self:getBaseAt(col, row) and not self:getResourceAt(col, row) and not inStartingArea(col, row) then
+            if tile and isValidResourceTile(tile) then
+                if not self:getPieceAt(col, row) and not self:getBaseAt(col, row) and not self:getResourceAt(col, row) and not inStartingArea(col, row) and not isTooCloseToResources(col, row) then
                     local resource = Resource.new("generic", self.map, col, row)
                     table.insert(self.resources, resource)
                     placed = true
@@ -713,31 +804,31 @@ function Game:generateResources()
         return cnt
     end
 
-    -- Place oil for upper half
+    -- Place oil for upper half (relax distance constraint for guaranteed oil spawns)
     local tries = 0
-    while countOilInHalf(true) < minOilPerSide and tries < 400 do
+    while countOilInHalf(true) < minOilPerSide and tries < 1000 do
         tries = tries + 1
         local angle = math.random() * math.pi * 2
         local dist = math.random(0, oilRadius)
         local col = centerCol + math.floor(math.cos(angle) * dist + 0.5)
         local row = centerRow - math.abs(math.floor(math.sin(angle) * dist + 0.5)) - 1
         local tile = self.map:getTile(col, row)
-        if tile and tile.isLand and not inStartingArea(col, row) and not self:getResourceAt(col, row) then
+        if tile and isValidResourceTile(tile) and not inStartingArea(col, row) and not self:getResourceAt(col, row) then
             local resource = Resource.new("oil", self.map, col, row)
             table.insert(self.resources, resource)
         end
     end
 
-    -- Place oil for lower half
+    -- Place oil for lower half (relax distance constraint for guaranteed oil spawns)
     tries = 0
-    while countOilInHalf(false) < minOilPerSide and tries < 400 do
+    while countOilInHalf(false) < minOilPerSide and tries < 1000 do
         tries = tries + 1
         local angle = math.random() * math.pi * 2
         local dist = math.random(0, oilRadius)
         local col = centerCol + math.floor(math.cos(angle) * dist + 0.5)
         local row = centerRow + math.abs(math.floor(math.sin(angle) * dist + 0.5)) + 1
         local tile = self.map:getTile(col, row)
-        if tile and tile.isLand and not inStartingArea(col, row) and not self:getResourceAt(col, row) then
+        if tile and isValidResourceTile(tile) and not inStartingArea(col, row) and not self:getResourceAt(col, row) then
             local resource = Resource.new("oil", self.map, col, row)
             table.insert(self.resources, resource)
         end
@@ -782,6 +873,10 @@ function Game:update(dt)
         for team = 1, 2 do
             self.fogOfWar:updateVisibility(team, self.pieces, self.bases, self.teamStartingCorners)
         end
+        
+        -- Clear waypoints if an enemy is in view range
+        self:clearWaypointsOnEnemyContact()
+        
         -- Update combat animations
         self:updateCombatAnimations(dt)
         -- network messages are polled by main.lua and forwarded to Game:handleNetworkMessage
@@ -890,11 +985,34 @@ function Game:handleNetworkMessage(msg)
                     dDice = 0
                 end
             end
+            -- Apply morale bonuses (each morale point = +1 die)
+            local moraleA = self:computeMorale(attacker) or 0
+            local moraleD = self:computeMorale(target) or 0
+            aDice = (aDice or 0) + (moraleA or 0)
+            dDice = (dDice or 0) + (moraleD or 0)
             local maxA = (attacker and attacker.getDieMax and attacker:getDieMax()) or 6
             local maxD = (target and target.getDieMax and target:getDieMax()) or 6
+            -- Commander adjacency increases the max die face by +1 per adjacent commander
+            local cmdA = self:countAdjacentCommanders(attacker) or 0
+            local cmdD = self:countAdjacentCommanders(target) or 0
+            maxA = maxA + (cmdA or 0)
+            maxD = maxD + (cmdD or 0)
+            -- Check if defender is on a defensive structure (gives -1 to defender max die)
+            local defenseHere = self:getDefenseAt(amsg.toCol, amsg.toRow)
+            local defenseEffect = 0
+            if defenseHere and target and defenseHere.team == target.team then
+                defenseEffect = -1
+                maxD = math.max(1, maxD + defenseEffect)
+            end
+            pcall(function()
+                print(string.format("[DBG attack host PRE] aDice=%s moraleA=%s cmdA=%s maxA=%s  dDice=%s moraleD=%s cmdD=%s maxD=%s defense=%s defEff=%s", tostring(aDice), tostring(moraleA), tostring(cmdA), tostring(maxA), tostring(dDice), tostring(moraleD), tostring(cmdD), tostring(maxD), tostring(defenseHere ~= nil), tostring(defenseEffect)))
+            end)
             local rollsA = self:rollDice(aDice, maxA)
             local rollsD = self:rollDice(dDice, maxD)
             local damageToTarget, damageToAttacker = self:computeDiceOutcome(rollsA, rollsD)
+            pcall(function()
+                print(string.format("[DBG attack host POST] rollsA=%s rollsD=%s dmgToTarget=%s dmgToAttacker=%s", tostring(table.concat(rollsA,",")), tostring(table.concat(rollsD,",")), tostring(damageToTarget), tostring(damageToAttacker)))
+            end)
 
             -- Reveal attacker if hidden (authoritative)
             if attacker and attacker.hiddenInForest then
@@ -920,6 +1038,12 @@ function Game:handleNetworkMessage(msg)
             if target and damageToTarget > 0 then
                 local wasKilled = target:takeDamage(damageToTarget)
                 if wasKilled then
+                    -- Increment attacker's kill count and apply veteran status if threshold reached
+                    if attacker then
+                        attacker.kills = (attacker.kills or 0) + 1
+                        if attacker.kills >= 3 then attacker.veteran = true end
+                    end
+                    -- Remove the killed piece
                     for i, p in ipairs(self.pieces) do if p == target then table.remove(self.pieces, i); break end end
                     -- If killed and adjacent, consider movement into tile
                     if attacker and self:isWithinRange(attacker.col, attacker.row, amsg.toCol, amsg.toRow, 1) then
@@ -948,11 +1072,45 @@ function Game:handleNetworkMessage(msg)
 
             if moved and attacker then attacker:setPosition(amsg.toCol, amsg.toRow) end
 
-            -- Broadcast commit with dice rolls and damage so clients can animate and apply results
-            self:sendCommit({type = "attack", fromCol = amsg.fromCol, fromRow = amsg.fromRow, toCol = amsg.toCol, toRow = amsg.toRow, attackerRolls = rollsA, defenderRolls = rollsD, damageToTarget = damageToTarget, damageToAttacker = damageToAttacker, moved = moved, attackerTeam = attacker and attacker.team or nil, defenderTeam = target and target.team or nil})
+            -- Broadcast commit with dice rolls, damage and veteran/kill state so clients can animate and apply results
+            self:sendCommit({
+                type = "attack",
+                fromCol = amsg.fromCol,
+                fromRow = amsg.fromRow,
+                toCol = amsg.toCol,
+                toRow = amsg.toRow,
+                attackerRolls = rollsA,
+                defenderRolls = rollsD,
+                damageToTarget = damageToTarget,
+                damageToAttacker = damageToAttacker,
+                moved = moved,
+                attackerTeam = attacker and attacker.team or nil,
+                defenderTeam = target and target.team or nil,
+                attackerKills = attacker and (attacker.kills or 0) or 0,
+                attackerVeteran = attacker and (attacker.veteran and 1 or 0) or 0,
+                defenderKills = target and (target.kills or 0) or 0,
+                defenderVeteran = target and (target.veteran and 1 or 0) or 0,
+            })
 
             -- After broadcasting, host should authoritative trigger any mine effects caused by movement
             if moved and attacker then self:triggerMineAt(amsg.toCol, amsg.toRow, attacker) end
+        end
+    elseif msg.type == "setVeteranRequest" then
+        -- Host applies veteran request and broadcasts commit
+        if self.isHost then
+            local col = tonumber(msg.col)
+            local row = tonumber(msg.row)
+            local team = tonumber(msg.team)
+            local veteranFlag = (msg.veteran == 1 or msg.veteran == true)
+            if col and row then
+                local piece = self:getPieceAt(col, row)
+                if piece and piece.team == team then
+                    piece.veteran = veteranFlag
+                    if veteranFlag then piece.kills = math.max(3, piece.kills or 3) else piece.kills = 0 end
+                    -- Broadcast commit so clients apply the change
+                    self:sendCommit({type = "setVeteran", col = col, row = row, team = team, kills = piece.kills or 0, veteran = piece.veteran and 1 or 0})
+                end
+            end
         end
     elseif msg.type == "placePieceRequest" then
         if self.isHost then
@@ -1261,6 +1419,36 @@ function Game:handleNetworkMessage(msg)
         -- Mirror ammo consumption on attacker if present
         if attacker and attacker.useAmmo then attacker:useAmmo() end
 
+        -- Apply authoritative kill/veteran state from host so clients stay in sync
+        if msg.attackerKills then
+            local ak = tonumber(msg.attackerKills) or msg.attackerKills
+            if attacker and ak then attacker.kills = ak end
+        end
+    elseif msg.type == "setVeteran" then
+        -- Commit from host to set veteran state on a piece
+        local col = tonumber(msg.col)
+        local row = tonumber(msg.row)
+        local team = tonumber(msg.team)
+        local kills = tonumber(msg.kills) or 0
+        local veteranFlag = (msg.veteran == 1 or msg.veteran == true)
+        if col and row then
+            local piece = self:getPieceAt(col, row)
+            if piece then
+                piece.kills = kills
+                piece.veteran = veteranFlag
+            end
+        end
+        if msg.attackerVeteran then
+            if attacker then attacker.veteran = (msg.attackerVeteran == 1 or msg.attackerVeteran == true) end
+        end
+        if msg.defenderKills then
+            local dk = tonumber(msg.defenderKills) or msg.defenderKills
+            if target and dk then target.kills = dk end
+        end
+        if msg.defenderVeteran then
+            if target then target.veteran = (msg.defenderVeteran == 1 or msg.defenderVeteran == true) end
+        end
+
         -- Spawn animation (midpoint) if rolls provided
         local ax, ay = self.map:gridToPixels(fromCol, fromRow)
         local bx, by = self.map:gridToPixels(toCol, toRow)
@@ -1519,8 +1707,21 @@ function Game:draw()
             if drawBase then
                 local pixelX, pixelY = self.map:gridToPixels(base.col, base.row)
                 -- Draw influence radius first so base symbol is rendered on top
-                self:drawBaseRadius(base, pixelX, pixelY, viewTeam)
-                base:draw(pixelX, pixelY, self.hexSideLength)
+                if base.type == "airbase" and base.draw then
+                    -- Airbase draw method handles its own radius visualization
+                    base:draw(pixelX, pixelY, self.hexSideLength, self)
+                else
+                    self:drawBaseRadius(base, pixelX, pixelY, viewTeam)
+                    base:draw(pixelX, pixelY, self.hexSideLength)
+                end
+                -- Draw selection ring if selected
+                if base == self.actionsButtonContext and self.actionsButtonContextType == "base" then
+                    love.graphics.setColor(1, 1, 0, 1) -- Yellow ring
+                    love.graphics.setLineWidth(3)
+                    love.graphics.circle("line", pixelX, pixelY, self.hexSideLength * 0.8, 16)
+                    love.graphics.setLineWidth(1)
+                    love.graphics.setColor(1, 1, 1, 1)
+                end
             end
         end
     end
@@ -1556,9 +1757,68 @@ function Game:draw()
         end
     end
     
+    -- Draw defensive structures on tiles
+    if self.defenses then
+        local viewer = viewTeam or (self.localTeam or self.currentTurn)
+        for col, row_data in pairs(self.defenses) do
+            for row, defense in pairs(row_data) do
+                if defense and defense.col and defense.row then
+                    local dx, dy = self.map:gridToPixels(defense.col, defense.row)
+                    -- Team colors
+                    local r, g, b = 0.5, 0.5, 0.5
+                    if defense.team == 1 then r, g, b = 0.85, 0.15, 0.15
+                    elseif defense.team == 2 then r, g, b = 0.15, 0.25, 0.85 end
+                    
+                    -- Draw hollow (outline-only) hex at double previous size
+                    local hexSize = self.hexSideLength * 0.8
+
+                    -- Save graphics state we will modify and restore after drawing
+                    local pr, pg, pb, pa = love.graphics.getColor()
+                    local prevLine = love.graphics.getLineWidth()
+
+                    -- Team-colored dashed outline (no fill)
+                    love.graphics.setColor(r, g, b, 1)
+                    love.graphics.setLineWidth(3)
+                    local dashLength = math.max(6, math.floor(self.hexSideLength * 0.08))
+                    local gapLength = math.max(4, math.floor(self.hexSideLength * 0.06))
+
+                    for i = 0, 5 do
+                        local angle1 = (i * math.pi / 3) - math.pi / 2
+                        local angle2 = ((i + 1) * math.pi / 3) - math.pi / 2
+                        local x1 = dx + hexSize * math.cos(angle1)
+                        local y1 = dy + hexSize * math.sin(angle1)
+                        local x2 = dx + hexSize * math.cos(angle2)
+                        local y2 = dy + hexSize * math.sin(angle2)
+
+                        -- Calculate segment length and draw dashes in team color
+                        local segLen = math.sqrt((x2-x1)^2 + (y2-y1)^2)
+                        if segLen > 0 then
+                            local dx_seg = (x2 - x1) / segLen
+                            local dy_seg = (y2 - y1) / segLen
+                            local t = 0
+                            while t < segLen do
+                                local dashEnd = math.min(t + dashLength, segLen)
+                                local sx = x1 + dx_seg * t
+                                local sy = y1 + dy_seg * t
+                                local ex = x1 + dx_seg * dashEnd
+                                local ey = y1 + dy_seg * dashEnd
+                                love.graphics.line(sx, sy, ex, ey)
+                                t = dashEnd + gapLength
+                            end
+                        end
+                    end
+
+                    -- Restore previous graphics state
+                    love.graphics.setLineWidth(prevLine)
+                    love.graphics.setColor(pr, pg, pb, pa)
+                end
+            end
+        end
+    end
+    
     -- (Visibility updated in Game:update; avoid heavy update here)
 
-    -- Draw air superiority markers on tiles ("=", "^", "˅") for tiles with AS
+    -- Draw air superiority numbers on tiles (show both teams' values, including zeros)
     local asMap = self.airSuperiorityMap or self:calculateAirSuperiorityMap()
     for key, vals in pairs(asMap) do
         local comma = string.find(key, ",")
@@ -1575,22 +1835,20 @@ function Game:draw()
                 local t2 = vals[2] or 0
                 local playerAS = (viewTeam == 1) and t1 or t2
                 local enemyAS = (viewTeam == 1) and t2 or t1
-
+                -- Symbolic air superiority markers only (no numeric overlay)
+                -- Show symbol when the viewing team has superiority even if enemy has 0
                 local symbol = nil
-                -- tie and both present
                 if playerAS > 0 and playerAS == enemyAS then
                     symbol = "="
-                elseif playerAS > enemyAS and enemyAS > 0 then
+                elseif playerAS > enemyAS then
                     symbol = "^"
-                elseif enemyAS > playerAS and enemyAS > 0 then
+                elseif enemyAS > playerAS then
                     symbol = "v"
                 end
-
                 if symbol then
                     local tile = self.map:getTile(col, row)
                     if tile and tile.points then
                         local px, py = self.map:gridToPixels(col, row)
-                        -- Choose color: team color for favorable/tie, enemy color for losing
                         if symbol == "v" then
                             love.graphics.setColor(1, 0, 0)
                         else
@@ -1625,7 +1883,11 @@ function Game:draw()
             end
             if drawPiece then
                 local pixelX, pixelY = self.map:gridToPixels(piece.col, piece.row)
+                -- Pass game object to draw method so special units (like SAM) can render effects
                 piece:draw(pixelX, pixelY, self.hexSideLength)
+                if piece.type == "sam" then
+                    piece:drawIcon(pixelX, pixelY, self.hexSideLength, self)
+                end
             end
         end
     end
@@ -1649,18 +1911,70 @@ function Game:draw()
     --         local visionRange = self.selectedPiece:getMovementRange() or 3
     --         self.map:drawLineOfSightDebug(sourceHex, visionRange, 0, 0)
     --     end
-    -- end
+    -- Draw existing waypoint paths for all pieces (only for current team)
+    for _, piece in ipairs(self.pieces) do
+        -- Only show waypoints for pieces belonging to the current turn (not visible to enemy)
+        if piece.team == self.currentTurn and piece.waypoints and #piece.waypoints > 0 then
+            local waypoints = {{col = piece.col, row = piece.row}}
+            for _, wp in ipairs(piece.waypoints) do
+                table.insert(waypoints, wp)
+            end
+            -- Team-colored paths
+            if piece.team == 1 then
+                love.graphics.setColor(1, 0.3, 0.3, 0.4)  -- Red for team 1
+            else
+                love.graphics.setColor(0.3, 0.3, 1, 0.4)  -- Blue for team 2
+            end
+            love.graphics.setLineWidth(3)
+            for i = 1, #waypoints - 1 do
+                local p1x, p1y = self.map:gridToPixels(waypoints[i].col, waypoints[i].row)
+                local p2x, p2y = self.map:gridToPixels(waypoints[i+1].col, waypoints[i+1].row)
+                love.graphics.line(p1x, p1y, p2x, p2y)
+            end
+            -- Draw circle at the final waypoint target
+            if #waypoints > 1 then
+                local finalWp = waypoints[#waypoints]
+                local px, py = self.map:gridToPixels(finalWp.col, finalWp.row)
+                love.graphics.circle("line", px, py, self.hexSideLength * 0.4)
+            end
+            love.graphics.setLineWidth(1)
+            love.graphics.setColor(1,1,1,1)
+        end
+    end
     
     -- Draw action menu on top of pieces and overlays
     if self.actionMenu then
         self:drawActionMenu()
     end
 
-     -- During placement, show fog for the local player (or placementTeam if not networked)
+    -- During placement, show fog for the local player (or placementTeam if not networked)
     local viewTeam = self.localTeam or self.placementTeam
     self.fogOfWar:draw(viewTeam, self.camera, 0, 0)
 
-    
+    -- Draw airstrike targeting crosshair (world-space; drawn under UI)
+    if self.airstrikeTargeting then
+        local mx, my = love.mouse.getPosition()
+        local wx, wy = self.camera:screenToWorld(mx, my)
+        local tcol, trow = self.map:pixelsToGrid(wx, wy)
+        if tcol and trow then
+            local px, py = self.map:gridToPixels(tcol, trow)
+            local allowed = false
+            pcall(function() allowed = self:canAirstrike(self.airstrikeTargeting.team, tcol, trow) end)
+            if allowed then
+                love.graphics.setColor(0, 1, 0, 0.9)
+            else
+                love.graphics.setColor(1, 0, 0, 0.9)
+            end
+            local radius = self.hexSideLength * 0.6
+            love.graphics.setLineWidth(2)
+            love.graphics.circle("line", px, py, radius)
+            love.graphics.line(px - radius, py, px + radius, py)
+            love.graphics.line(px, py - radius, px, py + radius)
+            love.graphics.setLineWidth(1)
+            love.graphics.setColor(1,1,1,1)
+        end
+    end
+
     love.graphics.pop()
     
     -- Draw UI (always on screen)
@@ -1669,7 +1983,8 @@ function Game:draw()
     self:drawDevPlacementUI()
 end
 
--- Draw dev placement button/menu globally for dev single-player
+
+-- Draw dev placement button/menu globally for dev single-player (buttons with backgrounds)
 function Game:drawDevPlacementUI()
     if not self.devMode then return end
     local offline = not (Network and Network.isConnected and Network.isConnected and Network.isConnected())
@@ -1684,65 +1999,79 @@ function Game:drawDevPlacementUI()
     love.graphics.printf("Dev Placement", bx, by + 6, btnW, "center")
 
     if self.devPlacementMenuOpen then
-        local menuW = 180
-        local menuX = bx - 190
+        local options, bW, bH, pad = self:getDevPlacementOptions()
+        local menuX = bx - bW - 8
         local menuY = by
-        local units = {"infantry","engineer","sniper","tank"}
-        local bases = {"hq","ammoDepot","supplyDepot","airbase"}
-        local labelGap = 20
-        local itemH = 22
-        local itemSpacing = 26
-        local smallGap = 4
 
-        local unitsLabelY = menuY + 30
-        local unitsItemsStartY = unitsLabelY + labelGap
-        local unitsAreaH = #units * itemSpacing
+        -- Draw backdrop to block clicks through the menu
+        local totalH = #options * (bH + pad) - pad
+        love.graphics.setColor(0.06, 0.06, 0.06, 0.95)
+        love.graphics.rectangle("fill", menuX - 6, menuY - 6, bW + 12, totalH + 12, 6, 6)
 
-        local afterUnitsY = unitsItemsStartY + unitsAreaH
-        local basesLabelY = afterUnitsY + smallGap
-        local basesItemsStartY = basesLabelY + labelGap
-        local basesAreaH = #bases * itemSpacing
-
-        local instrY = basesItemsStartY + basesAreaH + 8
-        local menuH = instrY + 18
-
-        love.graphics.setColor(0,0,0,0.85)
-        love.graphics.rectangle("fill", menuX, menuY, menuW, menuH, 6, 6)
-        love.graphics.setColor(1,1,1,1)
-        love.graphics.printf("Dev Placement Menu", menuX, menuY + 6, menuW, "center")
-        love.graphics.setFont(love.graphics.newFont(12))
-
-        love.graphics.printf("Units:", menuX + 8, unitsLabelY, menuW - 16, "left")
-        local y = unitsItemsStartY
-        for i, u in ipairs(units) do
-            local itX, itY, itW, itH = menuX + 8, y, menuW - 16, itemH
-            love.graphics.setColor(0.2,0.2,0.2,0.9)
-            love.graphics.rectangle("fill", itX, itY, itW, itH, 4, 4)
-            love.graphics.setColor(1,1,1,1)
-            love.graphics.print(u, itX + 6, itY + 4)
-            y = y + itemSpacing
-        end
-
-        love.graphics.printf("Bases:", menuX + 8, basesLabelY, menuW - 16, "left")
-        y = basesItemsStartY
-        for i, b in ipairs(bases) do
-            local itX, itY, itW, itH = menuX + 8, y, menuW - 16, itemH
-            love.graphics.setColor(0.2,0.2,0.2,0.9)
-            love.graphics.rectangle("fill", itX, itY, itW, itH, 4, 4)
-            love.graphics.setColor(1,1,1,1)
-            love.graphics.print(b, itX + 6, itY + 4)
-            y = y + itemSpacing
-        end
-
-        love.graphics.setFont(love.graphics.newFont(10))
-        love.graphics.setColor(1,1,1,0.8)
-        love.graphics.printf("Click an item to enable free placement for the selected team.", menuX + 8, instrY, menuW - 16, "left")
+        local menu = NewMenu.new(menuX, menuY, options, {buttonWidth = bW, buttonHeight = bH, padding = pad})
+        menu:draw()
     end
 end
 
 
+-- Return options for the dev placement menu so drawing and input share the same layout
+function Game:getDevPlacementOptions()
+    local buttonWidth = 100
+    local buttonHeight = 24
+    local padding = 4
+    local options = {}
+    local units = {"infantry", "engineer", "sniper", "tank", "commander", "sam"}
+    for _, unit in ipairs(units) do
+        table.insert(options, {
+            label = unit,
+            onClick = function()
+                self.devPlacementSelected = { kind = "unit", name = unit }
+            end
+        })
+    end
+    local bases = {"hq", "ammoDepot", "supplyDepot", "airbase"}
+    for _, base in ipairs(bases) do
+        table.insert(options, {
+            label = base,
+            onClick = function()
+                self.devPlacementSelected = { kind = "base", name = base }
+            end
+        })
+    end
+    table.insert(options, {
+        label = "defense",
+        onClick = function()
+            self.devPlacementSelected = { kind = "defense" }
+        end
+    })
+    table.insert(options, {
+        label = "Toggle Veteran",
+        onClick = function()
+            local sel = self.selectedPiece
+            if sel then
+                local toggleTo = not sel.veteran
+                sel.veteran = toggleTo
+                if toggleTo then sel.kills = math.max(3, sel.kills or 3) else sel.kills = 0 end
+                if self.isHost and Network and Network.isConnected and Network.isConnected() and not self._applyingRemote then
+                    self:sendCommit({type = "setVeteran", col = sel.col, row = sel.row, team = sel.team, kills = sel.kills or 0, veteran = sel.veteran and 1 or 0})
+                elseif Network and Network.isConnected and Network.isConnected() and not self.isHost and not self._applyingRemote then
+                    pcall(function() Network.send({type = "setVeteranRequest", col = sel.col, row = sel.row, team = sel.team, veteran = sel.veteran and 1 or 0}) end)
+                end
+            end
+        end
+    })
+    return options, buttonWidth, buttonHeight, padding
+end
+
+-- Draw dev placement button/menu globally for dev single-player
+-- Dev placement menu removed
+
+
 
 function Game:drawValidMoves()
+    -- Only draw if we have valid moves/attacks calculated
+    if not self.validMoves or not self.validAttacks then return end
+    
     -- Draw valid movement tiles
     love.graphics.setColor(0, 1, 0, 0.3)
     for _, move in ipairs(self.validMoves) do
@@ -1821,13 +2150,14 @@ function Game:drawStartingAreas(viewTeam)
 end
 
 function Game:drawBaseRadius(base, pixelX, pixelY, viewTeam)
-    -- Draw hexagons within the base's influence radius, respecting terrain
-    local radius = base:getRadius()
-
-    -- Temporary: skip drawing airbase radius while debugging performance
-    if base and base.type == "airbase" then
+    -- Skip drawing radius for HQ, Ammo Depot, Supply Depot
+    -- Airbase handles its own radius drawing in its draw method
+    if base.type == "hq" or base.type == "ammoDepot" or base.type == "supplyDepot" or base.type == "airbase" then
         return
     end
+
+    -- Draw hexagons within the base's influence radius, respecting terrain
+    local radius = base:getRadius()
 
     -- Use getHexesWithinRange which respects terrain passability
     -- Pass base's team so enemy pieces don't block the visualization
@@ -1958,6 +2288,83 @@ function Game:drawUI()
                 end
             end
         end
+        -- Draw bottom Actions button when a selection/context is available
+            if self.actionsButtonVisible then
+                local btnW, btnH = 140, 36
+                local bx = love.graphics.getWidth() - btnW - 16
+                local by = love.graphics.getHeight() - btnH - 12
+                local disabled = true
+                if self.actionsButtonContext then
+                    local opts = self:getActionOptions(self.actionsButtonContext, self.actionsButtonContextType)
+                    if opts and #opts > 0 then disabled = false end
+                end
+                if disabled then
+                    love.graphics.setColor(0.45, 0.45, 0.45, 0.95)
+                else
+                    love.graphics.setColor(0.18, 0.18, 0.22, 0.95)
+                end
+                love.graphics.rectangle("fill", bx, by, btnW, btnH, 8, 8)
+                love.graphics.setColor(1,1,1,1)
+                local label = disabled and "Actions (none)" or "Actions"
+                love.graphics.setFont(love.graphics.newFont(14))
+                love.graphics.printf(label, bx, by + 8, btnW, "center")
+
+                -- Draw actions panel via reusable menu when open
+                if self.actionsPanelOpen and self.actionsPanelOptions and #self.actionsPanelOptions > 0 then
+                    local opts = self.actionsPanelOptions
+                    -- Set affordability and labels
+                    local team = self.actionsButtonContext and self.actionsButtonContext.team or self.currentTurn
+                    for _, opt in ipairs(opts) do
+                        opt.label = opt.name
+                        -- Check resource affordability
+                        if not opt.disabled and opt.cost and opt.cost > 0 then
+                            if (self.teamResources[team] or 0) < opt.cost then
+                                opt.disabled = true
+                            end
+                        end
+                        -- Check oil affordability
+                        if not opt.disabled and opt.oilCost and opt.oilCost > 0 then
+                            if (self.teamOil[team] or 0) < opt.oilCost then
+                                opt.disabled = true
+                            end
+                        end
+                        -- Build display label with costs
+                        local costParts = {}
+                        if opt.cost and opt.cost > 0 then
+                            table.insert(costParts, opt.cost .. (opt.costType == "oil" and "O" or "R"))
+                        end
+                        if opt.oilCost and opt.oilCost > 0 then
+                            table.insert(costParts, opt.oilCost .. "O")
+                        end
+                        if #costParts > 0 then
+                            opt.displayLabel = opt.label .. " (" .. table.concat(costParts, " + ") .. ")"
+                        else
+                            opt.displayLabel = opt.label
+                        end
+                        opt.onClick = function() self:executeAction(opt) end
+                    end
+                    -- Calculate max button width
+                    local maxWidth = 0
+                    local font = love.graphics.getFont()
+                    for _, opt in ipairs(opts) do
+                        local w = font:getWidth(opt.displayLabel)
+                        if w > maxWidth then maxWidth = w end
+                    end
+                    local buttonWidth = math.max(120, maxWidth + 20)  -- padding for text
+                    local panelW = buttonWidth
+                    local panelX = bx - panelW - 8
+                    local numOpts = #opts
+                    local buttonH = 24
+                    local padding = 4
+                    local panelH = numOpts * (buttonH + padding) - padding  -- approximate
+                    local panelY = by - panelH - 8
+                    local menu = NewMenu.new(panelX, panelY, opts, {buttonWidth = buttonWidth, buttonHeight = buttonH, padding = padding})
+                    menu:draw()
+                    self.actionsPanelMenu = menu
+                else
+                    self.actionsPanelMenu = nil
+                end
+            end
         local basesInfo = string.format("Bases: HQ: %d | Ammo: %d | Supply: %d", hqCount, ammoDepotCount, supplyDepotCount)
         love.graphics.setFont(love.graphics.newFont(12))
         love.graphics.print(basesInfo, 10, 70)
@@ -2044,6 +2451,9 @@ function Game:drawUI()
 end
 
 function Game:mousepressed(x, y, button)
+    -- Check shift key for waypoint mode
+    local shift = love.keyboard.isDown("lshift") or love.keyboard.isDown("rshift")
+    
     -- Check ready button click in screen coordinates first (UI sits above camera)
     if self.state == "placing" and self.localTeam then
         local btnW, btnH = 120, 32
@@ -2074,7 +2484,8 @@ function Game:mousepressed(x, y, button)
             return
         end
     end
-    -- Dev placement button click (visible when devMode)
+    -- Dev menu removed
+    -- Dev placement button click (visible when devMode) - buttons with backgrounds
     if self.devMode then
         local btnW, btnH = 120, 28
         local bx = love.graphics.getWidth() - btnW - 16
@@ -2083,51 +2494,47 @@ function Game:mousepressed(x, y, button)
             self.devPlacementMenuOpen = not self.devPlacementMenuOpen
             return
         end
-        -- If menu open, check for menu item clicks
         if self.devPlacementMenuOpen then
-            local menuW = 180
-            local menuX = bx - 190
+            local options, bW, bH, pad = self:getDevPlacementOptions()
+            local menuX = bx - bW - 8
             local menuY = by
-            local units = {"infantry","engineer","sniper","tank"}
-            local bases = {"hq","ammoDepot","supplyDepot","airbase"}
-            local labelGap = 20
-            local itemSpacing = 26
-            local smallGap = 4
+            local menu = NewMenu.new(menuX, menuY, options, {buttonWidth = bW, buttonHeight = bH, padding = pad})
+            if menu:handleClick(x, y) then
+                return
+            end
 
-            local unitsLabelY = menuY + 30
-            local unitsItemsStartY = unitsLabelY + labelGap
-            local unitsAreaH = #units * itemSpacing
+            -- Consume clicks anywhere in the menu backdrop so clicks don't fall through to the map
+            local totalH = #options * (bH + pad) - pad
+            if x >= menuX and x <= menuX + bW and y >= menuY and y <= menuY + totalH then
+                return
+            end
+        end
+    end
 
-            local afterUnitsY = unitsItemsStartY + unitsAreaH
-            local basesLabelY = afterUnitsY + smallGap
-            local basesItemsStartY = basesLabelY + labelGap
-            local basesAreaH = #bases * itemSpacing
-
-            local instrY = basesItemsStartY + basesAreaH + 8
-            local menuH = instrY + 18
-
-            if x >= menuX and x <= menuX + menuW and y >= menuY and y <= menuY + menuH then
-                -- Units section
-                local relY = y - unitsItemsStartY
-                if relY >= 0 and relY < unitsAreaH then
-                    local idx = math.floor(relY / itemSpacing) + 1
-                    local sel = units[idx]
-                    if sel then
-                        self.devPlacementSelected = { kind = "unit", name = sel }
-                    end
-                    return
+    -- Check bottom Actions button click (screen coordinates) before converting to world coords
+    if self.actionsButtonVisible then
+        local btnW, btnH = 140, 36
+        local bx = love.graphics.getWidth() - btnW - 16
+        local by = love.graphics.getHeight() - btnH - 12
+        if x >= bx and x <= bx + btnW and y >= by and y <= by + btnH then
+            -- Toggle/handle actions panel via button
+            if self.actionsPanelOpen then
+                self.actionsPanelOpen = false
+                self.actionsPanelOptions = nil
+            else
+                if self.actionsButtonContext then
+                    local opts = self:getActionOptions(self.actionsButtonContext, self.actionsButtonContextType)
+                    self.actionsPanelOptions = opts
+                    self.actionsPanelOpen = true
                 end
+            end
+            return
+        end
 
-                -- Bases section
-                local relY2 = y - basesItemsStartY
-                if relY2 >= 0 and relY2 < basesAreaH then
-                    local idx = math.floor(relY2 / itemSpacing) + 1
-                    local sel = bases[idx]
-                    if sel then
-                        self.devPlacementSelected = { kind = "base", name = sel }
-                    end
-                    return
-                end
+        -- If actions panel open, check for clicks via NewMenu instance
+        if self.actionsPanelOpen and self.actionsPanelMenu then
+            if self.actionsPanelMenu:handleClick(x, y) then
+                return
             end
         end
     end
@@ -2135,6 +2542,49 @@ function Game:mousepressed(x, y, button)
     local col, row = self.map:pixelsToGrid(worldX, worldY)
     -- Block input while waiting for hotseat pass
     if self.passPending then
+        return
+    end
+    -- Dev placement quick placement (if an item selected from dev menu)
+    if self.devPlacementSelected and button == 1 then
+        local sel = self.devPlacementSelected
+        local teamArg = self.localTeam or self.placementTeam or self.currentTurn
+        local tile = self.map and self.map:getTile(col, row)
+        if tile and tile.isLand then
+            if sel.kind == "unit" then
+                if not self:getPieceAt(col, row) and not self:getBaseAt(col, row) and not self:getResourceAt(col, row) then
+                    self:addPiece(sel.name, teamArg, col, row)
+                    if self.isHost and Network and Network.isConnected and Network.isConnected() then
+                        pcall(function() self:sendCommit({type = "placePiece", team = teamArg, col = col, row = row, unitType = sel.name}) end)
+                    end
+                    if self.fogOfWar then
+                        self.fogOfWar:updateVisibility(teamArg, self.pieces, self.bases, self.teamStartingCorners)
+                    end
+                    self.devPlacementSelected = nil
+                    self.devPlacementMenuOpen = false
+                end
+            elseif sel.kind == "base" then
+                if not self:getBaseAt(col, row) and not self:getResourceAt(col, row) then
+                    self:applyPlaceBase(teamArg, col, row, sel.name)
+                    if self.isHost and Network and Network.isConnected and Network.isConnected() then
+                        pcall(function() self:sendCommit({type = "placeBase", team = teamArg, col = col, row = row, baseType = sel.name}) end)
+                    end
+                    if self.fogOfWar then
+                        self.fogOfWar:updateVisibility(teamArg, self.pieces, self.bases, self.teamStartingCorners)
+                    end
+                    self.devPlacementSelected = nil
+                    self.devPlacementMenuOpen = false
+                end
+            elseif sel.kind == "defense" then
+                if not self:getDefenseAt(col, row) then
+                    self:addDefense(col, row, teamArg)
+                    if self.isHost and Network and Network.isConnected and Network.isConnected() then
+                        pcall(function() self:sendCommit({type = "placeDefense", team = teamArg, col = col, row = row}) end)
+                    end
+                    self.devPlacementSelected = nil
+                    self.devPlacementMenuOpen = false
+                end
+            end
+        end
         return
     end
     -- If this instance represents a networked player, only allow input for that player's team
@@ -2147,45 +2597,7 @@ function Game:mousepressed(x, y, button)
         end
         -- During placement, `localTeam` is allowed to place simultaneously (no block)
     end
-    -- Dev placement quick placement (if a dev item is selected)
-    if self.devPlacementSelected and button == 1 then
-        local sel = self.devPlacementSelected
-        local teamArg = self.localTeam or self.placementTeam or self.currentTurn
-        local tile = self.map and self.map:getTile(col, row)
-        if tile and tile.isLand then
-            -- prevent placing on top of existing structures/pieces
-            if sel.kind == "unit" then
-                if not self:getPieceAt(col, row) and not self:getBaseAt(col, row) and not self:getResourceAt(col, row) then
-                    self:addPiece(sel.name, teamArg, col, row)
-                    if self.isHost and Network and Network.isConnected and Network.isConnected() then
-                        pcall(function() self:sendCommit({type = "placePiece", team = teamArg, col = col, row = row, unitType = sel.name}) end)
-                    end
-                    -- Update fog once for this placement (dev quick placement)
-                    if self.fogOfWar then
-                        self.fogOfWar:updateVisibility(teamArg, self.pieces, self.bases, self.teamStartingCorners)
-                    end
-                    -- Exit dev placement mode after one placement
-                    self.devPlacementSelected = nil
-                    self.devPlacementMenuOpen = false
-                end
-            elseif sel.kind == "base" then
-                if not self:getBaseAt(col, row) and not self:getResourceAt(col, row) then
-                    self:applyPlaceBase(teamArg, col, row, sel.name)
-                    if self.isHost and Network and Network.isConnected and Network.isConnected() then
-                        pcall(function() self:sendCommit({type = "placeBase", team = teamArg, col = col, row = row, baseType = sel.name}) end)
-                    end
-                    -- applyPlaceBase already updates fog for the placing team; ensure it's updated here as well
-                    if self.fogOfWar then
-                        self.fogOfWar:updateVisibility(teamArg, self.pieces, self.bases, self.teamStartingCorners)
-                    end
-                    -- Exit dev placement mode after one placement
-                    self.devPlacementSelected = nil
-                    self.devPlacementMenuOpen = false
-                end
-            end
-        end
-        return
-    end
+    -- Dev quick-placement removed
 
     if self.state == "placing" then
         -- Placement phase: place pieces or bases on click
@@ -2219,6 +2631,7 @@ function Game:mousepressed(x, y, button)
             if button == 1 then -- Left click cancels and refunds cost
                 local at = self.airstrikeTargeting
                 self.teamResources[at.team] = (self.teamResources[at.team] or 0) + (at.cost or 0)
+                self.teamOil[at.team] = (self.teamOil[at.team] or 0) + (at.oilCost or 0)
                 self.airstrikeTargeting = nil
                 return
             elseif button == 2 then -- Right click commits the strike
@@ -2279,6 +2692,8 @@ function Game:mousepressed(x, y, button)
             
             -- If there's a piece, handle piece selection logic
             if piece and piece.team == self.currentTurn and piece.col > 0 and piece.row > 0 then
+                -- Shift-click behaves the same as normal click (select piece with valid moves)
+                
                 -- If clicking on already selected piece with menu open, close menu and deselect
                 if piece == self.selectedPiece and self.actionMenu then
                     self.actionMenu = nil
@@ -2288,9 +2703,11 @@ function Game:mousepressed(x, y, button)
                     return
                 end
                 
-                -- If clicking on already selected piece, open action menu (default actions like Sweep)
+                -- If clicking on already selected piece, show bottom Actions button instead of hex menu
                 if piece == self.selectedPiece then
-                    self:openActionMenu(piece, "piece")
+                    self.actionsButtonVisible = true
+                    self.actionsButtonContext = piece
+                    self.actionsButtonContextType = "piece"
                     return
                 end
                 
@@ -2310,6 +2727,17 @@ function Game:mousepressed(x, y, button)
                 return
             end
             
+            -- If clicking on empty tile, deselect any selected base or piece
+            if not piece and not base then
+                self.actionsButtonVisible = false
+                self.actionsButtonContext = nil
+                self.actionsButtonContextType = nil
+                if self.actionsPanelOpen then
+                    self.actionsPanelOpen = false
+                    self.actionsPanelOptions = nil
+                end
+            end
+            
             -- Otherwise, try to select a piece (in case piece team check failed)
             if self.actionMenu then
                 self.actionMenu = nil
@@ -2318,6 +2746,30 @@ function Game:mousepressed(x, y, button)
             end
             self:selectPiece(col, row)
         elseif button == 2 then  -- Right click
+            -- If shift is held and a piece is selected, set waypoint to clicked location
+            if shift and self.selectedPiece then
+                local piece = self.selectedPiece
+                local viewTeam = self.localTeam or self.currentTurn
+                -- Only allow waypoints on visible/explored tiles
+                if self.fogOfWar and not self.fogOfWar:isTileVisible(viewTeam, col, row) then
+                    return  -- Can't set waypoint on unexplored tile
+                end
+                
+                -- Calculate full path from piece current position to the clicked tile
+                local fullPath = self:findShortestPath(piece.col, piece.row, col, row)
+                
+                if fullPath and #fullPath > 0 then
+                    -- Break path into movement-sized segments
+                    local moveRange = piece.stats.moveRange or 1
+                    local segments = self:breakPathIntoSegments(fullPath, moveRange)
+                    
+                    piece.waypoints = segments
+                    piece.currentWaypointIndex = 1
+                end
+                return
+            end
+            
+            -- Normal right-click move
             if self.selectedPiece then
                 self:movePiece(col, row)
             end
@@ -2346,6 +2798,9 @@ function Game:selectPiece(col, row)
     -- If clicking on the already selected piece, deselect it
     if piece and piece == self.selectedPiece then
         piece:deselect(self)
+        self.actionsButtonVisible = false
+        self.actionsButtonContext = nil
+        self.actionsButtonContextType = nil
         return
     end
     
@@ -2359,10 +2814,17 @@ function Game:selectPiece(col, row)
         piece.selected = true
         self.selectedPiece = piece
         self:calculateValidMoves()
+        -- Show bottom Actions button for selected piece
+        self.actionsButtonVisible = true
+        self.actionsButtonContext = piece
+        self.actionsButtonContextType = "piece"
 
     else
         if self.selectedPiece then
             self.selectedPiece:deselect(self)
+            self.actionsButtonVisible = false
+            self.actionsButtonContext = nil
+            self.actionsButtonContextType = nil
         end
     end
 end
@@ -2456,6 +2918,26 @@ function Game:removeMine(mine)
             end
         end
     end
+end
+
+function Game:getDefenseAt(col, row)
+    if not self.defenses then return nil end
+    if not self.defenses[col] then return nil end
+    return self.defenses[col][row]
+end
+
+function Game:addDefense(col, row, team)
+    if not self.defenses then self.defenses = {} end
+    if not self.defenses[col] then
+        self.defenses[col] = {}
+    end
+    self.defenses[col][row] = { team = team, col = col, row = row }
+end
+
+function Game:removeDefense(col, row)
+    if not self.defenses then return end
+    if not self.defenses[col] then return end
+    self.defenses[col][row] = nil
 end
 
 function Game:triggerMineAt(col, row, mover)
@@ -2603,14 +3085,16 @@ function Game:selectBase(base)
         return
     end
     
-    -- Open menu for this base
-    self:openActionMenu(base, "base")
+    -- Show bottom Actions button for this base (user opens menu from button)
+    self.actionsButtonVisible = true
+    self.actionsButtonContext = base
+    self.actionsButtonContextType = "base"
 end
 
 -- Generic function to open action menu for any object
 -- context: the object (base, piece, resource, etc.)
 -- contextType: "base", "piece", "resource", etc.
-function Game:openActionMenu(context, contextType)
+function Game:openActionMenu(context, contextType, overrideX, overrideY)
     -- Generate action options based on context type and object
     local options = self:getActionOptions(context, contextType)
     
@@ -2619,16 +3103,20 @@ function Game:openActionMenu(context, contextType)
         return
     end
     
-    -- Get pixel position of the context object
+    -- Get pixel position of the context object (allow override to anchor menu at screen coords)
     local pixelX, pixelY
-    if contextType == "base" then
-        pixelX, pixelY = self.map:gridToPixels(context.col, context.row)
-    elseif contextType == "piece" then
-        pixelX, pixelY = self.map:gridToPixels(context.col, context.row)
-    elseif contextType == "resource" then
-        pixelX, pixelY = self.map:gridToPixels(context.col, context.row)
+    if overrideX and overrideY then
+        pixelX, pixelY = overrideX, overrideY
     else
-        return  -- Unknown context type
+        if contextType == "base" then
+            pixelX, pixelY = self.map:gridToPixels(context.col, context.row)
+        elseif contextType == "piece" then
+            pixelX, pixelY = self.map:gridToPixels(context.col, context.row)
+        elseif contextType == "resource" then
+            pixelX, pixelY = self.map:gridToPixels(context.col, context.row)
+        else
+            return  -- Unknown context type
+        end
     end
     
     -- Create ActionMenu instance
@@ -2640,174 +3128,15 @@ end
 -- Get action options for a given context object
 -- This is where you define what actions are available for each object type
 function Game:getActionOptions(context, contextType)
-    local options = {}
-    
     if contextType == "base" then
-        if context.type == "hq" then
-            local team = context.team
-            local unitCount = self:getUnitCount(team)
-            local unitCapacity = self:getUnitCapacity(team)
-            local atCapacity = (unitCapacity > 0) and (unitCount >= unitCapacity) or false
-
-            -- HQ can build infantry
-            table.insert(options, {
-                id = "build_infantry",
-                name = "Build Infantry",
-                cost = 2,  -- Cost in resources
-                icon = "infantry",  -- For future use
-                disabled = atCapacity
-            })
-            -- Sniper
-            table.insert(options, {
-                id = "build_sniper",
-                name = "Build Sniper",
-                cost = 4,
-                icon = "sniper",
-                disabled = atCapacity
-            })
-            -- Tank
-            table.insert(options, {
-                id = "build_tank",
-                name = "Build Tank",
-                cost = 6,
-                icon = "tank",
-                disabled = atCapacity
-            })
-            -- Engineer
-            table.insert(options, {
-                id = "build_engineer",
-                name = "Build Engineer",
-                cost = 3,
-                icon = "engineer",
-                disabled = atCapacity
-            })
-        end
-        -- Add deconstruct option to all bases
-        table.insert(options, {
-            id = "deconstruct",
-            name = "Deconstruct",
-            cost = 0,  -- Free
-            icon = "X",
-            isDeconstruct = true  -- Flag for red coloring
-        })
-        -- Airbase: offer an airstrike targeting mode when there exists at least one eligible enemy target
-        if context.type == "airbase" and context.col and context.col > 0 then
-            local tiles = self:getTilesWithinRadius(context.col, context.row, context:getRadius())
-            local hasEligible = false
-            for _, tile in ipairs(tiles) do
-                local piece = self:getPieceAt(tile.col, tile.row)
-                if piece and piece.team ~= context.team then
-                    if self:canAirstrike(context.team, tile.col, tile.row) then
-                        hasEligible = true
-                        break
-                    end
-                end
-            end
-            if hasEligible then
-                table.insert(options, {
-                    id = "airstrike_target",
-                    name = "Airstrike (Target)",
-                    icon = "airstrike",
-                    cost = 2,
-                })
-            end
-        end
-        -- Add more base types here as needed
+        return context:getActionOptions(self)
     elseif contextType == "piece" then
-        -- Engineer can build structures
-        if context.stats.canBuild and not context.isBuilding then
-            -- Check if engineer is on a resource tile or if tile already has a base
-            local onResourceTile = self:getResourceAt(context.col, context.row) ~= nil
-            local hasBase = self:getBaseAt(context.col, context.row) ~= nil
-            
-            table.insert(options, {
-                id = "build_hq",
-                name = "Build HQ",
-                cost = 10,
-                buildTurns = 4,  -- Takes 4 turns to build
-                icon = "hq",
-                disabled = onResourceTile or hasBase  -- Can't build bases on resource tiles or occupied tiles
-            })
-            table.insert(options, {
-                id = "build_ammo_depot",
-                name = "Build Ammo Depot",
-                cost = 5,
-                buildTurns = 2,  -- Takes 2 turns to build
-                icon = "ammo_depot",
-                disabled = onResourceTile or hasBase  -- Can't build bases on resource tiles or occupied tiles
-            })
-            table.insert(options, {
-                id = "build_supply_depot",
-                name = "Build Supply Depot",
-                cost = 5,
-                buildTurns = 2,  -- Takes 2 turns to build
-                icon = "supply_depot",
-                disabled = onResourceTile or hasBase  -- Can't build bases on resource tiles or occupied tiles
-            })
-            table.insert(options, {
-                id = "build_resource_mine",
-                name = "Build Resource Mine",
-                cost = 3,
-                buildTurns = 3,  -- Takes 3 turns to build
-                icon = "resource_mine",
-                disabled = hasBase  -- Can't build mine if tile has a base
-            })
-            table.insert(options, {
-                id = "build_airbase",
-                name = "Build Airbase",
-                cost = 8,
-                buildTurns = 4,
-                icon = "airbase",
-                disabled = onResourceTile or hasBase
-            })
-            -- Place a land mine (engineer-specific)
-            table.insert(options, {
-                id = "place_mine",
-                name = "Place Mine",
-                cost = 2,
-                icon = "mine",
-                disabled = self:getMineAt(context.col, context.row) ~= nil
-            })
-        end
-        -- Sweep for mines (default unit action; consumes turn)
-        do
-            local disabled = (context.hasMoved or context.isBuilding)
-            table.insert(options, {
-                id = "sweep_mines",
-                name = "Sweep For Mines",
-                cost = 0,
-                icon = "sweep",
-                shortcut = "S",
-                disabled = disabled
-            })
-        end
-
-        -- Disarm option(s) for any revealed mines adjacent to this piece
-        do
-            local startTile = self.map:getTile(context.col, context.row)
-            if startTile then
-                local neighbors = self.map:getNeighbors(startTile, 1)
-                for _, n in ipairs(neighbors) do
-                    local mine = self:getMineAt(n.col, n.row)
-                    -- Only show disarm for mines that are revealed to this team and belong to an enemy
-                    if mine and mine.revealedTo and mine.revealedTo[context.team] and mine.team ~= context.team then
-                        table.insert(options, {
-                            id = "disarm_mine",
-                            name = "Disarm Mine",
-                            icon = "disarm",
-                            shortcut = "D",
-                            targetMine = mine,
-                            disabled = (context.hasMoved or context.isBuilding)
-                        })
-                    end
-                end
-            end
-        end
+        return context:getActionOptions(self)
     elseif contextType == "resource" then
         -- Add resource actions here (e.g., harvest, upgrade, etc.)
+        return {}
     end
-    
-    return options
+    return {}
 end
 
 function Game:drawActionMenu()
@@ -2851,10 +3180,10 @@ function Game:handleActionMenuClick(worldX, worldY)
 end
 
 function Game:executeAction(option)
-    if not self.actionMenu or not self.actionMenuContext then return end
-    
-    local context = self.actionMenuContext
-    local contextType = self.actionMenuContextType
+    -- Allow execution from either the legacy `actionMenu` context or the new bottom actions panel
+    local context = self.actionMenuContext or self.actionsButtonContext
+    local contextType = self.actionMenuContextType or self.actionsButtonContextType
+    if not context or not contextType then return end
     
     -- Check if option is disabled
     if option.disabled then
@@ -2879,9 +3208,30 @@ function Game:executeAction(option)
     elseif option.id == "build_tank" and contextType == "base" then
         -- Build a tank near the base (oil requirement enforced server-side)
         self:buildUnitNearBase(context, "tank", team, option.cost)
+    elseif option.id == "build_sam" and contextType == "base" then
+        -- Build a SAM unit near the base (oil requirement enforced server-side)
+        self:buildUnitNearBase(context, "sam", team, option.cost)
     elseif option.id == "build_engineer" and contextType == "base" then
         -- Build an engineer near the base
         self:buildUnitNearBase(context, "engineer", team, option.cost)
+    elseif option.id == "recruit_commander" and contextType == "base" then
+        -- Recruit a commander near this HQ (enforce one-per-HQ safely)
+        local baseHex = self.map:getTile(context.col, context.row)
+        local hasCommander = false
+        if baseHex then
+            local p = self:getPieceAt(context.col, context.row)
+            if p and p.type == "commander" and p.team == context.team then hasCommander = true end
+            local neigh = self.map:getNeighbors(baseHex, 1)
+            for _, n in ipairs(neigh) do
+                if not hasCommander then
+                    local pp = self:getPieceAt(n.col, n.row)
+                    if pp and pp.type == "commander" and pp.team == context.team then hasCommander = true end
+                end
+            end
+        end
+        if not hasCommander then
+            self:buildUnitNearBase(context, "commander", team, option.cost)
+        end
     elseif option.id == "build_hq" and contextType == "piece" then
         -- Engineer builds an HQ
         self:buildStructureNearPiece(context, "hq", team, option.cost, option.buildTurns)
@@ -2901,6 +3251,14 @@ function Game:executeAction(option)
         -- Engineer places a land mine
         if context.placeMine then
             context:placeMine(self)
+        end
+    elseif option.id == "build_defense" and contextType == "piece" then
+        -- Engineer builds a defensive structure
+        local existingDefense = self:getDefenseAt(context.col, context.row)
+        if not existingDefense then
+            self:addDefense(context.col, context.row, team)
+            self.teamResources[team] = (self.teamResources[team] or 0) - (option.cost or 0)
+            context.hasMoved = true  -- Building uses up movement
         end
     elseif option.id == "sweep_mines" and contextType == "piece" then
         -- Sweep action: reveal mines within piece's view range for this team
@@ -2954,18 +3312,36 @@ function Game:executeAction(option)
                 break
             end
         end
+    elseif option.id == "toggle_veteran" and contextType == "piece" then
+        -- Dev toggle: if networked, send request to host; otherwise toggle locally and broadcast if host
+        local toggleTo = not context.veteran
+        if Network and Network.isConnected and Network.isConnected() and not self.isHost and not self._applyingRemote then
+            pcall(function()
+                Network.send({type = "setVeteranRequest", col = context.col, row = context.row, team = context.team, veteran = toggleTo and 1 or 0})
+            end)
+        else
+            -- Host or local single-player: apply directly
+            context.veteran = toggleTo
+            if toggleTo then context.kills = math.max(3, context.kills or 3) else context.kills = 0 end
+            if self.isHost and Network and Network.isConnected and Network.isConnected() and not self._applyingRemote then
+                self:sendCommit({type = "setVeteran", col = context.col, row = context.row, team = context.team, kills = context.kills or 0, veteran = context.veteran and 1 or 0})
+            end
+        end
     elseif option.id == "airstrike_target" and contextType == "base" then
         -- Enter airstrike targeting mode: deduct cost now, allow player to choose tile
         if not context or context.type ~= "airbase" then return end
         local cost = option.cost or 0
-        if self.teamResources[team] < cost then return end
+        local oilCost = option.oilCost or 0
+        if self.teamResources[team] < cost or self.teamOil[team] < oilCost then return end
 
         -- Deduct cost and enter targeting state (left-click cancel refunds)
         self.teamResources[team] = self.teamResources[team] - cost
+        self.teamOil[team] = self.teamOil[team] - oilCost
         self.airstrikeTargeting = {
             base = context,
             team = team,
             cost = cost,
+            oilCost = oilCost,
         }
         -- Close any action menu while targeting
         self.actionMenu = nil
@@ -2975,10 +3351,12 @@ function Game:executeAction(option)
     end
     -- Add more action handlers here as needed
     
-    -- Close menu after action
+    -- Close any open menus/panels after action
     self.actionMenu = nil
     self.actionMenuContext = nil
     self.actionMenuContextType = nil
+    self.actionsPanelOpen = false
+    self.actionsPanelOptions = nil
 end
 
 function Game:buildUnitNearBase(base, unitType, team, cost)
@@ -2990,8 +3368,8 @@ function Game:buildUnitNearBase(base, unitType, team, cost)
         return
     end
 
-    -- Oil requirement for tanks: if building locally on host, ensure oil is available and deduct it.
-    local oilCost = (unitType == "tank") and 1 or 0
+    -- Oil requirement for tanks and SAM: if building locally on host, ensure oil is available and deduct it.
+    local oilCost = ((unitType == "tank") and 1 or 0) + ((unitType == "sam") and 1 or 0)
     if self.isHost and oilCost > 0 then
         if (self.teamOil[team] or 0) < oilCost then
             return
@@ -3015,7 +3393,7 @@ function Game:buildUnitNearBase(base, unitType, team, cost)
                not self:getBaseAt(neighbor.col, neighbor.row) and
                not self:getResourceAt(neighbor.col, neighbor.row) then
                 -- If networked client, validate locally (enforce oil/resource) then request host to build unit (do NOT deduct locally)
-                local oilCost = (unitType == "tank") and 1 or 0
+                local oilCost = ((unitType == "tank") and 1 or 0) + ((unitType == "sam") and 1 or 0)
                 if Network and Network.isConnected and Network.isConnected() and not self.isHost and not self._applyingRemote then
                     -- Client-side enforcement: require both generic resources and oil available before sending request
                     if (self.teamResources[team] or 0) < cost then return end
@@ -3205,6 +3583,7 @@ function Game:getHexesWithinRange(col, row, range, visited, team)
             local key = currentHex.col .. "," .. currentHex.row
             if not visited[key] then
                 visited[key] = currentHex
+                currentHex.distance = currentDistance
                 table.insert(visited, currentHex)
             end
         end
@@ -3341,6 +3720,7 @@ end
 -- Calculate air superiority map: returns table keyed by "col,row" -> { [1]=points1, [2]=points2 }
 function Game:calculateAirSuperiorityMap()
     local map = {}
+    -- Airbases provide air superiority
     for _, base in ipairs(self.bases) do
         if base.type == "airbase" and base.col and base.col > 0 and base.row and base.row > 0 then
             local tiles = self:getTilesWithinRadius(base.col, base.row, base:getRadius())
@@ -3348,6 +3728,18 @@ function Game:calculateAirSuperiorityMap()
                 local key = tile.col .. "," .. tile.row
                 if not map[key] then map[key] = { [1] = 0, [2] = 0 } end
                 map[key][base.team] = map[key][base.team] + 1
+            end
+        end
+    end
+    -- SAM units provide anti-air defense (reduce enemy air superiority)
+    for _, piece in ipairs(self.pieces) do
+        if piece.type == "sam" and piece.col and piece.col > 0 and piece.row and piece.row > 0 then
+            local radius = piece.stats.airDefenseRadius or 2
+            local tiles = self:getTilesWithinRadius(piece.col, piece.row, radius)
+            for _, tile in ipairs(tiles) do
+                local key = tile.col .. "," .. tile.row
+                if not map[key] then map[key] = { [1] = 0, [2] = 0 } end
+                map[key][piece.team] = map[key][piece.team] + 1
             end
         end
     end
@@ -3363,8 +3755,14 @@ function Game:getAirSuperiorityAt(col, row)
     return entry[1] or 0, entry[2] or 0
 end
 
--- Can `team` perform an airstrike against target tile? Requires teamAS > enemyAS and teamAS > 0
+-- Can `team` perform an airstrike against target tile? Requires teamAS > enemyAS and teamAS > 0, and not targeting own pieces/bases
 function Game:canAirstrike(team, targetCol, targetRow)
+    -- Check for own pieces or bases at the target tile
+    local piece = self:getPieceAt(targetCol, targetRow)
+    if piece and piece.team == team then return false end
+    local base = self:getBaseAt(targetCol, targetRow)
+    if base and base.team == team then return false end
+
     local t1, t2 = self:getAirSuperiorityAt(targetCol, targetRow)
     local teamAS = t1
     local enemyAS = t2
@@ -3519,6 +3917,9 @@ function Game:movePiece(col, row)
         end
 
         self.selectedPiece:setPosition(col, row)
+        -- Clear any waypoints when piece is moved manually
+        self.selectedPiece.waypoints = {}
+        self.selectedPiece.currentWaypointIndex = 0
         self:calculateValidMoves()
         -- Send network update (mirror) if connected and this is a local action
         if Network and Network.isConnected and Network.isConnected() and not self._applyingRemote then
@@ -3531,6 +3932,13 @@ function Game:movePiece(col, row)
 
         -- Check for mines triggered by moving into this tile (host will broadcast mine commits)
         self:triggerMineAt(col, row, self.selectedPiece)
+        
+        -- Destroy defense if enemy enters the tile
+        local defense = self:getDefenseAt(col, row)
+        if defense and defense.team ~= self.selectedPiece.team then
+            self:removeDefense(col, row)
+            self:log(self.selectedPiece.type .. " from team " .. self.selectedPiece.team .. " destroyed a defense at (" .. col .. ", " .. row .. ")")
+        end
 
         -- Recalculate valid moves/attacks after any mine effects and keep the piece selected
         -- so the player can attack after moving if valid targets exist.
@@ -3563,13 +3971,38 @@ function Game:movePiece(col, row)
                 dDice = 0
             end
         end
+        -- Apply morale bonuses (each morale point = +1 die)
+        local moraleA = self:computeMorale(self.selectedPiece) or 0
+        local moraleD = self:computeMorale(targetPiece) or 0
+        aDice = (aDice or 0) + (moraleA or 0)
+        dDice = (dDice or 0) + (moraleD or 0)
         -- Roll dice with per-unit max faces
         local maxA = (self.selectedPiece and self.selectedPiece.getDieMax and self.selectedPiece:getDieMax()) or 6
         local maxD = (targetPiece and targetPiece.getDieMax and targetPiece:getDieMax()) or 6
+        -- Commander adjacency increases the max die face by +1 per adjacent commander
+        local cmdA = self:countAdjacentCommanders(self.selectedPiece) or 0
+        local cmdD = self:countAdjacentCommanders(targetPiece) or 0
+        maxA = maxA + (cmdA or 0)
+        maxD = maxD + (cmdD or 0)
+        
+        -- Check if defender is on a defensive structure (gives -1 to defender max die)
+        local defense = self:getDefenseAt(col, row)
+        local defenseEffect = 0
+        if defense and defense.team == targetPiece.team then
+            defenseEffect = -1
+            maxD = math.max(1, maxD + defenseEffect)  -- Ensure minimum die value of 1
+        end
+
+        pcall(function()
+            print(string.format("[DBG attack local PRE] aDice=%s moraleA=%s cmdA=%s maxA=%s  dDice=%s moraleD=%s cmdD=%s maxD=%s defense=%s defEff=%s", tostring(aDice), tostring(moraleA), tostring(cmdA), tostring(maxA), tostring(dDice), tostring(moraleD), tostring(cmdD), tostring(maxD), tostring(defense ~= nil), tostring(defenseEffect)))
+        end)
         local rollsA = self:rollDice(aDice, maxA)
         local rollsD = self:rollDice(dDice, maxD)
         -- Compute damage from dice comparisons
         local damageToTarget, damageToAttacker = self:computeDiceOutcome(rollsA, rollsD)
+        pcall(function()
+            print(string.format("[DBG attack local POST] rollsA=%s rollsD=%s dmgToTarget=%s dmgToAttacker=%s", tostring(table.concat(rollsA,",")), tostring(table.concat(rollsD,",")), tostring(damageToTarget), tostring(damageToAttacker)))
+        end)
 
         -- Reveal attacker if hidden (local single-player or host handles reveal broadcast elsewhere)
         if self.selectedPiece and self.selectedPiece.hiddenInForest then
@@ -3734,6 +4167,68 @@ function Game:mousemoved(x, y, dx, dy)
     end
 end
 
+-- Clear waypoints if an enemy is in view range of the unit
+function Game:clearWaypointsOnEnemyContact()
+    for _, piece in ipairs(self.pieces) do
+        if piece.waypoints and #piece.waypoints > 0 then
+            local viewRange = piece:getViewRange() or piece.stats.viewRange or 1
+            -- Check if any enemy piece is within view range
+            for _, otherPiece in ipairs(self.pieces) do
+                if otherPiece.team ~= piece.team then
+                    local dx = otherPiece.col - piece.col
+                    local dy = otherPiece.row - piece.row
+                    -- Simple distance check
+                    local dist = math.sqrt(dx*dx + dy*dy)
+                    if dist <= viewRange then
+                        -- Enemy in view range; clear waypoints
+                        piece.waypoints = {}
+                        piece.currentWaypointIndex = 0
+                        break
+                    end
+                end
+            end
+        end
+    end
+end
+
+-- Pathfind one step toward target, respecting terrain
+-- Returns path {col, row} list or nil if no path
+function Game:pathToward(startCol, startRow, targetCol, targetRow)
+    -- Simple BFS to find shortest path
+    local visited = {}
+    local queue = {{col = startCol, row = startRow, path = {{col = startCol, row = startRow}}}}
+    visited[startCol .. "," .. startRow] = true
+    
+    while #queue > 0 do
+        local current = table.remove(queue, 1)
+        if current.col == targetCol and current.row == targetRow then
+            return current.path
+        end
+        
+        -- Explore neighbors
+        local tile = self.map:getTile(current.col, current.row)
+        if tile then
+            local neighbors = self.map:getNeighbors(tile, 1)
+            for _, neighbor in ipairs(neighbors) do
+                local nkey = neighbor.col .. "," .. neighbor.row
+                if not visited[nkey] then
+                    visited[nkey] = true
+                    local nTile = self.map:getTile(neighbor.col, neighbor.row)
+                    if nTile and nTile.isLand then
+                        local newPath = {}
+                        for _, p in ipairs(current.path) do
+                            table.insert(newPath, p)
+                        end
+                        table.insert(newPath, {col = neighbor.col, row = neighbor.row})
+                        table.insert(queue, {col = neighbor.col, row = neighbor.row, path = newPath})
+                    end
+                end
+            end
+        end
+    end
+    return nil
+end
+
 function Game:wheelmoved(x, y)
     if y > 0 then
         self.camera:zoomIn(0.1)
@@ -3742,11 +4237,116 @@ function Game:wheelmoved(x, y)
     end
 end
 
+-- Process waypoint moves for a team at the start of their turn
+function Game:processWaypointMoves(team)
+    for _, piece in ipairs(self.pieces) do
+        if piece.team == team and piece.waypoints and #piece.waypoints > 0 and not piece.hasMoved then
+            local currentWpIdx = piece.currentWaypointIndex
+            if currentWpIdx >= 1 and currentWpIdx <= #piece.waypoints then
+                local targetWp = piece.waypoints[currentWpIdx]
+                -- Move toward the target waypoint
+                local path = self:findShortestPath(piece.col, piece.row, targetWp.col, targetWp.row)
+                if path and #path > 0 then
+                    -- Move moveRange steps at once (or fewer if path is shorter)
+                    local moveRange = piece.stats.moveRange or 1
+                    local stepsToMove = math.min(moveRange, #path)
+                    local nextStep = path[stepsToMove]
+                    local oldCol, oldRow = piece.col, piece.row
+                    piece:setPosition(nextStep.col, nextStep.row)
+                    piece.hasMoved = true
+                    -- Check if reached waypoint; advance to next if so
+                    if piece.col == targetWp.col and piece.row == targetWp.row then
+                        piece.currentWaypointIndex = currentWpIdx + 1
+                        if piece.currentWaypointIndex > #piece.waypoints then
+                            -- Reached the last waypoint; clear waypoints
+                            piece.waypoints = {}
+                            piece.currentWaypointIndex = 0
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
+
+-- Pathfind one step toward target, respecting terrain
+-- Returns path {col, row} list or nil if no path
+-- Find the shortest path using BFS
+-- Returns list of {col, row} steps from start to target
+function Game:findShortestPath(startCol, startRow, targetCol, targetRow)
+    local visited = {}
+    local queue = {{col = startCol, row = startRow, path = {}}}
+    visited[startCol .. "," .. startRow] = true
+    
+    while #queue > 0 do
+        local current = table.remove(queue, 1)
+        local currentPath = current.path
+        
+        if current.col == targetCol and current.row == targetRow then
+            return currentPath
+        end
+        
+        local tile = self.map:getTile(current.col, current.row)
+        if tile then
+            local neighbors = self.map:getNeighbors(tile, 1)
+            for _, neighbor in ipairs(neighbors) do
+                local nkey = neighbor.col .. "," .. neighbor.row
+                if not visited[nkey] then
+                    visited[nkey] = true
+                    local nTile = self.map:getTile(neighbor.col, neighbor.row)
+                    if nTile and nTile.isLand then
+                        local newPath = {}
+                        for _, p in ipairs(currentPath) do
+                            table.insert(newPath, p)
+                        end
+                        table.insert(newPath, {col = neighbor.col, row = neighbor.row})
+                        table.insert(queue, {col = neighbor.col, row = neighbor.row, path = newPath})
+                    end
+                end
+            end
+        end
+    end
+    return {}
+end
+
+-- Break a full path into movement-sized segments (waypoints)
+-- segmentSize should be the piece's moveRange
+-- Returns waypoints at multiples of segmentSize, plus the final waypoint
+function Game:breakPathIntoSegments(fullPath, segmentSize)
+    local segments = {}
+    
+    if not fullPath or #fullPath == 0 then return segments end
+    
+    local pathLength = #fullPath
+    
+    -- Add waypoints at each segmentSize interval
+    for i = segmentSize, pathLength, segmentSize do
+        table.insert(segments, fullPath[i])
+    end
+    
+    -- If there's a remainder (path not evenly divisible), add the final waypoint
+    if pathLength % segmentSize ~= 0 then
+        table.insert(segments, fullPath[pathLength])
+    end
+    
+    -- If the only remaining waypoint is the final one (path shorter than segmentSize),
+    -- make sure we have it
+    if #segments == 0 and #fullPath > 0 then
+        table.insert(segments, fullPath[#fullPath])
+    end
+    
+    return segments
+end
+
 function Game:endTurn()
     -- Can't end turn during placement phase
     if self.state == "placing" then
         return
     end
+    
+    -- Process waypoint moves for the team that's about to end their turn
+    self:processWaypointMoves(self.currentTurn)
+    
     -- If connected and not the host, request the host to end the turn instead
     if Network and Network.isConnected and Network.isConnected() and not self.isHost and not self._applyingRemote then
         pcall(function()
@@ -4127,6 +4727,56 @@ function Game:resetGame()
     self:initializePieces()
     self:initializeBases()
     self:generateResources()
+end
+
+-- Helper function to draw air defense radius ring and air superiority symbols
+-- Used by both airbase and SAM units
+function Game:drawAirDefenseRadius(col, row, radius, team, lineColor, lineWidth)
+    lineWidth = lineWidth or 2
+    
+    -- Draw the outer ring
+    local edges = self:getRingEdges(col, row, radius)
+    if edges and #edges > 0 then
+        love.graphics.setColor(lineColor[1], lineColor[2], lineColor[3], 0.7)
+        love.graphics.setLineWidth(lineWidth)
+        for _, e in ipairs(edges) do
+            love.graphics.line(e[1], e[2], e[3], e[4])
+        end
+        love.graphics.setLineWidth(1)
+        love.graphics.setColor(1, 1, 1, 1)
+    end
+    
+    -- Draw air superiority symbols on tiles within radius
+    local tiles = self:getTilesWithinRadius(col, row, radius)
+    if tiles then
+        for _, tile in ipairs(tiles) do
+            local t1, t2 = self:getAirSuperiorityAt(tile.col, tile.row)
+            local playerAS = (team == 1) and t1 or t2
+            local enemyAS = (team == 1) and t2 or t1
+            
+            local symbol = nil
+            if playerAS > 0 and playerAS == enemyAS then
+                symbol = "="
+            elseif playerAS > enemyAS then
+                symbol = "^"
+            elseif enemyAS > playerAS then
+                symbol = "v"
+            end
+            
+            if symbol then
+                local px, py = self.map:gridToPixels(tile.col, tile.row)
+                if symbol == "v" then
+                    love.graphics.setColor(1, 0, 0)
+                else
+                    if team == 1 then love.graphics.setColor(1, 0, 0) else love.graphics.setColor(0, 0, 1) end
+                end
+                love.graphics.setFont(love.graphics.newFont(12))
+                local w = love.graphics.getFont():getWidth(symbol)
+                local h = love.graphics.getFont():getHeight()
+                love.graphics.print(symbol, px - w/2, py - h/2)
+            end
+        end
+    end
 end
 
 return Game
