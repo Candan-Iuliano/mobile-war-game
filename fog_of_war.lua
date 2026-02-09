@@ -62,6 +62,13 @@ function FogOfWar:setTileExplored(team, col, row, explored)
     self.explored[team][col][row] = explored
 end
 
+function FogOfWar:clearExplored(team)
+    -- Clear all explored state for a team (used when transitioning game phases)
+    if self.explored[team] then
+        self.explored[team] = {}
+    end
+end
+
 function FogOfWar:revealAreaFull(team, centerCol, centerRow, radius)
     -- Reveal ALL tiles within radius from center (no line of sight checks)
     local centerHex = self.map:getTile(centerCol, centerRow)

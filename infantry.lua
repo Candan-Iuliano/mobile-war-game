@@ -10,7 +10,7 @@ M.stats = {
     viewRange = 3,
     damage = 1,
     maxAmmo = 3,
-    maxDie = 4,
+    maxDie = 6,
 }
 
 M.methods = {

@@ -17,9 +17,14 @@ function Game.new()
     local self = setmetatable({}, Game)
     
     -- Game state
-    self.state = "placing"  -- "placing", "playing", "gameOver"
+    self.state = "zone_draft"  -- "zone_draft", "placing", "playing", "gameOver"
     self.currentTurn = 1    -- Team 1 or 2
     self.turnCount = 0
+    
+    -- Zone draft phase
+    self.zoneDraftTeam = 1  -- Which team is currently drafting (1 or 2)
+    self.teamZoneSelected = {}  -- tracks which team has selected a zone: {[1] = true/false, [2] = true/false}
+    self.teamInPlacement = {}  -- tracks which teams are in placement: {[1] = true/false, [2] = true/false}
     
     -- Placement phase
     self.piecesPerTeam = 4  -- Number of pieces per team (3 infantry + 1 engineer)
@@ -34,10 +39,26 @@ function Game.new()
     -- Map setup
     self.hexSideLength = 32
     self.mapWidth = 32
-    self.mapHeight = 32
+    self.mapHeight = 28
+    
     self.map = HexMap.new(self.mapWidth, self.mapHeight, self.hexSideLength)
-    self.map:initializeGrid()
+    self.map:initializeGrid(true)  -- true = circular grid mode
+    self.mapGeneratorUsed = nil  -- Track which generator was used ("radial", "region_stitch", etc.)
     self:generateMapTerrain()
+
+    -- Start-sector selection (radial sectors) for dynamic starts (only for radial maps)
+    self.startSectors = nil         -- populated by generateStartSectors
+    self.tileToSector = nil         -- mapping col,row -> sector index
+    self.selectedStartSector = {}   -- selections per team id
+    self.freePlacement = false      -- Set to true with F1 during placement dev mode
+    self.revealedCandidates = {}    -- revealed candidate lists per team during draft
+    -- Generate default sectors only for radial maps (circular playable area with perimeter zones)
+    if self.mapGeneratorUsed == "radial" then
+        pcall(function() self:generateStartSectors(8) end)
+        -- Prepare initial reveals for both teams (reveal 3 candidates each)
+        self:prepareRevealForTeam(1, 3)
+        self:prepareRevealForTeam(2, 3)  -- team 2 gets their own set of 3 zones
+    end
     
     -- Starting areas for teams (top and bottom rows, 5 rows deep)
     self.startingAreaDepth = 5
@@ -86,17 +107,8 @@ function Game.new()
     -- Combat animations (dice roll displays)
     self.combatAnimations = {} -- { {x,y,rollsA,rollsD,ttl} }
     
-    -- Initialize starting areas as explored and visible for each team
-    for team = 1, 2 do
-        local area = self.teamStartingAreas[team]
-        if area then
-            for row = area.rowStart, area.rowEnd do
-                for col = 1, self.mapWidth do
-                    self.fogOfWar:setTileVisible(team, col, row, true)
-                end
-            end
-        end
-    end
+    -- Initialize fog visibility based on current state
+    self:updateFogVisibility()
     
     -- Input handling
     if self.selectedPiece then
@@ -243,13 +255,21 @@ function Game:drawCombatAnimations()
 end
 
 function Game:generateMapTerrain()
-    -- Use region-stitch generator to create tileable strategic regions
-    local success, _ = pcall(function() self.map:generateTerrain("region_stitch") end)
-    if not success then
-        -- Fallback to balanced if region_stitch unavailable
-        print("Region-stitch terrain generator failed, falling back to balanced generator.")
-        self.map:generateTerrain("balanced")
+    -- Prefer radial generator for circular maps; fall back gracefully
+    local success, _ = pcall(function() self.map:generateTerrain("radial") end)
+    if success then
+        self.mapGeneratorUsed = "radial"
+        return
     end
+    print("Radial generator failed or unavailable, trying region_stitch then balanced.")
+    local ok2, _ = pcall(function() self.map:generateTerrain("region_stitch") end)
+    if ok2 then
+        self.mapGeneratorUsed = "region_stitch"
+        return
+    end
+    print("Region-stitch generator failed, falling back to balanced generator.")
+    self.map:generateTerrain("balanced")
+    self.mapGeneratorUsed = "balanced"
 end
 
 function Game:initializePieces()
@@ -271,16 +291,16 @@ end
 function Game:initializeBases()
     -- Create bases for team 1: HQ, Ammo Depot, Supply Depot
     self:addBase("hq", 1, nil, nil)
-    self:addBase("ammoDepot", 1, nil, nil)
-    self:addBase("supplyDepot", 1, nil, nil)
-    -- Add one airbase per player (unplaced at start)
-    self:addBase("airbase", 1, nil, nil)
+    -- self:addBase("ammoDepot", 1, nil, nil)
+    -- self:addBase("supplyDepot", 1, nil, nil)
+    -- -- Add one airbase per player (unplaced at start)
+    -- self:addBase("airbase", 1, nil, nil)
     
     -- Create bases for team 2: HQ, Ammo Depot, Supply Depot
     self:addBase("hq", 2, nil, nil)
-    self:addBase("ammoDepot", 2, nil, nil)
-    self:addBase("supplyDepot", 2, nil, nil)
-    self:addBase("airbase", 2, nil, nil)
+    -- self:addBase("ammoDepot", 2, nil, nil)
+    -- self:addBase("supplyDepot", 2, nil, nil)
+    -- self:addBase("airbase", 2, nil, nil)
 end
 
 -- function Game:initializeProvinces()
@@ -1692,6 +1712,23 @@ function Game:draw()
         self:drawStartingAreas(viewTeam)
     end
     
+    -- Draw mountains through fog during placing phase for visibility (not zone_draft)
+    if self.state == "placing" then
+        local viewTeam = self.localTeam or self.placementTeam
+        for col = 1, self.map.cols do
+            for row = 1, self.map.rows do
+                local tile = self.map:getTile(col, row)
+                if tile and tile.terrain == "mountain" then
+                    local pixelX, pixelY = self.map:gridToPixels(col, row)
+                    -- Draw mountain indicator (small dark square in center)
+                    love.graphics.setColor(0.4, 0.4, 0.5, 0.8)
+                    love.graphics.circle("fill", pixelX, pixelY, 4)
+                    love.graphics.setColor(1, 1, 1, 1)
+                end
+            end
+        end
+    end
+    
     -- Draw grid coordinates for debugging
     --self:drawGridCoordinates()
     
@@ -2111,7 +2148,18 @@ function Game:drawValidPlacementTiles()
 end
 
 function Game:drawStartingAreas(viewTeam)
-    -- Draw starting area indicators for both teams (top and bottom strips)
+    -- If sector picking is enabled, draw sectors instead of rectangular strips
+    if self.startSectors and #self.startSectors > 0 and (self.selectedStartSector and (not self.selectedStartSector[1] or not self.selectedStartSector[2])) then
+        self:drawStartSectors(viewTeam)
+        return
+    end
+
+    -- Only draw old rectangular zones for non-radial maps during placement phase
+    if self.state ~= "placing" or self.mapGeneratorUsed == "radial" then
+        return
+    end
+
+    -- Fallback: Draw starting area indicators for both teams (top and bottom strips)
     for team, area in pairs(self.teamStartingAreas) do
         -- Determine color based on team and whether it's the current placement team
         local isCurrentTeam = false
@@ -2196,7 +2244,34 @@ function Game:drawUI()
     love.graphics.setColor(1, 1, 1)
     love.graphics.setFont(love.graphics.newFont(14))
     
-    if self.state == "placing" then
+    if self.state == "zone_draft" then
+        -- Zone draft phase UI
+        love.graphics.setFont(love.graphics.newFont(18))
+        love.graphics.setColor(1, 1, 1)
+        love.graphics.print("Zone Draft Phase", 10, 10)
+        
+        love.graphics.setFont(love.graphics.newFont(14))
+        local draftTeam = self.zoneDraftTeam
+        local teamName = (draftTeam == 1) and "Red" or "Blue"
+        local teamColor = (draftTeam == 1) and {1, 0.2, 0.2} or {0.2, 0.4, 1}
+        
+        love.graphics.setColor(teamColor[1], teamColor[2], teamColor[3])
+        love.graphics.print(string.format("Team %s: Select a starting zone", teamName), 10, 40)
+        
+        love.graphics.setFont(love.graphics.newFont(11))
+        love.graphics.setColor(1, 1, 1)
+        love.graphics.print("Click on a highlighted zone to select it.", 10, 65)
+        
+        -- Show which team has already selected
+        for team = 1, 2 do
+            if self.teamZoneSelected[team] then
+                local tname = (team == 1) and "Red" or "Blue"
+                local tsectorId = self.selectedStartSector[team]
+                love.graphics.setColor((team == 1) and {1, 0.2, 0.2} or {0.2, 0.4, 1})
+                love.graphics.print(string.format("Team %s selected zone %d", tname, tsectorId or 0), 10, 85 + (team * 18))
+            end
+        end
+    elseif self.state == "placing" then
         -- Placement phase UI (simultaneous)
         local team1Placed, team2Placed = 0, 0
         for _, piece in ipairs(self.pieces) do
@@ -2484,7 +2559,6 @@ function Game:mousepressed(x, y, button)
             return
         end
     end
-    -- Dev menu removed
     -- Dev placement button click (visible when devMode) - buttons with backgrounds
     if self.devMode then
         local btnW, btnH = 120, 28
@@ -2492,7 +2566,7 @@ function Game:mousepressed(x, y, button)
         local by = 16 + 40
         if x >= bx and x <= bx + btnW and y >= by and y <= by + btnH then
             self.devPlacementMenuOpen = not self.devPlacementMenuOpen
-            return
+            return  -- Consume this click, do NOT process map placement
         end
         if self.devPlacementMenuOpen then
             local options, bW, bH, pad = self:getDevPlacementOptions()
@@ -2500,13 +2574,13 @@ function Game:mousepressed(x, y, button)
             local menuY = by
             local menu = NewMenu.new(menuX, menuY, options, {buttonWidth = bW, buttonHeight = bH, padding = pad})
             if menu:handleClick(x, y) then
-                return
+                return  -- Consume menu item click
             end
 
             -- Consume clicks anywhere in the menu backdrop so clicks don't fall through to the map
             local totalH = #options * (bH + pad) - pad
             if x >= menuX and x <= menuX + bW and y >= menuY and y <= menuY + totalH then
-                return
+                return  -- Consume click in menu area
             end
         end
     end
@@ -2599,7 +2673,58 @@ function Game:mousepressed(x, y, button)
     end
     -- Dev quick-placement removed
 
-    if self.state == "placing" then
+    if self.state == "zone_draft" then
+        -- Zone draft phase: select starting zone
+        if button == 1 then  -- Left click
+            local key = tostring(col) .. "," .. tostring(row)
+            local sIdx = nil
+            if self.tileToSector then sIdx = self.tileToSector[key] end
+            if sIdx then
+                -- Check if this zone is in the current drafting team's revealed candidates
+                local draftTeam = self.zoneDraftTeam
+                local isRevealed = false
+                if self.revealedCandidates and self.revealedCandidates[draftTeam] then
+                    for _, rid in ipairs(self.revealedCandidates[draftTeam]) do
+                        if rid == sIdx then isRevealed = true; break end
+                    end
+                end
+                
+                if isRevealed then
+                    -- Team selects this zone
+                    self.selectedStartSector[draftTeam] = sIdx
+                    self.teamZoneSelected[draftTeam] = true
+                    pcall(function() print(string.format("[zone_draft] team %s selected start sector %s", tostring(draftTeam), tostring(sIdx))) end)
+                    
+                    -- Mark sector as chosen
+                    if self.startSectors[sIdx] then
+                        self.startSectors[sIdx].chosen = true
+                    end
+                    
+                    -- Move this team to placement phase
+                    self.teamInPlacement[draftTeam] = true
+                    
+                    -- Move to next team in draft, or end draft if both selected
+                    if draftTeam == 1 then
+                        -- Team 1 just picked; now regenerate team 2's options excluding adjacent zones
+                        self.zoneDraftTeam = 2
+                        self:prepareRevealForTeam(2, 3)  -- This now respects team 1's chosen zone
+                        self:updateFogVisibility()  -- Update fog for team 2 to see their zones
+                    else
+                        -- Both teams have selected; all players now in placement
+                        self.state = "placing"
+                        -- Clear explored tiles from zone_draft phase so hidden zones appear unknown
+                        if self.fogOfWar then
+                            self.fogOfWar:clearExplored(1)
+                            self.fogOfWar:clearExplored(2)
+                        end
+                        -- Update fog to show only their chosen zones
+                        self:updateFogVisibility()
+                    end
+                    return
+                end
+            end
+        end
+    elseif self.state == "placing" then
         -- Placement phase: place pieces or bases on click
         if button == 1 then  -- Left click
             local teamArg = nil
@@ -4131,13 +4256,12 @@ function Game:keypressed(key)
                 self.placementTeam = (self.placementTeam == 1) and 2 or 1
                 pcall(function() print(string.format("[game] placementTeam -> %s", tostring(self.placementTeam))) end)
             else
-                -- During normal play, Tab toggles local control between teams
-                if not self.localTeam then
-                    self.localTeam = 1
-                else
-                    self.localTeam = (self.localTeam == 1) and 2 or nil
+                -- During zone_draft or placement, Tab switches the active team
+                if self.state == "zone_draft" then
+                    self.zoneDraftTeam = (self.zoneDraftTeam == 1) and 2 or 1
+                    self:updateFogVisibility()
+                    pcall(function() print(string.format("[game] zoneDraftTeam -> %s", tostring(self.zoneDraftTeam))) end)
                 end
-                pcall(function() print(string.format("[game] localTeam -> %s", tostring(self.localTeam))) end)
             end
             return
         end
@@ -4154,6 +4278,13 @@ function Game:keypressed(key)
         elseif key == "0" then
             self.localTeam = nil
             pcall(function() print("[game] localTeam cleared -> simultaneous placement") end)
+            return
+        elseif key == "f2" then
+            -- Toggle free placement during dev mode placement phase (F2, not F1)
+            if self.state == "placing" then
+                self.freePlacement = not self.freePlacement
+                pcall(function() print(string.format("[game] freePlacement -> %s", tostring(self.freePlacement))) end)
+            end
             return
         end
     end
@@ -4569,11 +4700,272 @@ end
 
 function Game:isInStartingArea(col, row, team)
     -- Check if position is within the team's starting area (top or bottom 5 rows)
+    -- If a start sector has been selected for this team, restrict to that sector
+    if self.selectedStartSector and self.selectedStartSector[team] then
+        local sIdx = self.selectedStartSector[team]
+        if self.tileToSector then
+            local key = tostring(col) .. "," .. tostring(row)
+            return self.tileToSector[key] == sIdx
+        end
+    end
+    -- Fallback to legacy rectangular starting areas
     local area = self.teamStartingAreas[team]
     if not area then return false end
-    
-    -- Check if row is within starting area depth
     return row >= area.rowStart and row <= area.rowEnd
+end
+
+-- Update fog of war visibility based on game state
+function Game:updateFogVisibility()
+    if not self.fogOfWar or not self.startSectors then return end
+    
+    if self.state == "zone_draft" then
+        -- During zone draft, show only the current drafting team's 3 revealed zones
+        local draftTeam = self.zoneDraftTeam
+        for team = 1, 2 do
+            -- Hide everything by default
+            for col = 1, self.mapWidth do
+                for row = 1, self.mapHeight do
+                    self.fogOfWar:setTileVisible(team, col, row, false)
+                end
+            end
+            
+            -- For the drafting team, reveal their 3 candidate zones
+            if team == draftTeam and self.revealedCandidates and self.revealedCandidates[draftTeam] then
+                for _, sectorId in ipairs(self.revealedCandidates[draftTeam]) do
+                    local sector = self.startSectors[sectorId]
+                    if sector then
+                        for _, t in ipairs(sector.tiles) do
+                            self.fogOfWar:setTileVisible(team, t.col, t.row, true)
+                        end
+                    end
+                end
+            end
+        end
+    elseif self.state == "placing" then
+        self:updatePlacementPhaseVisibility()
+    end
+end
+
+-- Update fog of war visibility for placement phase (only selected zone visible)
+function Game:updatePlacementPhaseVisibility()
+    if self.state ~= "placing" or not self.startSectors then return end
+    
+    -- For each team, set visibility only for their selected zone (if in placement)
+    for team = 1, 2 do
+        -- First, disable all visibility
+        for col = 1, self.mapWidth do
+            for row = 1, self.mapHeight do
+                self.fogOfWar:setTileVisible(team, col, row, false)
+            end
+        end
+        
+        -- Then, enable visibility only in their selected zone
+        if self.selectedStartSector and self.selectedStartSector[team] then
+            local sectorId = self.selectedStartSector[team]
+            local sector = self.startSectors[sectorId]
+            if sector then
+                for _, t in ipairs(sector.tiles) do
+                    self.fogOfWar:setTileVisible(team, t.col, t.row, true)
+                end
+            end
+        end
+    end
+end
+
+-- When a piece/base is placed, fog is already set via updatePlacementPhaseVisibility
+-- No need for revealPlacementZone anymore since we control it via selectedStartSector
+function Game:revealPlacementZone(col, row, team)
+    -- No-op: visibility is now managed by updatePlacementPhaseVisibility
+    -- based on selectedStartSector
+end
+
+-- Generate perimeter start sectors: N even zones around edge, proportional to map size
+function Game:generateStartSectors(n)
+    n = n or 8
+    self.startSectors = {}
+    self.tileToSector = {}
+
+    -- Find map center
+    local centerCol = math.ceil(self.mapWidth / 2)
+    local centerRow = math.ceil(self.mapHeight / 2)
+    local cx, cy = self.map:gridToPixels(centerCol, centerRow)
+
+    -- Collect all tiles (land and mountains) and compute the actual radius
+    local landTiles = {}
+    local maxDist = 0
+    for col = 1, self.mapWidth do
+        for row = 1, self.mapHeight do
+            local tile = self.map:getTile(col, row)
+            if tile then  -- Include all tiles, not just land
+                local px, py = self.map:gridToPixels(col, row)
+                local dx = px - cx
+                local dy = py - cy
+                local dist = math.sqrt(dx * dx + dy * dy)
+                table.insert(landTiles, {col = col, row = row, dist = dist})
+                if dist > maxDist then maxDist = dist end
+            end
+        end
+    end
+
+    if #landTiles == 0 then return end
+
+    -- Ring depth: proportional to map size (e.g., ~20% of radius from edge to center)
+    -- This ensures zones are ~8 tiles deep at any map size
+    local ringDepth = maxDist * 0.32
+    local ringInnerRadius = maxDist - ringDepth
+
+    -- Initialize N sectors (perimeter zones)
+    for i = 1, n do
+        self.startSectors[i] = {tiles = {}, centroidX = 0, centroidY = 0, count = 0, id = i, chosen = false}
+    end
+
+    -- Assign land tiles to sectors based on angle (only tiles in perimeter ring)
+    for _, tdata in ipairs(landTiles) do
+        if tdata.dist >= ringInnerRadius then  -- Within outer ring
+            local px, py = self.map:gridToPixels(tdata.col, tdata.row)
+            local ang = math.atan2(py - cy, px - cx)  -- -pi..pi
+            local sectorIdx = math.floor(((ang + math.pi) / (2 * math.pi)) * n) + 1
+            if sectorIdx < 1 then sectorIdx = 1 end
+            if sectorIdx > n then sectorIdx = n end
+            
+            local s = self.startSectors[sectorIdx]
+            table.insert(s.tiles, {col = tdata.col, row = tdata.row})
+            s.centroidX = s.centroidX + px
+            s.centroidY = s.centroidY + py
+            s.count = s.count + 1
+            self.tileToSector[tostring(tdata.col) .. "," .. tostring(tdata.row)] = sectorIdx
+        end
+    end
+
+    -- Finalize centroids
+    for i = 1, n do
+        local s = self.startSectors[i]
+        if s.count > 0 then
+            s.centroidX = s.centroidX / s.count
+            s.centroidY = s.centroidY / s.count
+        else
+            s.centroidX, s.centroidY = cx, cy
+        end
+    end
+
+    return self.startSectors
+end
+
+-- Draw start-sector overlays when sector picking is active; otherwise existing behavior draws rectangular strips
+function Game:drawStartSectors(viewTeam)
+    if not self.startSectors then return end
+    local n = #self.startSectors
+    
+    -- During zone_draft, only show zones for the current drafting team
+    local showAllZones = (self.state ~= "zone_draft")
+    
+    for i, s in ipairs(self.startSectors) do
+        local r, g, b = 0.5, 0.5, 0.5
+        local alpha = 0.15
+        local lineAlpha = 0.4
+        
+        -- During zone_draft, hide non-relevant zones
+        if self.state == "zone_draft" then
+            local draftTeam = self.zoneDraftTeam
+            -- If team 1 already picked, only show team 1's selected zone; team 2 sees their revealed candidates
+            if self.selectedStartSector and self.selectedStartSector[1] and draftTeam == 2 then
+                -- Show only the current team's revealed candidates
+                local isRevealed = false
+                if self.revealedCandidates and self.revealedCandidates[draftTeam] then
+                    for _, rid in ipairs(self.revealedCandidates[draftTeam]) do
+                        if rid == i then isRevealed = true; break end
+                    end
+                end
+                if not isRevealed then goto skip_zone end
+                r, g, b = 1.0, 0.95, 0.6
+                alpha = 0.40
+                lineAlpha = 0.95
+            elseif draftTeam == 1 and self.selectedStartSector and self.selectedStartSector[1] then
+                -- Team 1 already picked, don't show any more zones to team 1
+                goto skip_zone
+            else
+                -- Normal draft phase: show revealed candidates for drafting team
+                local isRevealed = false
+                if self.revealedCandidates and self.revealedCandidates[draftTeam] then
+                    for _, rid in ipairs(self.revealedCandidates[draftTeam]) do
+                        if rid == i then isRevealed = true; break end
+                    end
+                end
+                
+                if not isRevealed then
+                    -- Skip drawing this zone
+                    goto skip_zone
+                end
+                
+                -- This zone is revealed for the drafting team: highlight it
+                r, g, b = 1.0, 0.95, 0.6
+                alpha = 0.40
+                lineAlpha = 0.95
+            end
+        else
+            -- During placement, only show the viewing team's selected zone
+            if self.state == "placing" then
+                -- Only draw this sector if it belongs to the viewing team
+                if self.selectedStartSector and self.selectedStartSector[viewTeam] == i then
+                    if viewTeam == 1 then r, g, b = 1, 0.2, 0.2
+                    elseif viewTeam == 2 then r, g, b = 0.2, 0.4, 1 end
+                    alpha = 0.50
+                    lineAlpha = 1.0
+                else
+                    goto skip_zone
+                end
+            else
+                -- Other states: show selected zones in team colors
+                for team, sel in pairs(self.selectedStartSector or {}) do
+                    if sel == i then
+                        if team == 1 then r, g, b = 1, 0.2, 0.2
+                        elseif team == 2 then r, g, b = 0.2, 0.4, 1 end
+                        alpha = 0.50
+                        lineAlpha = 1.0
+                    end
+                end
+            end
+        end
+
+        love.graphics.setColor(r, g, b, alpha)
+        for _, t in ipairs(s.tiles) do
+            local tile = self.map:getTile(t.col, t.row)
+            if tile and tile.points then love.graphics.polygon("fill", tile.points) end
+        end
+
+        -- draw outline and label at centroid
+        love.graphics.setColor(r, g, b, lineAlpha)
+        love.graphics.setLineWidth(2)
+        for _, t in ipairs(s.tiles) do
+            local tile = self.map:getTile(t.col, t.row)
+            if tile and tile.points then love.graphics.polygon("line", tile.points) end
+        end
+        love.graphics.setLineWidth(1)
+        
+        -- Draw purple border at the outer edge of zone tiles (only for radial maps)
+        if self.mapGeneratorUsed == "radial" then
+            -- Get the external edges of this zone's tiles
+            local edges = self:calculateExternalEdges(s.tiles)
+            
+            -- Draw the border in purple
+            love.graphics.setColor(0.8, 0.2, 1.0, 0.9)  -- Purple, high visibility
+            love.graphics.setLineWidth(3)
+            
+            for _, e in ipairs(edges) do
+                love.graphics.line(e[1], e[2], e[3], e[4])
+            end
+            love.graphics.setLineWidth(1)
+        end
+        
+        if s.centroidX and s.centroidY then
+            love.graphics.setFont(love.graphics.newFont(16))
+            love.graphics.setColor(1,1,1,1.0)
+            love.graphics.printf(tostring(i), s.centroidX - 10, s.centroidY - 10, 20, "center")
+        end
+        
+        ::skip_zone::
+    end
+    love.graphics.setColor(1,1,1,1)
 end
 
 function Game:placePiece(col, row, team)
@@ -4584,8 +4976,8 @@ function Game:placePiece(col, row, team)
     end
     
     local teamToPlace = team or self.placementTeam
-    -- Check if position is within the team's starting area (unless devMode is enabled)e
-    if not self.devMode then
+    -- Check if position is within the team's starting area (unless freePlacement is enabled)
+    if not self.freePlacement then
         if not self:isInStartingArea(col, row, teamToPlace) then
             return  -- Can't place outside starting area
         end
@@ -4609,6 +5001,10 @@ function Game:placePiece(col, row, team)
             -- Place this piece (host or local play)
             piece:setPosition(col, row)
             self.piecesPlaced = self.piecesPlaced + 1
+            
+            -- Reveal placement zone for this team (permanent visibility in that sector)
+            self:revealPlacementZone(col, row, teamToPlace)
+            
             -- Refresh fog visibility for both teams after placement
             if self.fogOfWar then
                 self.fogOfWar:updateVisibility(teamToPlace, self.pieces, self.bases, self.teamStartingCorners)
@@ -4649,8 +5045,8 @@ function Game:placeBase(col, row, team)
     
     -- Determine which team is placing (allow optional team arg)
     local teamToPlace = team or self.placementTeam
-    -- Check if position is within the team's starting area (unless devMode is enabled)
-    if not self.devMode then
+    -- Check if position is within the team's starting area (unless freePlacement is enabled)
+    if not self.freePlacement then
         if not self:isInStartingArea(col, row, teamToPlace) then
             return  -- Can't place outside starting area
         end
@@ -4675,6 +5071,9 @@ function Game:placeBase(col, row, team)
 
             -- Local placement (host or single-player): delegate to helper
             self:applyPlaceBase(teamToPlace, col, row, base.type)
+            
+            -- Reveal placement zone for this team (permanent visibility in that sector)
+            self:revealPlacementZone(col, row, teamToPlace)
 
             -- If host, broadcast commit
             if Network and Network.isConnected and Network.isConnected() and self.isHost and not self._applyingRemote then
@@ -4777,6 +5176,60 @@ function Game:drawAirDefenseRadius(col, row, radius, team, lineColor, lineWidth)
             end
         end
     end
+end
+
+-- Prepare N candidate start sectors for a team, picking random zones (not pre-assigned)
+function Game:prepareRevealForTeam(team, n)
+    if not self.startSectors or #self.startSectors == 0 then return end
+    self.revealedCandidates = self.revealedCandidates or {}
+    
+    -- Collect available (not yet chosen) sector ids
+    local available = {}
+    for sid, s in ipairs(self.startSectors) do
+        if not s.chosen then table.insert(available, sid) end
+    end
+    
+    if #available == 0 then return end
+
+    -- Build set of sectors adjacent to any already-chosen sector
+    local adjacentChosen = {}
+    for sid, s in ipairs(self.startSectors) do
+        if s.chosen then
+            for _, t in ipairs(s.tiles) do
+                local tile = self.map:getTile(t.col, t.row)
+                if tile then
+                    local neigh = self.map:getNeighbors(tile, 1)
+                    for _, nk in ipairs(neigh) do
+                        local key = tostring(nk.col) .. "," .. tostring(nk.row)
+                        local osid = self.tileToSector[key]
+                        if osid then adjacentChosen[osid] = true end
+                    end
+                end
+            end
+        end
+    end
+
+    -- Filter to exclude adjacent-to-chosen sectors (enforce at least 1 zone gap)
+    local filtered = {}
+    for _, sid in ipairs(available) do
+        if not adjacentChosen[sid] then table.insert(filtered, sid) end
+    end
+    
+    -- Fallback: if not enough non-adjacent, use all available
+    if #filtered < n then filtered = available end
+
+    -- Pick n random unique sectors from filtered
+    local picks = {}
+    local pool = {unpack(filtered)}
+    -- Use team-based offset to ensure different results for each team
+    math.randomseed(os.time() + team * 1000)
+    for i = 1, math.min(n, #pool) do
+        local idx = math.random(#pool)
+        table.insert(picks, pool[idx])
+        table.remove(pool, idx)
+    end
+
+    self.revealedCandidates[team] = picks
 end
 
 return Game

@@ -240,7 +240,7 @@ function Piece:getActionOptions(game)
             id = "build_hq",
             name = "Build HQ",
             cost = 10,
-            buildTurns = 4,
+            buildTurns = 2,
             icon = "hq",
             disabled = onResourceTile or hasBase
         })
@@ -264,7 +264,7 @@ function Piece:getActionOptions(game)
             id = "build_resource_mine",
             name = "Build Resource Mine",
             cost = 3,
-            buildTurns = 3,
+            buildTurns = 1,
             icon = "resource_mine",
             disabled = hasBase
         })
@@ -273,7 +273,7 @@ function Piece:getActionOptions(game)
             name = "Build Airbase",
             cost = 8,
             oilCost = 2,
-            buildTurns = 4,
+            buildTurns = 2,
             icon = "airbase",
             disabled = onResourceTile or hasBase
         })

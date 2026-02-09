@@ -60,7 +60,26 @@ function HexMap.new(cols, rows, hexSideLength)
 end
 
 -- Initialize the grid with hex tiles
-function HexMap:initializeGrid()
+-- If isCircular is true, only creates hexes within a circular radius
+function HexMap:initializeGrid(isCircular)
+    isCircular = isCircular or false
+    
+    local centerCol = math.ceil(self.cols / 2)
+    local centerRow = math.ceil(self.rows / 2)
+    local cx, cy = 0, 0
+    
+    -- If circular, pre-calculate center in pixels
+    if isCircular then
+        cx = centerCol * self.horizontalSpacing
+        if centerCol % 2 == 0 then cy = cy + self.hexTile.hexHeight / 2 end
+        cy = centerRow * self.verticalSpacing
+        if centerCol % 2 == 0 then cy = cy + self.hexTile.hexHeight / 2 end
+    end
+    
+    -- Determine radius for circular grid: ~70% of smaller dimension
+    local minDim = math.min(self.cols, self.rows)
+    local circularRadius = minDim * .8* self.hexSideLength
+    
     for col = 1, self.cols do
         self.grid[col] = {}
         for row = 1, self.rows do
@@ -73,9 +92,21 @@ function HexMap:initializeGrid()
                 y = y + self.hexTile.hexHeight / 2
             end
             
+            -- If circular mode, skip hexes outside the radius
+            if isCircular then
+                local dx = x - cx
+                local dy = y - cy
+                local dist = math.sqrt(dx * dx + dy * dy)
+                if dist > circularRadius then
+                    -- Don't create hex outside radius
+                    goto skip_tile
+                end
+            end
+            
             -- Create hex tile
             local hexTile = HexTile.new(col, row, x, y, self.hexSideLength)
             self.grid[col][row] = hexTile
+            ::skip_tile::
         end
     end
 end
@@ -150,6 +181,8 @@ end
 
 
 function HexMap:getNeighbors(startHex, range)
+    if not startHex then return {} end
+    
     local neighbors = {} -- Table to store valid neighbors
     local visited = {} -- Table to track visited tiles
     local queue = {} -- Queue for BFS
@@ -163,6 +196,7 @@ function HexMap:getNeighbors(startHex, range)
     while #queue > 0 do
         local current = table.remove(queue, 1)
         local currentHex = current.hex
+        if not currentHex then goto continue_bfs end
         local currentRange = current.range
         currentHex.distance = currentRange
         -- Add the current hex to neighbors if it's within range (excluding the start hex if range > 0)
@@ -172,7 +206,7 @@ function HexMap:getNeighbors(startHex, range)
 
         -- Stop if we've reached the desired range
         if currentRange >= range then
-            goto continue
+            goto continue_bfs
         end
 
         -- Determine if this is an odd or even column
@@ -209,14 +243,18 @@ function HexMap:getNeighbors(startHex, range)
                 -- If the neighbor hasn't been visited, add it to the queue
                 if not visited[neighborKey] then
                     visited[neighborKey] = true
-                    table.insert(queue, {
-                        hex = self.grid[neighborCol][neighborRow],
-                        range = currentRange + 1
-                    })
+                    local neighborTile = self.grid[neighborCol][neighborRow]
+                    -- Only add to queue if tile exists (important for circular grids)
+                    if neighborTile then
+                        table.insert(queue, {
+                            hex = neighborTile,
+                            range = currentRange + 1
+                        })
+                    end
                 end
             end
         end
-        ::continue::
+        ::continue_bfs::
     end
 
     return neighbors
@@ -402,10 +440,12 @@ function HexMap:draw(offsetX, offsetY)
     for col = 1, self.cols do
         for row = 1, self.rows do
             local tile = self.grid[col][row]
-            self:drawTile(tile, offsetX, offsetY)
+            if tile then  -- Skip nil tiles (tiles outside circular boundary)
+                self:drawTile(tile, offsetX, offsetY)
+            end
         end
     end
-    self:drawGridCoordinates()
+    --self:drawGridCoordinates()
 end
 
 -- Draw a single hex tile
@@ -426,7 +466,8 @@ function HexMap:drawTile(tile, offsetX, offsetY)
             love.graphics.setColor(0.8, 0.7, 0.5)  -- Tan for bare land
         end
     else
-        love.graphics.setColor(0.5, 0.5, 0.5)  -- Gray for mountains
+        -- Mountains/water (not land)
+        love.graphics.setColor(0.4, 0.4, 0.5)  -- Dark gray for mountains
     end
     
     -- Draw hexagon
