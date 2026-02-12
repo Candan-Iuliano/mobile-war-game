@@ -138,6 +138,8 @@ function Game.new()
     self.devPlacementSelected = nil -- { kind = "unit"|"base", name = "infantry" }
     -- Per-player ready flags for simultaneous placement
     self.playerReady = {[1] = false, [2] = false}
+
+    --local centerCol, centerRow, cx, cy, _ = self:computeMapCenterAndRadius()
     
     return self
 end
@@ -223,6 +225,40 @@ function Game:updateCombatAnimations(dt)
         local a = self.combatAnimations[i]
         a.ttl = a.ttl - dt
         if a.ttl <= 0 then table.remove(self.combatAnimations, i) end
+    end
+end
+
+-- Update piece movement animations and trigger effects/trap checks as they move
+function Game:updatePieceAnimations(dt)
+    for _, piece in ipairs(self.pieces) do
+        if piece.isAnimating then
+            -- Track the tile before update
+            local prevCol, prevRow = piece.col, piece.row
+            
+            -- Update animation
+            local isComplete = piece:updateAnimation(dt)
+            
+            -- Check if piece has entered a new tile and trigger effects
+            if piece.col ~= prevCol or piece.row ~= prevRow then
+                -- Check for mines at new position
+                self:triggerMineAt(piece.col, piece.row, piece)
+                
+                -- Destroy defense if enemy enters tile
+                local defense = self:getDefenseAt(piece.col, piece.row)
+                if defense and defense.team ~= piece.team then
+                    self:removeDefense(piece.col, piece.row)
+                    self:log(piece.type .. " from team " .. piece.team .. " destroyed a defense at (" .. piece.col .. ", " .. piece.row .. ")")
+                end
+            end
+            
+            -- Animation finished, recalculate valid moves
+            if isComplete then
+                piece.isAnimating = false
+                piece.animationPath = {}
+                -- Recalculate valid moves after animation completes
+                self:calculateValidMoves()
+            end
+        end
     end
 end
 
@@ -350,8 +386,6 @@ end
 -- function Game:drawProvinceBoundaries()
 --     if not self.provinces then return end
 
---     -- Build reverse map: provinceId -> list of tiles
---     local provinceTiles = {}
 --     for col = 1, self.mapWidth do
 --         for row = 1, self.mapHeight do
 --             local pid = self.provinces[col .. "," .. row]
@@ -708,8 +742,8 @@ function Game:applyPlaceBase(team, col, row, baseType)
         pcall(function() print(string.format("[game] applyPlaceBase -> created new base team=%s col=%s row=%s baseType=%s", tostring(team), tostring(col), tostring(row), tostring(baseType))) end)
         placedBase = newBase
     end
-    -- Update fog visibility so the new base's effects are recognized locally
-    if self.fogOfWar then
+    -- Update fog visibility so the new base's effects are recognized locally (skip during placement to avoid cheating)
+    if self.fogOfWar and self.state ~= "placing" then
         -- Cache tiles within this placed base's radius to avoid repeated BFS calls
         if placedBase and placedBase.col and placedBase.col > 0 and self.getTilesWithinRadius then
             placedBase._tilesInRadius = self:getTilesWithinRadius(placedBase.col, placedBase.row, placedBase:getRadius())
@@ -758,6 +792,27 @@ function Game:generateResources()
         return false
     end
 
+    -- Compute map center (in grid and pixel coords) and map radius (pixels)
+    function Game:computeMapCenterAndRadius()
+        local centerCol = math.ceil(self.mapWidth / 2)
+        local centerRow = math.ceil(self.mapHeight / 2)
+        local cx, cy = self.map:gridToPixels(centerCol, centerRow)
+        local maxDist = 0
+        for col = 1, self.mapWidth do
+            for row = 1, self.mapHeight do
+                local tile = self.map:getTile(col, row)
+                if tile then
+                    local px, py = self.map:gridToPixels(col, row)
+                    local dx = px - cx
+                    local dy = py - cy
+                    local d = math.sqrt(dx * dx + dy * dy)
+                    if d > maxDist then maxDist = d end
+                end
+            end
+        end
+        return centerCol, centerRow, cx, cy, maxDist
+    end
+
     -- First, create resources marked by the map generator (tile.resourceType)
     local centerCol = math.floor(self.mapWidth / 2)
     local centerRow = math.floor(self.mapHeight / 2)
@@ -788,9 +843,18 @@ function Game:generateResources()
         end
     end
 
-    -- Generate a few additional generic resource tiles scattered across the map
-    local numResources = 3  -- Number of extra generic resources to place
-    for i = 1, numResources do
+    -- Generate a few additional generic metal tiles scattered across the map
+    -- Place enough so at least one is found by turn 3 (spread across map for even distribution)
+    local numMetals = 8  -- Increased from 3 to ensure better distribution
+    local mapArea = self.mapWidth * self.mapHeight
+    local targetDensity = numMetals / mapArea  -- Target spawn density
+    
+    -- Use helper to get map center and radius
+    local mapCenterCol, mapCenterRow, centerPx, centerPy, mapRadiusPx = self:computeMapCenterAndRadius()
+    local minDistFromEdge = 4 * (self.map.sideLength or 50)  -- 4 tiles from edge in pixels
+    local maxSpawnRadiusPx = mapRadiusPx - minDistFromEdge
+   
+    for i = 1, numMetals do
         local attempts = 0
         local placed = false
         while not placed and attempts < 100 do
@@ -799,11 +863,18 @@ function Game:generateResources()
             local row = math.random(5, self.mapHeight - 5)
             local tile = self.map:getTile(col, row)
             if tile and isValidResourceTile(tile) then
+                   -- Check distance from map center to ensure 4+ tiles from edge
+                   local px, py = self.map:gridToPixels(col, row)
+                   local dx = px - centerPx
+                   local dy = py - centerPy
+                   local distFromCenter = math.sqrt(dx * dx + dy * dy)
+                   if distFromCenter <= maxSpawnRadiusPx then
                 if not self:getPieceAt(col, row) and not self:getBaseAt(col, row) and not self:getResourceAt(col, row) and not inStartingArea(col, row) and not isTooCloseToResources(col, row) then
                     local resource = Resource.new("generic", self.map, col, row)
                     table.insert(self.resources, resource)
                     placed = true
                 end
+                   end
             end
         end
     end
@@ -866,6 +937,7 @@ end
 
 function Game:addPiece(pieceType, team, col, row)
     local piece = Piece.new(pieceType, team, self.map, col, row)
+    piece.recruited = true  -- New pieces start as having moved to prevent move+attack on the turn they're built
     table.insert(self.pieces, piece)
     -- If added with coordinates (mid-game build), mark so host will broadcast at end-turn
     if piece.col and piece.row and piece.col > 0 and piece.row > 0 then
@@ -885,6 +957,9 @@ end
 function Game:update(dt)
     -- Update game logic here
     if self.state == "playing" then
+        -- Update piece animations and handle effects as they move
+        self:updatePieceAnimations(dt)
+        
         -- Update pieces, animations, etc.
         
         -- Air superiority is expensive; compute once per turn instead of every frame
@@ -901,14 +976,8 @@ function Game:update(dt)
         self:updateCombatAnimations(dt)
         -- network messages are polled by main.lua and forwarded to Game:handleNetworkMessage
     elseif self.state == "placing" then
-        -- Update fog of war for the team that's placing (or local team if networked)
-        -- In devMode we avoid per-frame fog recalculation; update only after placements
-        if not self.devMode then
-            local viewTeam = self.localTeam or self.placementTeam
-            if self.fogOfWar then
-                self.fogOfWar:updateVisibility(viewTeam, self.pieces, self.bases, self.teamStartingCorners)
-            end
-        end
+        -- During placement phase we avoid updating fog every frame to keep visibility stable
+        -- (visibility will be refreshed after placement concludes)
         self:updateCombatAnimations(dt)
     end
 end
@@ -1017,15 +1086,21 @@ function Game:handleNetworkMessage(msg)
             local cmdD = self:countAdjacentCommanders(target) or 0
             maxA = maxA + (cmdA or 0)
             maxD = maxD + (cmdD or 0)
-            -- Check if defender is on a defensive structure (gives -1 to defender max die)
+            -- Check for defensive buffs: tile defenses and hills both penalize attacker max die
             local defenseHere = self:getDefenseAt(amsg.toCol, amsg.toRow)
-            local defenseEffect = 0
+            local defenseCount = 0
             if defenseHere and target and defenseHere.team == target.team then
-                defenseEffect = -1
-                maxD = math.max(1, maxD + defenseEffect)
+                defenseCount = defenseCount + 1
+            end
+            local targetTile = self.map and self.map:getTile(amsg.toCol, amsg.toRow)
+            if targetTile and targetTile.isHill then
+                defenseCount = defenseCount + 1
+            end
+            if defenseCount > 0 then
+                maxA = math.max(1, maxA - defenseCount)
             end
             pcall(function()
-                print(string.format("[DBG attack host PRE] aDice=%s moraleA=%s cmdA=%s maxA=%s  dDice=%s moraleD=%s cmdD=%s maxD=%s defense=%s defEff=%s", tostring(aDice), tostring(moraleA), tostring(cmdA), tostring(maxA), tostring(dDice), tostring(moraleD), tostring(cmdD), tostring(maxD), tostring(defenseHere ~= nil), tostring(defenseEffect)))
+                print(string.format("[DBG attack host PRE] aDice=%s moraleA=%s cmdA=%s maxA=%s  dDice=%s moraleD=%s cmdD=%s maxD=%s defense=%s defEff=%s target.col=%s target.row=%s attack.col=%s attack.row=%s", tostring(aDice), tostring(moraleA), tostring(cmdA), tostring(maxA), tostring(dDice), tostring(moraleD), tostring(cmdD), tostring(maxD), tostring(defenseHere ~= nil), tostring(defenseEffect), tostring(target and target.col), tostring(target and target.row), tostring(amsg.toCol), tostring(amsg.toRow)))
             end)
             local rollsA = self:rollDice(aDice, maxA)
             local rollsD = self:rollDice(dDice, maxD)
@@ -1583,6 +1658,17 @@ function Game:handleNetworkMessage(msg)
                 pcall(function() print(string.format("[game] commit startBuilding: no piece at %d,%d", col, row)) end)
             end
         end
+    elseif msg.type == "placeDefense" then
+        -- Host broadcasted placeDefense commit: create defensive structure on client
+        local col = tonumber(msg.col)
+        local row = tonumber(msg.row)
+        local team = tonumber(msg.team)
+        if col and row and team then
+            if not self:getDefenseAt(col, row) then
+                self:addDefense(col, row, team)
+                pcall(function() print(string.format("[game] applied commit placeDefense at %d,%d team=%s", col, row, tostring(team))) end)
+            end
+        end
     elseif msg.type == "placementPhase" then
         if msg.phase == "bases" then
             pcall(function() print("[game] remote requested entering base placement phase") end)
@@ -1919,7 +2005,9 @@ function Game:draw()
                 end
             end
             if drawPiece then
-                local pixelX, pixelY = self.map:gridToPixels(piece.col, piece.row)
+                -- Use interpolated position during animation
+                local drawCol, drawRow = piece:getAnimationPosition()
+                local pixelX, pixelY = self.map:gridToPixels(drawCol, drawRow)
                 -- Pass game object to draw method so special units (like SAM) can render effects
                 piece:draw(pixelX, pixelY, self.hexSideLength)
                 if piece.type == "sam" then
@@ -1952,30 +2040,36 @@ function Game:draw()
     for _, piece in ipairs(self.pieces) do
         -- Only show waypoints for pieces belonging to the current turn (not visible to enemy)
         if piece.team == self.currentTurn and piece.waypoints and #piece.waypoints > 0 then
-            local waypoints = {{col = piece.col, row = piece.row}}
-            for _, wp in ipairs(piece.waypoints) do
-                table.insert(waypoints, wp)
-            end
-            -- Team-colored paths
-            if piece.team == 1 then
-                love.graphics.setColor(1, 0.3, 0.3, 0.4)  -- Red for team 1
-            else
-                love.graphics.setColor(0.3, 0.3, 1, 0.4)  -- Blue for team 2
-            end
-            love.graphics.setLineWidth(3)
-            for i = 1, #waypoints - 1 do
-                local p1x, p1y = self.map:gridToPixels(waypoints[i].col, waypoints[i].row)
-                local p2x, p2y = self.map:gridToPixels(waypoints[i+1].col, waypoints[i+1].row)
-                love.graphics.line(p1x, p1y, p2x, p2y)
-            end
-            -- Draw circle at the final waypoint target
-            if #waypoints > 1 then
-                local finalWp = waypoints[#waypoints]
+            -- Get the final destination (last waypoint)
+            local finalWp = piece.waypoints[#piece.waypoints]
+            
+                -- Get the full quickest path (minimize movement turns) from current position to final destination
+            local fullPath = self:findQuickestPath(piece.col, piece.row, finalWp.col, finalWp.row, piece.team, piece.stats.moveRange)
+            
+            if fullPath and #fullPath > 0 then
+                -- Prepend current position to draw the complete path
+                local completePath = {{col = piece.col, row = piece.row}}
+                for _, pathTile in ipairs(fullPath) do
+                    table.insert(completePath, pathTile)
+                end
+                
+                -- Team-colored paths
+                local teamColor
+                if piece.team == 1 then
+                    teamColor = {1, 0.3, 0.3, 0.4}  -- Red for team 1
+                else
+                    teamColor = {0.3, 0.3, 1, 0.4}  -- Blue for team 2
+                end
+                
+                -- Draw line through all hex centers in the complete path
+                self:drawPathLine(completePath, teamColor, 3)
+                
+                -- Draw circle at the final waypoint target
                 local px, py = self.map:gridToPixels(finalWp.col, finalWp.row)
+                love.graphics.setColor(teamColor[1], teamColor[2], teamColor[3], 1)
                 love.graphics.circle("line", px, py, self.hexSideLength * 0.4)
+                love.graphics.setColor(1,1,1,1)
             end
-            love.graphics.setLineWidth(1)
-            love.graphics.setColor(1,1,1,1)
         end
     end
     
@@ -2128,6 +2222,22 @@ function Game:drawValidMoves()
             love.graphics.polygon("fill", points)
         end
     end
+end
+
+-- Helper method to draw a path line through hex centers
+function Game:drawPathLine(pathTiles, teamColor, lineWidth)
+    if not pathTiles or #pathTiles == 0 then return end
+    
+    love.graphics.setLineWidth(lineWidth or 3)
+    love.graphics.setColor(teamColor[1], teamColor[2], teamColor[3], teamColor[4] or 0.4)
+    
+    for i = 1, #pathTiles - 1 do
+        local p1x, p1y = self.map:gridToPixels(pathTiles[i].col, pathTiles[i].row)
+        local p2x, p2y = self.map:gridToPixels(pathTiles[i+1].col, pathTiles[i+1].row)
+        love.graphics.line(p1x, p1y, p2x, p2y)
+    end
+    
+    love.graphics.setLineWidth(1)
 end
 
 function Game:drawValidPlacementTiles()
@@ -2449,7 +2559,7 @@ function Game:drawUI()
         love.graphics.setFont(love.graphics.newFont(11))
         for _, piece in ipairs(self.pieces) do
             if piece.team == self.currentTurn and piece.isBuilding and piece.buildingTurnsRemaining then
-                local buildingName = piece.buildingType == "resource_mine" and "Resource Mine" or
+                local buildingName = piece.buildingType == "resource_mine" and "Metal Mine" or
                                    piece.buildingType == "ammoDepot" and "Ammo Depot" or
                                    piece.buildingType == "supplyDepot" and "Supply Depot" or
                                    piece.buildingType == "airbase" and "Airbase" or
@@ -2473,7 +2583,7 @@ function Game:drawUI()
             
             -- Show building status if building
             if self.selectedPiece.isBuilding then
-                local buildingName = self.selectedPiece.buildingType == "resource_mine" and "Resource Mine" or
+                local buildingName = self.selectedPiece.buildingType == "resource_mine" and "Metal Mine" or
                                    self.selectedPiece.buildingType == "ammoDepot" and "Ammo Depot" or
                                    self.selectedPiece.buildingType == "supplyDepot" and "Supply Depot" or
                                    self.selectedPiece.buildingType == "airbase" and "Airbase" or
@@ -2740,12 +2850,15 @@ function Game:mousepressed(x, y, button)
 
             if self.placementPhase == "pieces" then
                 if teamArg and teamHasPlacedAllPieces(teamArg) then
-                    -- This local team has finished pieces: allow placing bases for them
+                    -- This local team has finished pieces: allow placing bases AND replacing pieces
+                    self:placePiece(col, row, teamArg)
                     self:placeBase(col, row, teamArg)
                 else
                     self:placePiece(col, row, teamArg)
                 end
             else
+                -- Base placement phase: allow both piece and base replacement
+                self:placePiece(col, row, teamArg)
                 self:placeBase(col, row, teamArg)
             end
         end
@@ -2880,13 +2993,19 @@ function Game:mousepressed(x, y, button)
                     return  -- Can't set waypoint on unexplored tile
                 end
                 
-                -- Calculate full path from piece current position to the clicked tile
-                local fullPath = self:findShortestPath(piece.col, piece.row, col, row)
+                -- Don't allow waypoint on a tile occupied by another piece
+                local occupier = self:getPieceAt(col, row)
+                if occupier and occupier ~= piece then
+                    return  -- Can't set waypoint on occupied tile
+                end
+                
+                -- Calculate full quickest path from piece current position to the clicked tile
+                local fullPath = self:findQuickestPath(piece.col, piece.row, col, row, piece.team, piece.stats.moveRange)
                 
                 if fullPath and #fullPath > 0 then
-                    -- Break path into movement-sized segments
+                    -- Break path into movement-sized segments, checking for friendly collisions
                     local moveRange = piece.stats.moveRange or 1
-                    local segments = self:breakPathIntoSegments(fullPath, moveRange)
+                    local segments = self:breakPathIntoSegments(fullPath, moveRange, piece)
                     
                     piece.waypoints = segments
                     piece.currentWaypointIndex = 1
@@ -3370,7 +3489,7 @@ function Game:executeAction(option)
         -- Engineer builds a supply depot
         self:buildStructureNearPiece(context, "supplyDepot", team, option.cost, option.buildTurns)
     elseif option.id == "build_resource_mine" and contextType == "piece" then
-        -- Engineer builds a resource mine
+        -- Engineer builds a metal mine
         self:buildResourceMineNearPiece(context, team, option.cost, option.buildTurns)
     elseif option.id == "place_mine" and contextType == "piece" then
         -- Engineer places a land mine
@@ -3616,7 +3735,7 @@ function Game:calculateValidMoves()
     self.validMoves = {}
     self.validAttacks = {}
     
-    if not self.selectedPiece then return end
+    if not self.selectedPiece or self.selectedPiece.recruited == true then return end
     
     -- If piece is currently building, don't show any moves or attacks
     local isBuilding = self.selectedPiece.isBuilding or false
@@ -4041,11 +4160,24 @@ function Game:movePiece(col, row)
             self.teamOil[team] = (self.teamOil[team] or 0) - 1
         end
 
-        self.selectedPiece:setPosition(col, row)
+        -- Find quickest path (minimize movement turns) from current position to target
+        local path = self:findQuickestPath(oldCol, oldRow, col, row, self.selectedPiece and self.selectedPiece.team, (self.selectedPiece and self.selectedPiece.stats.moveRange) or 1)
+        
+        -- Mark as moved immediately (prevents further moves)
+        self.selectedPiece.hasMoved = true
+        
+        -- Start animated movement along the path
+        if path and #path > 0 then
+            self.selectedPiece:startAnimatedMovement(path)
+        else
+            -- If no path found, do direct movement (shouldn't happen for valid moves)
+            self.selectedPiece:setPosition(col, row)
+        end
+        
         -- Clear any waypoints when piece is moved manually
         self.selectedPiece.waypoints = {}
         self.selectedPiece.currentWaypointIndex = 0
-        self:calculateValidMoves()
+        
         -- Send network update (mirror) if connected and this is a local action
         if Network and Network.isConnected and Network.isConnected() and not self._applyingRemote then
             if self.isHost then
@@ -4055,19 +4187,9 @@ function Game:movePiece(col, row)
             end
         end
 
-        -- Check for mines triggered by moving into this tile (host will broadcast mine commits)
-        self:triggerMineAt(col, row, self.selectedPiece)
-        
-        -- Destroy defense if enemy enters the tile
-        local defense = self:getDefenseAt(col, row)
-        if defense and defense.team ~= self.selectedPiece.team then
-            self:removeDefense(col, row)
-            self:log(self.selectedPiece.type .. " from team " .. self.selectedPiece.team .. " destroyed a defense at (" .. col .. ", " .. row .. ")")
-        end
-
-        -- Recalculate valid moves/attacks after any mine effects and keep the piece selected
-        -- so the player can attack after moving if valid targets exist.
-        self:calculateValidMoves()
+        -- Note: Mine triggers and defense destruction now happen in updatePieceAnimations() as piece moves
+        -- Recalculate valid moves/attacks after animation completes
+        -- For now, we'll recalculate when animation finishes
     elseif isValidAttack and targetPiece then
         -- If networked client, send request to host and don't apply locally
         -- If networked client, send request to host and don't apply locally
@@ -4110,16 +4232,16 @@ function Game:movePiece(col, row)
         maxA = maxA + (cmdA or 0)
         maxD = maxD + (cmdD or 0)
         
-        -- Check if defender is on a defensive structure (gives -1 to defender max die)
+        -- Check if defender is on a defensive structure (gives -1 to attacker max die)
         local defense = self:getDefenseAt(col, row)
         local defenseEffect = 0
         if defense and defense.team == targetPiece.team then
             defenseEffect = -1
-            maxD = math.max(1, maxD + defenseEffect)  -- Ensure minimum die value of 1
+            maxA = math.max(1, maxA + defenseEffect)  -- Defense penalizes attacker's die, ensure minimum of 1
         end
 
         pcall(function()
-            print(string.format("[DBG attack local PRE] aDice=%s moraleA=%s cmdA=%s maxA=%s  dDice=%s moraleD=%s cmdD=%s maxD=%s defense=%s defEff=%s", tostring(aDice), tostring(moraleA), tostring(cmdA), tostring(maxA), tostring(dDice), tostring(moraleD), tostring(cmdD), tostring(maxD), tostring(defense ~= nil), tostring(defenseEffect)))
+            print(string.format("[DBG attack local PRE] aDice=%s moraleA=%s cmdA=%s maxA=%s  dDice=%s moraleD=%s cmdD=%s maxD=%s defense=%s defEff=%s target.col=%s target.row=%s attack.col=%s attack.row=%s", tostring(aDice), tostring(moraleA), tostring(cmdA), tostring(maxA), tostring(dDice), tostring(moraleD), tostring(cmdD), tostring(maxD), tostring(defense ~= nil), tostring(defenseEffect), tostring(targetPiece.col), tostring(targetPiece.row), tostring(col), tostring(row)))
         end)
         local rollsA = self:rollDice(aDice, maxA)
         local rollsD = self:rollDice(dDice, maxD)
@@ -4371,22 +4493,45 @@ end
 -- Process waypoint moves for a team at the start of their turn
 function Game:processWaypointMoves(team)
     for _, piece in ipairs(self.pieces) do
-        if piece.team == team and piece.waypoints and #piece.waypoints > 0 and not piece.hasMoved then
+        if piece.team == team and piece.waypoints and #piece.waypoints > 0 and not piece.hasMoved and not piece.isAnimating then
             local currentWpIdx = piece.currentWaypointIndex
             if currentWpIdx >= 1 and currentWpIdx <= #piece.waypoints then
                 local targetWp = piece.waypoints[currentWpIdx]
+                
+                -- Check if the target waypoint is occupied by a friendly piece at this moment
+                -- (another piece may have moved there during this turn phase)
+                local occupier = self:getPieceAt(targetWp.col, targetWp.row)
+                if occupier and occupier.team == piece.team and occupier ~= piece then
+                    -- Can't reach this waypoint, it's blocked by a friendly piece
+                    -- Skip to next waypoint instead of being stuck
+                    piece.currentWaypointIndex = currentWpIdx + 1
+                    if piece.currentWaypointIndex > #piece.waypoints then
+                        piece.waypoints = {}
+                        piece.currentWaypointIndex = 0
+                    end
+                    return
+                end
+                
                 -- Move toward the target waypoint
-                local path = self:findShortestPath(piece.col, piece.row, targetWp.col, targetWp.row)
+                local path = self:findQuickestPath(piece.col, piece.row, targetWp.col, targetWp.row, piece.team, piece.stats.moveRange)
                 if path and #path > 0 then
                     -- Move moveRange steps at once (or fewer if path is shorter)
                     local moveRange = piece.stats.moveRange or 1
                     local stepsToMove = math.min(moveRange, #path)
-                    local nextStep = path[stepsToMove]
-                    local oldCol, oldRow = piece.col, piece.row
-                    piece:setPosition(nextStep.col, nextStep.row)
+                    
+                    -- Extract the sub-path to animate
+                    local animationPath = {}
+                    for i = 1, stepsToMove do
+                        table.insert(animationPath, path[i])
+                    end
+                    
+                    -- Start animation
+                    piece:startAnimatedMovement(animationPath)
                     piece.hasMoved = true
+                    
                     -- Check if reached waypoint; advance to next if so
-                    if piece.col == targetWp.col and piece.row == targetWp.row then
+                    local finalStep = animationPath[#animationPath]
+                    if finalStep.col == targetWp.col and finalStep.row == targetWp.row then
                         piece.currentWaypointIndex = currentWpIdx + 1
                         if piece.currentWaypointIndex > #piece.waypoints then
                             -- Reached the last waypoint; clear waypoints
@@ -4404,7 +4549,9 @@ end
 -- Returns path {col, row} list or nil if no path
 -- Find the shortest path using BFS
 -- Returns list of {col, row} steps from start to target
-function Game:findShortestPath(startCol, startRow, targetCol, targetRow)
+-- Allows passing through friendly pieces when `movingTeam` is provided.
+-- Still disallows ending on an occupied tile (unless it's the target and handled elsewhere).
+function Game:findShortestPath(startCol, startRow, targetCol, targetRow, movingTeam)
     local visited = {}
     local queue = {{col = startCol, row = startRow, path = {}}}
     visited[startCol .. "," .. startRow] = true
@@ -4426,12 +4573,30 @@ function Game:findShortestPath(startCol, startRow, targetCol, targetRow)
                     visited[nkey] = true
                     local nTile = self.map:getTile(neighbor.col, neighbor.row)
                     if nTile and nTile.isLand then
-                        local newPath = {}
-                        for _, p in ipairs(currentPath) do
-                            table.insert(newPath, p)
+                        -- Check if tile is occupied by another piece
+                        -- Allow passing through friendly pieces (if movingTeam is provided)
+                        -- Only allow path through the target destination
+                        local occupiedByOther = false
+                        if not (neighbor.col == targetCol and neighbor.row == targetRow) then
+                            local occupier = self:getPieceAt(neighbor.col, neighbor.row)
+                            if occupier then
+                                if movingTeam and occupier.team == movingTeam then
+                                    -- friendly piece: allow pass-through
+                                    occupiedByOther = false
+                                else
+                                    occupiedByOther = true
+                                end
+                            end
                         end
-                        table.insert(newPath, {col = neighbor.col, row = neighbor.row})
-                        table.insert(queue, {col = neighbor.col, row = neighbor.row, path = newPath})
+
+                        if not occupiedByOther then
+                            local newPath = {}
+                            for _, p in ipairs(currentPath) do
+                                table.insert(newPath, p)
+                            end
+                            table.insert(newPath, {col = neighbor.col, row = neighbor.row})
+                            table.insert(queue, {col = neighbor.col, row = neighbor.row, path = newPath})
+                        end
                     end
                 end
             end
@@ -4440,30 +4605,208 @@ function Game:findShortestPath(startCol, startRow, targetCol, targetRow)
     return {}
 end
 
+-- Find the quickest path minimizing number of movement segments (turns).
+-- Steps per segment = moveRange. Hills force segment end when entered.
+-- movingTeam allows passing through friendly pieces.
+function Game:findQuickestPath(startCol, startRow, targetCol, targetRow, movingTeam, moveRange)
+    moveRange = moveRange or 1
+    -- Priority queue implemented as simple list sorted by (turns, pathLength)
+    local function makeKey(c, r, s)
+        return tostring(c) .. "," .. tostring(r) .. "," .. tostring(s)
+    end
+
+    local startState = {col = startCol, row = startRow, stepsLeft = moveRange, turns = 0, path = {}}
+    local open = {startState}
+    local best = {} -- best[key] = minimal turns seen for that state
+    best[makeKey(startCol, startRow, moveRange)] = 0
+
+    local function popBest()
+        if #open == 0 then return nil end
+        -- table.sort(open, function(a,b)
+        --     if a.turns ~= b.turns then return a.turns < b.turns end
+        --     return #a.path < #b.path
+        -- end)
+        table.sort(open, function(a, b)
+            if a.turns ~= b.turns then
+                return a.turns < b.turns
+            end
+            -- prefer states that used MORE steps in the current turn
+            return a.stepsLeft > b.stepsLeft
+        end)
+        return table.remove(open, 1)
+    end
+
+    while true do
+        local cur = popBest()
+        if not cur then break end
+        if cur.col == targetCol and cur.row == targetRow then
+            return cur.path
+        end
+
+        local tile = self.map:getTile(cur.col, cur.row)
+        if not tile then goto continue end
+        local neighbors = self.map:getNeighbors(tile, 1)
+        for _, neighbor in ipairs(neighbors) do
+            local ncol, nrow = neighbor.col, neighbor.row
+            local nTile = self.map:getTile(ncol, nrow)
+            if not nTile or not nTile.isLand then goto next_neighbor end
+
+            -- Get occupiers at this neighbor tile
+            local occupierPiece = self:getPieceAt(ncol, nrow)
+            
+            -- Block only enemy/neutral pieces - allow friendly pieces to be passed through
+            -- The waypoint breaking logic will handle avoiding landing on friendlies
+            if occupierPiece and movingTeam and occupierPiece.team ~= movingTeam then
+                -- Occupied by enemy or neutral piece - cannot pass through
+                goto next_neighbor
+            end
+
+            -- Determine if we need to start a new segment for this step
+            local startedNewSegment = false
+            local newTurns = cur.turns
+            local newStepsLeft = cur.stepsLeft
+
+            if newStepsLeft <= 0 then
+                newTurns = newTurns + 1
+                startedNewSegment = true
+                newStepsLeft = moveRange - 1
+            else
+                newStepsLeft = newStepsLeft - 1
+            end
+
+            -- If entering a hill, movement ends: force stepsLeft to 0 and increment turns if we didn't already start one for this move
+            if nTile.isHill then
+                if not startedNewSegment then
+                    newTurns = newTurns + 1
+                end
+                newStepsLeft = 0
+            end
+
+            local key = makeKey(ncol, nrow, newStepsLeft)
+            if not best[key] or newTurns < best[key] then
+                best[key] = newTurns
+                local newPath = {}
+                for _, v in ipairs(cur.path) do table.insert(newPath, v) end
+                table.insert(newPath, {col = ncol, row = nrow})
+                table.insert(open, {col = ncol, row = nrow, stepsLeft = newStepsLeft, turns = newTurns, path = newPath})
+            end
+            ::next_neighbor::
+        end
+        ::continue::
+    end
+    return {}
+end
+-- Predict where pieces will be at the end of the current turn
+-- This helps avoid setting waypoints that would collide with friendly pieces
+-- Returns a set of {col, row} positions occupied by friendly pieces after movement
+function Game:getPredictedFriendlyOccupancy(movingPiece)
+    local occupiedTiles = {}
+    
+    -- Check current positions of all friendly pieces except the moving one
+    for _, piece in ipairs(self.pieces) do
+        if piece.team == movingPiece.team and piece ~= movingPiece then
+            -- If piece is already moved this turn, it won't move again
+            -- If piece is not yet moved and has waypoints, predict its final position after move
+            if piece.hasMoved then
+                -- Piece has moved, mark current position
+                table.insert(occupiedTiles, {col = piece.col, row = piece.row})
+            else
+                -- Piece hasn't moved yet
+                if piece.waypoints and #piece.waypoints > 0 then
+                    -- Has waypoints, will move - check where it will end up
+                    local wpIndex = piece.currentWaypointIndex or 1
+                    if wpIndex > 0 and wpIndex <= #piece.waypoints then
+                        local currentWp = piece.waypoints[wpIndex]
+                        -- This piece will try to reach its current waypoint
+                        table.insert(occupiedTiles, {col = currentWp.col, row = currentWp.row})
+                    end
+                else
+                    -- No waypoints, stays in place
+                    table.insert(occupiedTiles, {col = piece.col, row = piece.row})
+                end
+            end
+        end
+    end
+    
+    return occupiedTiles
+end
+
+-- Helper function to check if a tile is occupied by a friendly piece (predicted)
+-- Bases are NOT considered blocking
+function Game:isTileOccupiedByFriendlyPiece(col, row, movingPiece, predictedOccupancy)
+    for _, occupied in ipairs(predictedOccupancy) do
+        if occupied.col == col and occupied.row == row then
+            return true
+        end
+    end
+    return false
+end
+
 -- Break a full path into movement-sized segments (waypoints)
 -- segmentSize should be the piece's moveRange
 -- Returns waypoints at multiples of segmentSize, plus the final waypoint
-function Game:breakPathIntoSegments(fullPath, segmentSize)
+-- Dynamically adjusts segment size to avoid friendly piece collisions
+function Game:breakPathIntoSegments(fullPath, segmentSize, movingPiece)
     local segments = {}
     
     if not fullPath or #fullPath == 0 then return segments end
     
-    local pathLength = #fullPath
+    -- Get predicted friendly occupancy for the end of turn
+    local predictedOccupancy = self:getPredictedFriendlyOccupancy(movingPiece)
     
-    -- Add waypoints at each segmentSize interval
-    for i = segmentSize, pathLength, segmentSize do
-        table.insert(segments, fullPath[i])
+    -- Also add current positions of all friendly pieces that might be in the way
+    for _, piece in ipairs(self.pieces) do
+        if piece.team == movingPiece.team and piece ~= movingPiece then
+            local alreadyInList = false
+            for _, occ in ipairs(predictedOccupancy) do
+                if occ.col == piece.col and occ.row == piece.row then
+                    alreadyInList = true
+                    break
+                end
+            end
+            if not alreadyInList then
+                table.insert(predictedOccupancy, {col = piece.col, row = piece.row})
+            end
+        end
     end
     
-    -- If there's a remainder (path not evenly divisible), add the final waypoint
-    if pathLength % segmentSize ~= 0 then
-        table.insert(segments, fullPath[pathLength])
-    end
+    local currentIndex = 1
     
-    -- If the only remaining waypoint is the final one (path shorter than segmentSize),
-    -- make sure we have it
-    if #segments == 0 and #fullPath > 0 then
-        table.insert(segments, fullPath[#fullPath])
+    while currentIndex <= #fullPath do
+        local maxReach = math.min(currentIndex + segmentSize - 1, #fullPath)
+        local safeEndpoint = nil
+        
+        -- Find the furthest safe point we can reach in this segment
+        -- Work backwards from maxReach to ensure we get the longest valid movement
+        for checkIndex = maxReach, currentIndex, -1 do
+            local tile = fullPath[checkIndex]
+            local t = nil
+            if tile and tile.col and tile.row then
+                t = self.map:getTile(tile.col, tile.row)
+            end
+            
+            -- Check if this tile is safe (no friendly piece collision)
+            local isSafe = not self:isTileOccupiedByFriendlyPiece(tile.col, tile.row, movingPiece, predictedOccupancy)
+            local isHill = t and t.isHill
+            
+            -- Valid endpoints: safe tile, or if it's the target destination (allow it)
+            if isSafe then
+                safeEndpoint = checkIndex
+                break
+            elseif isHill and checkIndex > currentIndex then
+                -- Hill forces end at previous tile
+                safeEndpoint = checkIndex - 1
+                break
+            end
+        end
+        
+        if safeEndpoint then
+            table.insert(segments, fullPath[safeEndpoint])
+            currentIndex = safeEndpoint + 1
+        else
+            -- No safe endpoint found in this segment, skip to next tile and try again
+            currentIndex = currentIndex + 1
+        end
     end
     
     return segments
@@ -4984,7 +5327,18 @@ function Game:placePiece(col, row, team)
     end
     
     -- Check if tile is already occupied
-    if self:getPieceAt(col, row) then
+    local occupier = self:getPieceAt(col, row)
+    if occupier then
+        -- If in placement phase and clicking your own placed piece, remove it and return it to unplaced pool
+        if self.state == "placing" and occupier.team == teamToPlace then
+            occupier.col = 0
+            occupier.row = 0
+            occupier.hexTile = nil
+            self.piecesPlaced = math.max(0, (self.piecesPlaced or 0) - 1)
+            -- Do not update fog during placement; leave visibility as-is
+            pcall(function() print(string.format("[game] removed placed piece of team %s at (%d,%d)", tostring(occupier.team), col, row)) end)
+            return
+        end
         return  -- Tile already has a piece
     end
     
@@ -5005,8 +5359,8 @@ function Game:placePiece(col, row, team)
             -- Reveal placement zone for this team (permanent visibility in that sector)
             self:revealPlacementZone(col, row, teamToPlace)
             
-            -- Refresh fog visibility for both teams after placement
-            if self.fogOfWar then
+            -- Skip refreshing fog visibility during placement phase (keep cached visibility)
+            if self.fogOfWar and self.state ~= "placing" then
                 self.fogOfWar:updateVisibility(teamToPlace, self.pieces, self.bases, self.teamStartingCorners)
                 self.fogOfWar:updateVisibility((teamToPlace == 1) and 2 or 1, self.pieces, self.bases, self.teamStartingCorners)
             end
@@ -5053,9 +5407,25 @@ function Game:placeBase(col, row, team)
     end
     pcall(function() print(string.format("[game] placeBase attempt team=%s col=%s row=%s placementPhase=%s", tostring(teamToPlace), tostring(col), tostring(row), tostring(self.placementPhase))) end)
     
-    -- Check if tile is already occupied by piece or base
-    if self:getPieceAt(col, row) or self:getBaseAt(col, row) then
+    -- Check if tile already contains a base: if in placement phase and it's your own base, remove it
+    local occupier = self:getBaseAt(col, row)
+    if occupier then
+        -- If in placement phase and clicking your own placed base, remove it and return it to unplaced pool
+        if self.state == "placing" and occupier.team == teamToPlace then
+            occupier.col = 0
+            occupier.row = 0
+            occupier.hexTile = nil
+            self.basesPlaced = math.max(0, (self.basesPlaced or 0) - 1)
+            -- Do not update fog during placement; leave visibility as-is
+            pcall(function() print(string.format("[game] removed placed base of team %s at (%d,%d)", tostring(occupier.team), col, row)) end)
+            return
+        end
         return  -- Tile already has something
+    end
+    
+    -- Check if tile already occupied by piece
+    if self:getPieceAt(col, row) then
+        return  -- Tile already has a piece
     end
     
     -- Find the first unplaced base for the requested team
@@ -5074,6 +5444,12 @@ function Game:placeBase(col, row, team)
             
             -- Reveal placement zone for this team (permanent visibility in that sector)
             self:revealPlacementZone(col, row, teamToPlace)
+
+            -- Skip refreshing fog visibility during placement phase (keep cached visibility)
+            if self.fogOfWar and self.state ~= "placing" then
+                self.fogOfWar:updateVisibility(teamToPlace, self.pieces, self.bases, self.teamStartingCorners)
+                self.fogOfWar:updateVisibility((teamToPlace == 1) and 2 or 1, self.pieces, self.bases, self.teamStartingCorners)
+            end
 
             -- If host, broadcast commit
             if Network and Network.isConnected and Network.isConnected() and self.isHost and not self._applyingRemote then

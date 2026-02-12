@@ -54,6 +54,8 @@ function Piece.new(pieceType, team, gameMap, col, row)
     self.selected = false
     self.canMove = true
     self.hasMoved = false
+    self.recruited = false  -- New pieces start as having moved to prevent move+attack on the turn they're built
+    self.veteran = false  -- Gains veteran status after surviving a battle, granting bonuses
     
     -- Building system (for engineers)
     self.isBuilding = false  -- Is this piece currently building something?
@@ -81,6 +83,14 @@ function Piece.new(pieceType, team, gameMap, col, row)
     self.waypoints = {}  -- List of {col, row} waypoints to follow
     self.currentWaypointIndex = 0  -- Index of the waypoint being moved toward
     
+    -- Movement animation system
+    self.isAnimating = false  -- Is this piece currently moving?
+    self.animationPath = {}  -- Path of tiles to step through during animation
+    self.animationProgress = 0  -- Current progress (0 to 1) in animating to next tile
+    self.animationSpeed = 0.15  -- Time in seconds per tile (adjust for faster/slower movement)
+    self.animationTime = 0  -- Accumulated time since animation started
+    self.animationNextTile = 0  -- Index of next tile in path to move to
+    
     return self
 end
 
@@ -106,8 +116,15 @@ function Piece:getMovementRange()
     return self.stats.moveRange
 end
 
-function Piece:getViewRange()
-    return self.stats.viewRange or self.stats.moveRange or 3
+function Piece:getViewRange(game)
+    local base = self.stats.viewRange or self.stats.moveRange or 3
+    if game and self.col and self.row and self.col > 0 then
+        local tile = game.map and game.map:getTile(self.col, self.row)
+        if tile and tile.isHill then
+            return base + 1
+        end
+    end
+    return base
 end
 
 function Piece:getAttackRange()
@@ -199,6 +216,87 @@ end
 
 function Piece:resetMove()
     self.hasMoved = false
+    self.recruited = false  -- Reset recruited status at start of turn so new pieces can move on the turn after they're built
+end
+
+-- Start animating movement along a path (each tile in the path will trigger effects)
+function Piece:startAnimatedMovement(path)
+    self.isAnimating = true
+    self.animationPath = path or {}
+    self.animationProgress = 0
+    self.animationTime = 0
+    self.animationNextTile = 1
+end
+
+-- Update animation progress (call from game.lua in update())
+-- Returns true if animation is complete
+function Piece:updateAnimation(dt)
+    if not self.isAnimating or not self.animationPath or #self.animationPath == 0 then
+        self.isAnimating = false
+        return true
+    end
+    
+    self.animationTime = self.animationTime + dt
+    
+    -- Check if we've moved to the next tile
+    while self.animationTime >= self.animationSpeed and self.animationNextTile <= #self.animationPath do
+        self.animationTime = self.animationTime - self.animationSpeed
+        
+        -- Move to next tile in path
+        local nextStep = self.animationPath[self.animationNextTile]
+        if nextStep then
+            -- Update position directly (effects will be handled by game.lua)
+            self.col = nextStep.col
+            self.row = nextStep.row
+            self.hexTile = self.gameMap:getTile(nextStep.col, nextStep.row)
+            self.hasMoved = true
+        end
+        
+        self.animationNextTile = self.animationNextTile + 1
+    end
+    
+    -- Calculate progress toward the next tile (0 to 1)
+    self.animationProgress = math.min(1, self.animationTime / self.animationSpeed)
+    
+    -- Animation complete when we've processed all tiles
+    if self.animationNextTile > #self.animationPath then
+        self.isAnimating = false
+        self.animationProgress = 1
+        return true
+    end
+    
+    return false
+end
+
+-- Get interpolated position for smooth visual animation
+function Piece:getAnimationPosition()
+    if not self.isAnimating or self.animationNextTile == 0 or self.animationNextTile > #self.animationPath then
+        return self.col, self.row
+    end
+    
+    -- Current position is the previous tile we came from
+    local prevTile
+    if self.animationNextTile == 1 then
+        -- First step: interpolate from start to first path tile
+        prevTile = {col = self.col, row = self.row}
+    else
+        prevTile = self.animationPath[self.animationNextTile - 1]
+    end
+    
+    local nextTile = self.animationPath[self.animationNextTile]
+    if not nextTile then return self.col, self.row end
+    
+    -- Interpolate in pixel space for better alignment with tile centers
+    local prevPx, prevPy = self.gameMap:gridToPixels(prevTile.col, prevTile.row)
+    local nextPx, nextPy = self.gameMap:gridToPixels(nextTile.col, nextTile.row)
+    
+    local interpPx = prevPx + (nextPx - prevPx) * self.animationProgress
+    local interpPy = prevPy + (nextPy - prevPy) * self.animationProgress
+    
+    -- Convert back to grid coordinates for consistency with grid system
+    local interpCol, interpRow = self.gameMap:pixelsToGrid(interpPx, interpPy)
+    
+    return interpCol, interpRow
 end
 
 function Piece:deselect(game)
@@ -262,7 +360,7 @@ function Piece:getActionOptions(game)
         })
         table.insert(options, {
             id = "build_resource_mine",
-            name = "Build Resource Mine",
+            name = "Build Metal Mine",
             cost = 3,
             buildTurns = 1,
             icon = "resource_mine",
