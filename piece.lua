@@ -235,6 +235,10 @@ function Piece:updateAnimation(dt)
         self.isAnimating = false
         return true
     end
+    -- Suppress debug prints during replay (when game.state == "replay")
+    -- if not (GAME and GAME.state == "replay") then
+    --     pcall(function() print("[DEBUG] Animating piece " .. tostring(self.type) .. " at " .. tostring(self.col) .. "," .. tostring(self.row)) end)
+    -- end
     
     self.animationTime = self.animationTime + dt
     

@@ -1,5 +1,10 @@
--- Core game logic and state management
 
+-- ...existing code...
+-- Apply a single replay action (move, attack, recruit)
+
+
+
+local Replay = require("replay")
 local Game = {}
 Game.__index = Game
 
@@ -44,6 +49,9 @@ function Game.new()
     self.map = HexMap.new(self.mapWidth, self.mapHeight, self.hexSideLength)
     self.map:initializeGrid(true)  -- true = circular grid mode
     self.mapGeneratorUsed = nil  -- Track which generator was used ("radial", "region_stitch", etc.)
+
+    -- Replay system: encapsulated in Replay module
+    self.replay = Replay.new()
     self:generateMapTerrain()
 
     -- Start-sector selection (radial sectors) for dynamic starts (only for radial maps)
@@ -92,9 +100,9 @@ function Game.new()
     self:generateResources()
     
     -- Resource currency (for building units/bases)
-    self.teamResources = {[1] = 10, [2] = 10}  -- Resources owned by each team
+    self.teamResources = {[1] = 100, [2] = 100}  -- Resources owned by each team
     -- Oil resource (separate currency used for late-game units)
-    self.teamOil = {[1] = 10, [2] = 0}
+    self.teamOil = {[1] = 100, [2] = 100}
 
     -- Province/Region control data (disabled for now)
     self.provinces = nil
@@ -220,18 +228,65 @@ function Game:spawnCombatAnimation(x, y, rollsA, rollsD, attackerTeam, defenderT
     return anim
 end
 
+function Game:spawnMineExplosion(x, y, damage, col, row)
+    local explosion = {x = x, y = y, damage = damage, col = col, row = row, ttl = 0.6, scale = 1.0}
+    if not self.explosions then self.explosions = {} end
+    table.insert(self.explosions, explosion)
+    return explosion
+end
+
+function Game:spawnDamageText(x, y, damage, damageType)
+    -- Reusable method for displaying fading damage/effect text
+    -- damageType: "mine", "airstrike", "attack", etc.
+    if not self.damageTexts then self.damageTexts = {} end
+    
+    local label = damageType == "mine" and "Mine!" or damageType == "airstrike" and "Airstrike!" or "Hit!"
+    local text = {
+        x = x, 
+        y = y, 
+        damage = damage, 
+        label = label,
+        damageType = damageType,
+        ttl = 1.2,  -- Fades out over 1.2 seconds
+        offsetY = 0  -- Will float upward
+    }
+    table.insert(self.damageTexts, text)
+    return text
+end
+
 function Game:updateCombatAnimations(dt)
     for i = #self.combatAnimations, 1, -1 do
         local a = self.combatAnimations[i]
         a.ttl = a.ttl - dt
         if a.ttl <= 0 then table.remove(self.combatAnimations, i) end
     end
+    
+    -- Update mine explosion animations
+    if self.explosions then
+        for i = #self.explosions, 1, -1 do
+            local e = self.explosions[i]
+            e.ttl = e.ttl - dt
+            e.scale = e.scale + (dt * 1.5)  -- Grow the explosion
+            if e.ttl <= 0 then table.remove(self.explosions, i) end
+        end
+    end
+    
+    -- Update damage text animations
+    if self.damageTexts then
+        for i = #self.damageTexts, 1, -1 do
+            local t = self.damageTexts[i]
+            t.ttl = t.ttl - dt
+            t.offsetY = t.offsetY - (dt * 30)  -- Float upward
+            if t.ttl <= 0 then table.remove(self.damageTexts, i) end
+        end
+    end
 end
-
 -- Update piece movement animations and trigger effects/trap checks as they move
 function Game:updatePieceAnimations(dt)
     for _, piece in ipairs(self.pieces) do
+        
         if piece.isAnimating then
+        
             -- Track the tile before update
             local prevCol, prevRow = piece.col, piece.row
             
@@ -240,8 +295,11 @@ function Game:updatePieceAnimations(dt)
             
             -- Check if piece has entered a new tile and trigger effects
             if piece.col ~= prevCol or piece.row ~= prevRow then
-                -- Check for mines at new position
-                self:triggerMineAt(piece.col, piece.row, piece)
+                -- Only trigger mines during live gameplay state (not during replays which have their own action system)
+                if self.state == "playing" then
+                    print("[MINE] Animation: piece at (" .. piece.col .. "," .. piece.row .. "), checking mines")
+                    self:triggerMineAt(piece.col, piece.row, piece)
+                end
                 
                 -- Destroy defense if enemy enters tile
                 local defense = self:getDefenseAt(piece.col, piece.row)
@@ -286,6 +344,45 @@ function Game:drawCombatAnimations()
         love.graphics.rectangle("fill", x-28, y+6, 56, 24, 4, 4)
         love.graphics.setColor(1,1,1,1)
         love.graphics.printf(table.concat(a.rollsD, ","), x-28, y+8, 56, "center")
+    end
+    love.graphics.setColor(1,1,1,1)
+end
+
+function Game:drawExplosions()
+    if not self.explosions then return end
+    for _, e in ipairs(self.explosions) do
+        -- Draw expanding red/orange explosion circle
+        local alpha = e.ttl / 0.6  -- Fade out as ttl decreases
+        love.graphics.setColor(1, 0.5, 0.1, alpha * 0.7)  -- Orange with decreasing alpha
+        love.graphics.circle("fill", e.x, e.y, 20 * e.scale)
+        
+        -- Draw bright center
+        love.graphics.setColor(1, 1, 0, alpha * 0.9)
+        love.graphics.circle("fill", e.x, e.y, 8 * e.scale)
+    end
+    love.graphics.setColor(1,1,1,1)
+end
+
+function Game:drawDamageText()
+    if not self.damageTexts then return end
+    love.graphics.setFont(love.graphics.newFont(14))
+    for _, t in ipairs(self.damageTexts) do
+        local alpha = t.ttl / 1.2  -- Fade out as ttl decreases
+        local y = t.y + t.offsetY
+        
+        -- Determine color based on damage type
+        local r, g, b = 1, 0.3, 0.3  -- Red by default (mine)
+        if t.damageType == "airstrike" then
+            r, g, b = 0.8, 0.6, 1  -- Purple for airstrikes
+        end
+        
+        -- Draw label (e.g., "Mine!")
+        love.graphics.setColor(r, g, b, alpha)
+        love.graphics.printf(t.label, t.x - 30, y - 15, 60, "center")
+        
+        -- Draw damage number below label
+        love.graphics.setColor(1, 1, 0, alpha * 0.9)
+        love.graphics.printf("-" .. t.damage, t.x - 30, y + 5, 60, "center")
     end
     love.graphics.setColor(1,1,1,1)
 end
@@ -954,8 +1051,312 @@ function Game:revealPieceToTeam(piece, team)
     piece.hiddenInForest = false
 end
 
+function Game:applyReplayAction(action)
+    if not action then 
+        print("[REPLAY] applyReplayAction: action is nil")
+        return 
+    end
+    print("[REPLAY] applyReplayAction: action.action = " .. tostring(action.action))
+    if action.action == "move" then
+        print("[REPLAY] Processing MOVE action")
+        -- Find the piece and animate its movement along the recorded path
+        local piece = self:getPieceAt(action.fromCol, action.fromRow)
+        print("[REPLAY] Looking for piece at (" .. tostring(action.fromCol) .. "," .. tostring(action.fromRow) .. "), found: " .. tostring(piece ~= nil))
+        if piece then
+            print("[REPLAY] piece.team=" .. tostring(piece.team) .. " action.team=" .. tostring(action.team) .. " match=" .. tostring(piece.team == action.team))
+            print("[REPLAY] piece.type=" .. tostring(piece.type) .. " action.pieceType=" .. tostring(action.pieceType) .. " match=" .. tostring(piece.type == action.pieceType))
+            print("[REPLAY] action.path=" .. tostring(action.path) .. " length=" .. tostring(action.path and #action.path or 0))
+        end
+        if piece and piece.team == action.team and piece.type == action.pieceType and action.path and #action.path > 0 then
+            print("[REPLAY] Starting animated move: " .. piece.type .. " from (" .. action.fromCol .. "," .. action.fromRow .. ") to (" .. action.toCol .. "," .. action.toRow .. ")")
+            -- Determine which portion of the path is visible to the local viewer.
+            local viewTeam = self.localTeam or (3 - action.team)
+            local fullPath = action.path
+            local visibleCount = 0
+            if self.fogOfWar then
+                for i, step in ipairs(fullPath) do
+                    if self.fogOfWar:isTileVisible(viewTeam, step.col, step.row) then
+                        visibleCount = i
+                    else
+                        break
+                    end
+                end
+            else
+                visibleCount = #fullPath
+            end
+
+            if visibleCount > 0 then
+                local visPath = {}
+                for i = 1, visibleCount do table.insert(visPath, fullPath[i]) end
+                -- If there is an invisible remainder, schedule it to be applied after the visible animation completes
+                if visibleCount < #fullPath then
+                    local final = fullPath[#fullPath]
+                    self._replayPendingFinal = self._replayPendingFinal or {}
+                    self._replayPendingFinal[piece] = { col = final.col, row = final.row }
+                end
+                piece:startAnimatedMovement(visPath)
+                self._replayWaitForPiece = piece
+                print("[REPLAY] _replayWaitForPiece set to: " .. piece.type .. " (visible steps=" .. tostring(visibleCount) .. ")")
+            else
+                -- No visible steps: directly apply final position without animation
+                local final = fullPath[#fullPath]
+                print("[REPLAY] Move entirely out of view; placing piece at final (" .. tostring(final.col) .. "," .. tostring(final.row) .. ")")
+                piece:setPosition(final.col, final.row)
+                piece.hasMoved = true
+            end
+        elseif piece then
+            print("[REPLAY] Move conditions failed - path check: path=" .. tostring(action.path) .. " length=" .. tostring(action.path and #action.path or 0))
+            print("[REPLAY] Setting position directly from (" .. action.fromCol .. "," .. action.fromRow .. ") to (" .. action.toCol .. "," .. action.toRow .. ")")
+            piece:setPosition(action.toCol, action.toRow)
+            piece.hasMoved = true
+        end
+    elseif action.action == "attack" then
+        print("[REPLAY] Processing ATTACK action")
+        -- Animate attack: find attacker and target, set pending attack with recorded damage
+        local attacker = self:getPieceAt(action.fromCol, action.fromRow)
+        local target = self:getPieceAt(action.toCol, action.toRow)
+        print("[REPLAY] Attack: attacker at (" .. tostring(action.fromCol) .. "," .. tostring(action.fromRow) .. ") found=" .. tostring(attacker ~= nil))
+        print("[REPLAY] Attack: target at (" .. tostring(action.toCol) .. "," .. tostring(action.toRow) .. ") found=" .. tostring(target ~= nil))
+        if attacker then
+            print("[REPLAY] Attack: attacker type=" .. tostring(attacker.type) .. " team=" .. tostring(attacker.team) .. " matches=" .. tostring(attacker.team == action.team and attacker.type == action.pieceType))
+        end
+        if attacker and target and attacker.team == action.team and attacker.type == action.pieceType and target.team == action.targetTeam and target.type == action.targetType then
+            print("[REPLAY] Setting _replayAttackPending with damageToTarget=" .. tostring(action.damageToTarget or 0) .. " damageToAttacker=" .. tostring(action.damageToAttacker or 0))
+            -- Spawn combat animation with recorded dice rolls
+            if action.rollsA and action.rollsD then
+                local ax, ay = self.map:gridToPixels(action.fromCol, action.fromRow)
+                local bx, by = self.map:gridToPixels(action.toCol, action.toRow)
+                local mx, my = (ax + bx) / 2, (ay + by) / 2
+                self:spawnCombatAnimation(mx, my, action.rollsA, action.rollsD, attacker.team, target.team)
+            end
+            -- Apply the recorded damage after a delay so the animation can play
+            self._replayAttackPending = {attacker=attacker, target=target, damageToTarget=action.damageToTarget or 0, damageToAttacker=action.damageToAttacker or 0, timer=0.3}
+        else
+            print("[REPLAY] Attack validation failed: attacker match=" .. tostring(attacker and attacker.team == action.team and attacker.type == action.pieceType) .. " target match=" .. tostring(target and target.team == action.targetTeam and target.type == action.targetType))
+        end
+    elseif action.action == "recruit" then
+        -- Add a new piece of the given type at the location
+        self:addPiece(action.pieceType, action.team, action.col, action.row)
+    elseif action.action == "mineTrigger" then
+        -- DISABLED: Replay mine trigger handling for testing live gameplay only
+        print("[DEBUG MINE] [REPLAY] DISABLED mineTrigger replay action at (" .. action.col .. "," .. action.row .. ")")
+        -- Replay mine trigger: spawn explosion animation, show damage text, and remove mine
+        
+        print("[DEBUG MINE] [REPLAY] Processing MINE TRIGGER action at (" .. action.col .. "," .. action.row .. "), moverTeam=" .. tostring(action.moverTeam))
+        local px, py = self.map:gridToPixels(action.col, action.row)
+        self:spawnMineExplosion(px, py, action.damage, action.col, action.row)
+        self:spawnDamageText(px, py, action.damage, "mine")
+        
+        -- Find the mover at the mine location (piece has moved there during movement action)
+        local mover = self:getPieceAt(action.col, action.row)
+        print("[DEBUG MINE] [REPLAY] Found mover at (" .. action.col .. "," .. action.row .. "): " .. tostring(mover and (mover.type .. " team " .. mover.team) or "nil"))
+        
+        -- If piece isn't at mine location yet, try to find by mover team+type
+        if not mover and action.moverTeam and action.moverType then
+            for _, piece in ipairs(self.pieces) do
+                if piece.team == action.moverTeam and piece.type == action.moverType and piece.col == action.col and piece.row == action.row then
+                    mover = piece
+                    break
+                end
+            end
+            print("[DEBUG MINE] [REPLAY] Found mover by team+type: " .. tostring(mover and (mover.type .. " team " .. mover.team) or "nil"))
+        end
+        
+        -- Apply damage to the mover
+        if mover then
+            print("[DEBUG MINE] [REPLAY] Applying " .. action.damage .. " damage to " .. mover.type .. " (team " .. mover.team .. ")")
+            mover:takeDamage(action.damage)
+        else
+            print("[DEBUG MINE] [REPLAY] NO MOVER FOUND to apply damage!")
+        end
+        
+        -- Remove the mine from the board
+        local mine = self:getMineAt(action.col, action.row)
+        print("[DEBUG MINE] [REPLAY] Attempting to remove mine at (" .. action.col .. "," .. action.row .. "): " .. tostring(mine and "found" or "not found"))
+        if mine then
+            self:removeMine(mine)
+        end
+        
+    elseif action.action == "airstrike" then
+        -- Replay airstrike: spawn animation, show damage text, and apply damage to target
+        print("[REPLAY] Processing AIRSTRIKE action at (" .. action.col .. "," .. action.row .. ")")
+        local px, py = self.map:gridToPixels(action.col, action.row)
+        self:spawnMineExplosion(px, py, action.damage, action.col, action.row)
+        self:spawnDamageText(px, py, action.damage, "airstrike")
+        
+        -- Find the target piece - prioritize by position, fallback to team+type
+        local target = nil
+        if action.targetCol and action.targetRow then
+            target = self:getPieceAt(action.targetCol, action.targetRow)
+        end
+        if not target and action.targetTeam and action.targetType then
+            for _, piece in ipairs(self.pieces) do
+                if piece.team == action.targetTeam and piece.type == action.targetType then
+                    target = piece
+                    break
+                end
+            end
+        end
+        
+        -- Set pending airstrike to apply damage after animation plays
+        if target then
+            self._replayAirstrikePending = {target = target, damage = action.damage, timer = 0.3}
+        end
+    end
+end
+-- Core game logic and state management
+
 function Game:update(dt)
     -- Update game logic here
+    if self.state == "replay" and self.replay and self.replay.replayActive then
+        -- print("[REPLAY UPDATE] In replay state, replayActive = " .. tostring(self.replay.replayActive))
+
+        -- If overlay is active, count down and wait (do not start animations)
+        if self._replayOverlay then
+            if self._replayOverlayTimer then
+                self._replayOverlayTimer = self._replayOverlayTimer - dt
+                if self._replayOverlayTimer <= 0 then
+                    self._replayOverlay = false
+                    self._replayOverlayTimer = nil
+                    print("[REPLAY] Overlay auto-dismissed, starting replay")
+                end
+            end
+            return
+        end
+
+        -- Always update animations during replay
+        self:updatePieceAnimations(dt)
+
+        -- Update fog-of-war visibility each frame during replay so visibility follows moving units.
+        if self.fogOfWar then
+            self.fogOfWar:updateVisibility(1, self.pieces, self.bases, self.teamStartingCorners)
+            self.fogOfWar:updateVisibility(2, self.pieces, self.bases, self.teamStartingCorners)
+            -- If a tile becomes visible again during replay, ensure enemy pieces on it are revealed so they render.
+            local viewTeam = self.localTeam or self.currentTurn
+            for _, piece in ipairs(self.pieces) do
+                if piece and piece.col and piece.row and piece.team ~= viewTeam then
+                    if self.fogOfWar:isTileVisible(viewTeam, piece.col, piece.row) then
+                        piece.revealedTo = piece.revealedTo or {}
+                        piece.revealedTo[viewTeam] = true
+                        piece.hiddenInForest = false
+                    end
+                end
+            end
+        end
+        
+        -- If waiting for a piece to finish animating, don't process next action
+        if self._replayWaitForPiece and self._replayWaitForPiece.isAnimating then
+            return
+        elseif self._replayWaitForPiece then
+            -- Animation finished, apply any pending final teleport (if moving out of visibility)
+            if self._replayPendingFinal and self._replayPendingFinal[self._replayWaitForPiece] then
+                local pos = self._replayPendingFinal[self._replayWaitForPiece]
+                if pos then
+                    print("[REPLAY] Applying pending final position for piece " .. tostring(self._replayWaitForPiece.type) .. " -> (" .. tostring(pos.col) .. "," .. tostring(pos.row) .. ")")
+                    self._replayWaitForPiece:setPosition(pos.col, pos.row)
+                    self._replayWaitForPiece.hasMoved = true
+                end
+                self._replayPendingFinal[self._replayWaitForPiece] = nil
+            end
+            -- Animation finished, clear it
+            self._replayWaitForPiece = nil
+        end
+        
+        -- If waiting for attack animation, wait for timer
+        if self._replayAttackPending then
+            self._replayAttackPending.timer = self._replayAttackPending.timer - dt
+            if self._replayAttackPending.timer <= 0 then
+                local attacker = self._replayAttackPending.attacker
+                local target = self._replayAttackPending.target
+                local damageToTarget = self._replayAttackPending.damageToTarget or 0
+                local damageToAttacker = self._replayAttackPending.damageToAttacker or 0
+                
+                print("[REPLAY ATTACK] Applying attack: attacker=" .. tostring(attacker and attacker.type) .. " target=" .. tostring(target and target.type) .. " dmgToTarget=" .. tostring(damageToTarget) .. " dmgToAttacker=" .. tostring(damageToAttacker))
+                
+                -- Apply damage to target
+                if target and damageToTarget > 0 then
+                    print("[REPLAY ATTACK] Applying " .. tostring(damageToTarget) .. " damage to target " .. tostring(target.type))
+                    local wasKilled = target:takeDamage(damageToTarget)
+                    if wasKilled then
+                        print("[REPLAY ATTACK] Target killed!")
+                        for i, p in ipairs(self.pieces) do if p == target then table.remove(self.pieces, i); break end end
+                    end
+                end
+                
+                -- Apply damage to attacker
+                if attacker and damageToAttacker > 0 then
+                    print("[REPLAY ATTACK] Applying " .. tostring(damageToAttacker) .. " damage to attacker " .. tostring(attacker.type))
+                    local wasKilled = attacker:takeDamage(damageToAttacker)
+                    if wasKilled then
+                        print("[REPLAY ATTACK] Attacker killed!")
+                        for i, p in ipairs(self.pieces) do if p == attacker then table.remove(self.pieces, i); break end end
+                    end
+                end
+                
+                self._replayAttackPending = nil
+                
+                -- If this was the last action, finish the replay now
+                if self.replay.replayIndex and self.replay.currentReplay and self.replay.replayIndex > #self.replay.currentReplay then
+                    print("[REPLAY ATTACK] Attack was last action, finishing replay")
+                    self.replay:finishReplay()
+                    self.state = "playing"
+                end
+            else
+                return
+            end
+        end
+        
+        -- If waiting for airstrike animation, wait for timer
+        if self._replayAirstrikePending then
+            self._replayAirstrikePending.timer = self._replayAirstrikePending.timer - dt
+            if self._replayAirstrikePending.timer <= 0 then
+                local target = self._replayAirstrikePending.target
+                local damage = self._replayAirstrikePending.damage or 0
+                
+                print("[REPLAY AIRSTRIKE] Applying airstrike: target=" .. tostring(target and target.type) .. " damage=" .. tostring(damage))
+                
+                -- Apply damage to target
+                if target and damage > 0 then
+                    print("[REPLAY AIRSTRIKE] Applying " .. tostring(damage) .. " damage to target " .. tostring(target.type))
+                    local wasKilled = target:takeDamage(damage)
+                    if wasKilled then
+                        print("[REPLAY AIRSTRIKE] Target killed!")
+                        for i, p in ipairs(self.pieces) do if p == target then table.remove(self.pieces, i); break end end
+                    end
+                end
+                
+                self._replayAirstrikePending = nil
+                
+                -- If this was the last action, finish the replay now
+                if self.replay.replayIndex and self.replay.currentReplay and self.replay.replayIndex > #self.replay.currentReplay then
+                    print("[REPLAY AIRSTRIKE] Airstrike was last action, finishing replay")
+                    self.replay:finishReplay()
+                    self.state = "playing"
+                end
+            else
+                return
+            end
+        end
+        print("[REPLAY UPDATE] About to call stepReplay")
+        -- Don't advance replay if we have pending animations
+        if not self._replayAttackPending and not self._replayAirstrikePending then
+            self.replay:stepReplay(function(action) 
+                print("[REPLAY CALLBACK] Callback invoked with action: " .. tostring(action and action.action or "nil"))
+                self:applyReplayAction(action) 
+            end)
+        end
+        
+        -- Finish replay if all actions are done and no attack/airstrike is pending
+        if self.replay.replayActive and self.replay.replayIndex and self.replay.currentReplay and self.replay.replayIndex > #self.replay.currentReplay and not self._replayAttackPending and not self._replayAirstrikePending then
+            print("[REPLAY] All actions completed, finishing replay")
+            self.replay:finishReplay()
+        end
+        -- If replay just finished, switch back to playing state
+        if not self.replay.replayActive then
+            self.state = "playing"
+        end
+        return
+    end
     if self.state == "playing" then
         -- Update piece animations and handle effects as they move
         self:updatePieceAnimations(dt)
@@ -1427,6 +1828,11 @@ function Game:handleNetworkMessage(msg)
         local row = tonumber(msg.row)
         local damage = tonumber(msg.damage) or 6
         if col and row then
+            -- Spawn airstrike animation
+            local px, py = self.map:gridToPixels(col, row)
+            self:spawnMineExplosion(px, py, damage, col, row)
+            self:spawnDamageText(px, py, damage, "airstrike")
+            
             local targetPiece = self:getPieceAt(col, row)
             if targetPiece then
                 local wasKilled = targetPiece:takeDamage(damage)
@@ -1446,8 +1852,16 @@ function Game:handleNetworkMessage(msg)
         local damage = tonumber(msg.damage) or 0
         local moverCol = tonumber(msg.moverCol)
         local moverRow = tonumber(msg.moverRow)
-        if col and row and moverCol and moverRow then
-            local piece = self:getPieceAt(moverCol, moverRow)
+        local moverTeam = tonumber(msg.moverTeam)
+        if col and row and moverCol and moverRow and moverTeam then
+            -- Find the piece that stepped on the mine (must be at mover position and be the correct team)
+            local piece = nil
+            for _, p in ipairs(self.pieces) do
+                if p.col == moverCol and p.row == moverRow and p.team == moverTeam then
+                    piece = p
+                    break
+                end
+            end
             if piece then
                 local wasKilled = piece:takeDamage(damage)
                 if wasKilled then
@@ -1457,6 +1871,11 @@ function Game:handleNetworkMessage(msg)
                             break
                         end
                     end
+                end
+                -- Record the mine trigger in the replay on non-host clients (host already recorded it in triggerMineAt)
+                if not self.isHost then
+                    local action = {action = "mineTrigger", col = col, row = row, moverCol = moverCol, moverRow = moverRow, moverTeam = moverTeam, moverType = piece.type, damage = damage}
+                    self.replay:recordAction(action)
                 end
             end
             -- Ensure mine removed locally
@@ -1755,7 +2174,10 @@ function Game:applyRemoteMove(msg)
     if piece.onMove then
         pcall(function() piece:onMove(self, fromCol, fromRow, toCol, toRow) end)
     end
-    -- Do NOT trigger mines here; host will authoritatively send a mineTriggered commit when needed
+    -- Trigger mines during live gameplay state only
+    if self.state == "playing" then
+        self:triggerMineAt(toCol, toRow, piece)
+    end
     -- Recalculate valid moves/attacks if this piece is currently selected so UI remains correct
     if self.selectedPiece and self.selectedPiece == piece then
         self:calculateValidMoves()
@@ -1780,6 +2202,15 @@ function Game:sendCommit(msg)
 end
 
 function Game:draw()
+    -- Only show the initial replay overlay while the overlay flag is active.
+    -- This ensures animations and updates do not run while the overlay is visible.
+    if self.state == "replay" and self.replay and self.replay.replayActive and self._replayOverlay then
+        love.graphics.setColor(0,0,0,0.6)
+        love.graphics.rectangle("fill", 0, 0, love.graphics.getWidth(), love.graphics.getHeight())
+        love.graphics.setColor(1,1,1,1)
+        love.graphics.printf("Enemy Turn Replay... (Press Space to Skip)", 0, love.graphics.getHeight()/2-20, love.graphics.getWidth(), "center")
+        return
+    end
     love.graphics.push()
     love.graphics.applyTransform(self.camera:getTransform())
     
@@ -2020,6 +2451,8 @@ function Game:draw()
     -- Draw valid moves if a piece is selected
     -- Draw combat animations (dice rolls) on top of pieces
     self:drawCombatAnimations()
+    self:drawExplosions()
+    self:drawDamageText()
     if self.selectedPiece then
         self:drawValidMoves()
     end
@@ -2894,6 +3327,19 @@ function Game:mousepressed(x, y, button)
                 -- Host or local apply: Apply strike to any piece at that tile
                 local targetPiece = self:getPieceAt(col, row)
                 local strikeDamage = 6
+                
+                -- Spawn airstrike animation and damage text
+                local px, py = self.map:gridToPixels(col, row)
+                self:spawnMineExplosion(px, py, strikeDamage, col, row)  -- Reuse explosion for visual
+                self:spawnDamageText(px, py, strikeDamage, "airstrike")
+                
+                -- Record airstrike for replay (only if visible to enemy)
+                local enemyTeam = (at.team == 1) and 2 or 1
+                if not self.fogOfWar or self.fogOfWar:isTileVisible(enemyTeam, col, row) then
+                    local action = {action = "airstrike", col = col, row = row, team = at.team, damage = strikeDamage, targetCol = targetPiece and targetPiece.col or col, targetRow = targetPiece and targetPiece.row or row, targetTeam = targetPiece and targetPiece.team or nil, targetType = targetPiece and targetPiece.type or nil}
+                    self.replay:recordAction(action)
+                end
+                
                 if targetPiece then
                     local wasKilled = targetPiece:takeDamage(strikeDamage)
                     if wasKilled then
@@ -3132,6 +3578,7 @@ end
 function Game:addMine(mine)
     self.mines = self.mines or {}
     table.insert(self.mines, mine)
+    print("[MINE] Added mine: Team " .. mine.team .. " at (" .. mine.col .. "," .. mine.row .. ")")
 end
 
 function Game:getMineAt(col, row)
@@ -3186,14 +3633,32 @@ end
 
 function Game:triggerMineAt(col, row, mover)
     local mine = self:getMineAt(col, row)
-    if not mine then return false end
-    if mine.team == mover.team then return false end
+    if not mine then 
+        print("[MINE] No mine at (" .. col .. "," .. row .. ") for " .. mover.type .. " team " .. mover.team)
+        return false 
+    end
+    print("[MINE] Found mine at (" .. col .. "," .. row .. "): team=" .. mine.team .. ", mover team=" .. mover.team)
+    if mine.team == mover.team then 
+        print("[MINE] Mine is same team, skipping")
+        return false 
+    end
 
-    -- Apply damage to mover (half damage if mine was revealed to mover's team)
+    print("[MINE] TRIGGERING mine at (" .. col .. "," .. row .. ") by team " .. mover.team)
+
+    -- Spawn mine explosion animation
+    local px, py = self.map:gridToPixels(col, row)
     local dmg = mine.damage or 5
     if mine.revealedTo and mine.revealedTo[mover.team] then
         dmg = math.max(1, math.floor(dmg / 2))
     end
+    self:spawnMineExplosion(px, py, dmg, col, row)
+    self:spawnDamageText(px, py, dmg, "mine")
+
+    -- Record the mine trigger for replay
+    local action = {action = "mineTrigger", col = col, row = row, moverCol = mover.col, moverRow = mover.row, moverTeam = mover.team, moverType = mover.type, damage = dmg}
+    self.replay:recordAction(action)
+
+    -- Apply damage to mover
     local wasKilled = mover:takeDamage(dmg)
 
     -- Remove mine
@@ -3207,15 +3672,6 @@ function Game:triggerMineAt(col, row, mover)
                 break
             end
         end
-    end
-    -- If host, broadcast that the mine was triggered and removed so peers can apply damage and remove it.
-    -- We must broadcast even when currently applying a remote request (self._applyingRemote may be true),
-    -- `sendCommit` temporarily clears that flag while sending, so allow sends unconditionally here.
-    if self.isHost and Network and Network.isConnected and Network.isConnected() then
-        pcall(function()
-            self:sendCommit({type = "mineTriggered", col = col, row = row, moverCol = mover.col, moverRow = mover.row, moverTeam = mover.team, damage = dmg, killed = wasKilled and 1 or 0})
-            self:sendCommit({type = "removeMine", col = col, row = row})
-        end)
     end
 
     return true
@@ -3636,6 +4092,16 @@ function Game:buildUnitNearBase(base, unitType, team, cost)
             if not self:getPieceAt(neighbor.col, neighbor.row) and 
                not self:getBaseAt(neighbor.col, neighbor.row) and
                not self:getResourceAt(neighbor.col, neighbor.row) then
+                -- Record recruit for replay if visible to enemy
+                local viewerTeam = (team == 1) and 2 or 1
+                if self.fogOfWar and self.fogOfWar:isTileVisible(viewerTeam, neighbor.col, neighbor.row) then
+                    self.replay:recordAction({
+                        action = "recruit",
+                        pieceType = unitType,
+                        team = team,
+                        col = neighbor.col, row = neighbor.row
+                    })
+                end
                 -- If networked client, validate locally (enforce oil/resource) then request host to build unit (do NOT deduct locally)
                 local oilCost = ((unitType == "tank") and 1 or 0) + ((unitType == "sam") and 1 or 0)
                 if Network and Network.isConnected and Network.isConnected() and not self.isHost and not self._applyingRemote then
@@ -4134,6 +4600,19 @@ function Game:movePiece(col, row)
     end
     
     if isValidMove then
+        -- Record move for replay if visible to enemy
+        local viewerTeam = (self.currentTurn == 1) and 2 or 1
+        if self.fogOfWar and self.fogOfWar:isTileVisible(viewerTeam, col, row) then
+            -- Find the path used for animation
+            local path = self:findQuickestPath(oldCol, oldRow, col, row, self.selectedPiece and self.selectedPiece.team, (self.selectedPiece and self.selectedPiece.stats.moveRange) or 1)
+            self.replay:recordAction({
+                action = "move",
+                pieceType = self.selectedPiece.type,
+                team = self.selectedPiece.team,
+                fromCol = oldCol, fromRow = oldRow, toCol = col, toRow = row,
+                path = path
+            })
+        end
         -- If networked client, send request to host instead of applying locally
         -- Tank movement requires oil: client-side check to avoid sending invalid request
         if self.selectedPiece and self.selectedPiece.type == "tank" then
@@ -4251,6 +4730,26 @@ function Game:movePiece(col, row)
             print(string.format("[DBG attack local POST] rollsA=%s rollsD=%s dmgToTarget=%s dmgToAttacker=%s", tostring(table.concat(rollsA,",")), tostring(table.concat(rollsD,",")), tostring(damageToTarget), tostring(damageToAttacker)))
         end)
 
+        -- Record attack for replay if visible to enemy (now with actual computed damage)
+        local viewerTeam = (self.currentTurn == 1) and 2 or 1
+        -- Always record attacks for replay (visibility check may prevent recordings)
+        if true then -- self.fogOfWar and (self.fogOfWar:isTileVisible(viewerTeam, col, row) or self.fogOfWar:isTileVisible(viewerTeam, oldCol, oldRow)) then
+            self.replay:recordAction({
+                action = "attack",
+                pieceType = self.selectedPiece.type,
+                team = self.selectedPiece.team,
+                fromCol = oldCol, fromRow = oldRow, toCol = col, toRow = row,
+                targetType = targetPiece.type,
+                targetTeam = targetPiece.team,
+                damageToTarget = damageToTarget,
+                damageToAttacker = damageToAttacker,
+                targetHp = targetPiece.hp,
+                attackerHp = self.selectedPiece.hp,
+                rollsA = rollsA,
+                rollsD = rollsD
+            })
+        end
+
         -- Reveal attacker if hidden (local single-player or host handles reveal broadcast elsewhere)
         if self.selectedPiece and self.selectedPiece.hiddenInForest then
             local revealTeam = nil
@@ -4328,10 +4827,10 @@ function Game:movePiece(col, row)
             pcall(function()
                     self:sendCommit({type = "attack", fromCol = oldCol, fromRow = oldRow, toCol = col, toRow = row, attackerRolls = rollsA, defenderRolls = rollsD, damageToTarget = damageToTarget, damageToAttacker = damageToAttacker, moved = movedInto, attackerTeam = self.selectedPiece and self.selectedPiece.team or nil, defenderTeam = targetPiece and targetPiece.team or nil})
             end)
-            -- After broadcasting, trigger mines if moved into tile
-            if movedInto and self.selectedPiece then self:triggerMineAt(col, row, self.selectedPiece) end
-        end
 
+        end
+        -- After broadcasting, trigger mines if moved into tile
+        if movedInto and self.selectedPiece then self:triggerMineAt(col, row, self.selectedPiece) end
         -- Mark piece as moved since it attacked (if still alive)
         if self.selectedPiece then self.selectedPiece.hasMoved = true end
         self:calculateValidMoves()
@@ -4340,6 +4839,20 @@ function Game:movePiece(col, row)
 end
 
 function Game:keypressed(key)
+    -- Replay skip logic
+    if self.state == "replay" and self.replay and self.replay.replayActive then
+        -- If overlay is active, dismiss it on Space; otherwise Space requests replay skip
+        if key == "space" then
+            if self._replayOverlay then
+                self._replayOverlay = false
+                self._replayOverlayTimer = nil
+                print("[REPLAY] Overlay dismissed by user")
+            else
+                self.replay.replaySkipRequested = true
+            end
+        end
+        return
+    end
     -- Accept hotseat pass if pending
     if self.passPending then
         if key == "return" or key == "space" then
@@ -4820,6 +5333,18 @@ function Game:endTurn()
     
     -- Process waypoint moves for the team that's about to end their turn
     self:processWaypointMoves(self.currentTurn)
+
+    -- Store replay actions for this turn (for the enemy to view next turn)
+    local teamThatEnded = self.currentTurn
+    local enemyTeam = (teamThatEnded == 1) and 2 or 1
+    self.replay:storeTurnReplay(enemyTeam, teamThatEnded)
+
+    pcall(function()
+        print("[DEBUG] Stored replay for team " .. tostring(enemyTeam) .. ": " .. tostring(#self.replay.turnReplays[enemyTeam]) .. " actions.")
+        for i, act in ipairs(self.replay.turnReplays[enemyTeam]) do
+            print("[DEBUG] Replay action " .. i .. ": " .. (act.action or "nil"))
+        end
+    end)
     
     -- If connected and not the host, request the host to end the turn instead
     if Network and Network.isConnected and Network.isConnected() and not self.isHost and not self._applyingRemote then
@@ -4964,6 +5489,125 @@ function Game:endTurn()
             if piece.team == self.currentTurn then
                 piece:resetMove()
             end
+        end
+
+        -- Sync mines from OPPONENT'S previous turn before we start OUR turn
+        -- This ensures we see enemy mines before our pieces can trigger them
+        local opponentTeam = self.currentTurn == 1 and 2 or 1
+        if self.replay.preTurnSnapshots and self.replay.preTurnSnapshots[opponentTeam] then
+            local snap = self.replay.preTurnSnapshots[opponentTeam]
+            if snap.mines then
+                for _, mineData in ipairs(snap.mines) do
+                    if not self:getMineAt(mineData.col, mineData.row) then
+                        local mine = {
+                            col = mineData.col,
+                            row = mineData.row,
+                            team = mineData.team,
+                            damage = mineData.damage or 5,
+                            revealedTo = mineData.revealedTo and table.shallow_copy(mineData.revealedTo) or nil
+                        }
+                        self:addMine(mine)
+                    end
+                end
+            end
+        end
+
+        -- Always switch localTeam to match currentTurn BEFORE starting replay so the view is correct
+        self.localTeam = self.currentTurn
+
+        -- Save board snapshot at the START of this team's turn (BEFORE they move)
+        -- This snapshot is used to restore the board when replaying the enemy's actions
+        self.replay:saveBoardSnapshotForTeam(self.currentTurn, self.pieces, self.mines)
+
+        -- Start replay for the new team if there are actions to show
+        self.replay:beginReplay(self.currentTurn)
+        pcall(function()
+            print("[REPLAY DEBUG] beginReplay called for team " .. tostring(self.currentTurn))
+            print("[REPLAY DEBUG] replayActive = " .. tostring(self.replay.replayActive))
+            print("[REPLAY DEBUG] currentReplay length = " .. tostring(self.replay.currentReplay and #self.replay.currentReplay or 0))
+        end)
+        -- Start replay if there are actions to show
+        if self.replay.replayActive then
+            -- Restore board state snapshot for replay (snapshot paired with stored replay for this team)
+            local snap = self.replay:getBoardSnapshot(self.currentTurn)
+            if snap then
+                print("[REPLAY] Snapshot has " .. tostring(#snap) .. " pieces")
+                for i, pdata in ipairs(snap) do
+                    print("[REPLAY] Snapshot piece " .. i .. ": type=" .. tostring(pdata.type) .. " team=" .. tostring(pdata.team) .. " at (" .. tostring(pdata.col) .. "," .. tostring(pdata.row) .. ")")
+                end
+                -- Rebuild piece list from snapshot, reusing existing piece objects where possible
+                local newPieces = {}
+                -- Create a mutable list of candidates from current pieces to match against
+                local candidates = {}
+                for _, p in ipairs(self.pieces) do table.insert(candidates, p) end
+
+                for _, pdata in ipairs(snap) do
+                    -- Prefer a candidate at the same position first
+                    local foundIdx = nil
+                    for i, c in ipairs(candidates) do
+                        if c.col == pdata.col and c.row == pdata.row and c.team == pdata.team and c.type == pdata.type then
+                            foundIdx = i
+                            break
+                        end
+                    end
+                    -- If not found, try any candidate matching team+type
+                    if not foundIdx then
+                        for i, c in ipairs(candidates) do
+                            if c.team == pdata.team and c.type == pdata.type then
+                                foundIdx = i
+                                break
+                            end
+                        end
+                    end
+
+                    if foundIdx then
+                        local existing = table.remove(candidates, foundIdx)
+                        existing.col = pdata.col
+                        existing.row = pdata.row
+                        existing.hexTile = self.map:getTile(pdata.col, pdata.row)
+                        existing.hp = pdata.hp
+                        existing.veteran = pdata.veteran
+                        existing.hiddenInForest = pdata.hiddenInForest
+                        if pdata.revealedTo then existing.revealedTo = table.shallow_copy(pdata.revealedTo) end
+                        table.insert(newPieces, existing)
+                    else
+                        local piece = Piece.new(pdata.type, pdata.team, self.map, pdata.col, pdata.row)
+                        piece.hp = pdata.hp
+                        piece.veteran = pdata.veteran
+                        piece.hiddenInForest = pdata.hiddenInForest
+                        if pdata.revealedTo then piece.revealedTo = table.shallow_copy(pdata.revealedTo) end
+                        table.insert(newPieces, piece)
+                    end
+                end
+
+                -- Replace the current pieces list with the rebuilt one (drop unmatched old pieces)
+                self.pieces = newPieces
+                print("[REPLAY] Applied snapshot; total pieces now " .. tostring(#self.pieces))
+                
+                -- Restore mines from snapshot
+                if snap.mines then
+                    -- self.mines = {}
+                    for _, mineData in ipairs(snap.mines) do
+                        local mine = {
+                            col = mineData.col,
+                            row = mineData.row,
+                            team = mineData.team,
+                            damage = mineData.damage or 5,
+                            revealedTo = mineData.revealedTo and table.shallow_copy(mineData.revealedTo) or nil
+                        }
+                        table.insert(self.mines, mine)
+                    end
+                    print("[REPLAY] Applied snapshot; restored " .. tostring(#self.mines) .. " mines")
+                end
+            end
+            self.state = "replay"
+            -- Show overlay first; actual replay animations start after overlay dismissed
+            self._replayOverlay = true
+            self._replayOverlayTimer = 1.5 -- seconds before auto-start; user can press Space to dismiss sooner
+            pcall(function() print("[REPLAY DEBUG] STATE SET TO REPLAY (overlay active)") end)
+        else
+            self.state = "playing"
+            pcall(function() print("[REPLAY DEBUG] STATE SET TO PLAYING (no replay actions)") end)
         end
 
         -- Recompute air superiority at the start of the new turn (once-per-turn)
